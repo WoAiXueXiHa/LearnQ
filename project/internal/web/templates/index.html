@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.Title}}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div><h1>LearnQ</h1><p>把学习记录变成报告、复习与可检索知识</p></div>
+  <span id="health" class="badge">正在连接…</span>
+</header>
+<nav class="tabs" aria-label="主导航">
+  <button class="active" data-view="records">学习记录</button>
+  <button data-view="task">任务与报告</button>
+  <button data-view="reviews">复习计划</button>
+  <button data-view="skills">AI Skill</button>
+  <button data-view="knowledge">知识库与 RAG</button>
+</nav>
+<main>
+  <div id="notice" class="notice" hidden></div>
+
+  <section id="records">
+    <div class="section-head"><div><h2>记录今天学了什么</h2><p>提交后会自动生成报告和复习计划。</p></div></div>
+    <form id="recordForm" class="card form-grid">
+      <label>标题<input name="title" placeholder="例如：Go 并发学习" required></label>
+      <label>学习时长（分钟）<input name="duration" type="number" value="30" min="1" required></label>
+      <label class="wide">学习摘要<textarea name="summary" placeholder="学到了什么、遇到什么问题"></textarea></label>
+      <label>模块分类<select name="category"><option value="backend">后端</option><option value="algorithm">算法</option><option value="project">项目</option><option value="interview">面试</option></select></label>
+      <label class="wide">模块内容<textarea name="content" placeholder="写下可以被报告和 Skill 使用的具体事实" required></textarea></label>
+      <button id="recordSubmit" type="submit">创建学习报告</button>
+    </form>
+    <div id="duplicateBox" class="card warning" hidden>
+      <p>检测到最近 10 分钟内有完全相同的记录，已复用原任务。</p>
+      <button id="forceCreate" type="button">仍然新建一条</button>
+    </div>
+    <div class="section-head"><h3>最近记录</h3><button class="secondary" type="button" onclick="loadRecords()">刷新</button></div>
+    <div id="recordList" class="cards"></div>
+  </section>
+
+  <section id="task" hidden>
+    <div class="section-head"><div><h2>任务与报告</h2><p>状态会自动刷新，成功后直接显示报告与执行轨迹。</p></div></div>
+    <div class="toolbar"><input id="taskID" inputmode="numeric" placeholder="输入 Task ID"><button type="button" onclick="openTask(taskID.value)">查询</button></div>
+    <div id="taskDetail" class="stack empty">从学习记录中打开一个任务，或输入 Task ID。</div>
+  </section>
+
+  <section id="reviews" hidden>
+    <div class="section-head"><div><h2>复习计划</h2><p>新报告先进入“即将复习”，到期后自动移动到“现在到期”。</p></div><button class="secondary" onclick="loadReviews()">刷新</button></div>
+    <h3>现在到期</h3><div id="dueList" class="cards"></div>
+    <h3>即将复习</h3><div id="upcomingList" class="cards"></div>
+  </section>
+
+  <section id="skills" hidden>
+    <div class="section-head"><div><h2>AI Skill 工作台</h2><p>选择不同 Skill 会使用不同分析路径和真实工具。</p></div></div>
+    <form id="skillForm" class="card form-grid">
+      <label>Skill<select id="skillName"></select></label>
+      <label class="wide">输入 JSON<textarea id="skillInput" class="code" rows="8"></textarea></label>
+      <button type="submit">运行 Skill</button>
+    </form>
+    <div id="skillResult" class="stack empty">运行后将在这里显示结构化产物和工具证据。</div>
+  </section>
+
+  <section id="knowledge" hidden>
+    <div class="section-head"><div><h2>知识库与 RAG</h2><p>先上传文档并等待 ready，再基于可核验证据提问。</p></div></div>
+    <form id="uploadForm" class="card upload">
+      <input id="documentFile" name="file" type="file" accept=".md,.txt,.json" required>
+      <button type="submit">上传并建立索引</button>
+    </form>
+    <div class="section-head"><h3>文档</h3><button class="secondary" onclick="loadDocuments()">刷新</button></div>
+    <div id="documentList" class="cards"></div>
+    <form id="ragForm" class="toolbar">
+      <input id="question" placeholder="例如：LearnQ 如何避免旧 Worker 覆盖新结果？" required>
+      <button id="ragSubmit" type="submit" disabled>查询证据</button>
+    </form>
+    <div id="ragResult" class="stack empty">至少有一个文档 ready 后才能查询。</div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

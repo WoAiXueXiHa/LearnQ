@@ -1,0 +1,63 @@
+services:
+  mysql:
+    image: mysql:8.4.10
+    environment:
+      MYSQL_DATABASE: learnq
+      MYSQL_USER: learnq
+      MYSQL_PASSWORD: learnq
+      MYSQL_ROOT_PASSWORD: local-root-only
+    healthcheck:
+      # 127.0.0.1 forces TCP. "localhost" may report the temporary init
+      # server healthy through its socket before port 3306 is listening.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-plocal-root-only"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes: [mysql-data:/var/lib/mysql]
+  redis:
+    image: redis:7.2.14-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    healthcheck:
+      # The official image has bash but intentionally ships without wget/curl.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes: [qdrant-data:/qdrant/storage]
+  migration:
+    build: {context: ., args: {TARGET: migrate}}
+    environment: &env
+      MYSQL_DSN: learnq:learnq@tcp(mysql:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true
+      REDIS_ADDR: redis:6379
+      QDRANT_URL: http://qdrant:6333
+      AI_MODE: fake
+      HTTP_ADDR: 0.0.0.0:8080
+      REPORT_DIR: /app/data/reports
+    depends_on:
+      mysql: {condition: service_healthy}
+  api:
+    build: {context: ., args: {TARGET: api}}
+    environment: *env
+    ports: ["127.0.0.1:8080:8080"]
+    depends_on:
+      migration: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+  worker:
+    build: {context: ., args: {TARGET: worker}}
+    environment: *env
+    volumes: [reports:/app/data/reports]
+    depends_on:
+      migration: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+volumes:
+  mysql-data:
+  qdrant-data:
+  reports:

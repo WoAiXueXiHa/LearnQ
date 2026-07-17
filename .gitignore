@@ -1,0 +1,33 @@
+
+# Local workspace instructions and sibling experiments
+/AGENTS.md
+/demo/
+/go.work
+/go.work.sum
+
+# Local environment files (keep shareable templates)
+.env
+.env.*
+!.env.example
+
+# Go build and test output
+/project/bin/
+/project/build/
+/project/dist/
+/project/coverage/
+/project/coverage.out
+/project/*.test
+/project/*.out
+
+# Runtime data
+/project/data/reports/
+/project/tmp/
+
+# Logs
+*.log
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
