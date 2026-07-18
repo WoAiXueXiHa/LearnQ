@@ -81,8 +81,12 @@ func (s *Store) DispatchOutbox(ctx context.Context, enqueue func(context.Context
 				return err
 			}
 			now := time.Now().UTC()
-			if err := tx.Exec(`UPDATE ai_tasks SET status='queued', updated_at=? WHERE id=? AND status IN ('pending','retry_wait')`, now, task.ID).Error; err != nil {
-				return err
+			result := tx.Exec(`UPDATE ai_tasks SET status='queued', updated_at=? WHERE id=? AND status IN ('pending','retry_wait')`, now, task.ID)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return errors.New("task state changed while dispatching")
 			}
 			if err := tx.Exec(`UPDATE outbox_events SET published_at=? WHERE id=? AND published_at IS NULL`, now, event.ID).Error; err != nil {
 				return err
@@ -146,7 +150,29 @@ func (s *Store) Complete(ctx context.Context, task domain.AITask, token, markdow
 }
 
 func (s *Store) Fail(ctx context.Context, task domain.AITask, token string, cause error) (time.Time, bool, error) {
+	return s.fail(ctx, task, token, cause, false, false)
+}
+
+// FailTerminal persists a non-retryable failure, such as invalid model
+// credentials or an invalid provider request, without wasting later attempts.
+func (s *Store) FailTerminal(ctx context.Context, task domain.AITask, token string, cause error) (time.Time, bool, error) {
+	return s.fail(ctx, task, token, cause, false, true)
+}
+
+// FailDocument changes the task and its document in one transaction. A retry
+// returns the document to uploaded; a terminal failure exposes failed to users.
+func (s *Store) FailDocument(ctx context.Context, task domain.AITask, token string, cause error, terminal bool) (time.Time, bool, error) {
+	return s.fail(ctx, task, token, cause, true, terminal)
+}
+
+func (s *Store) fail(ctx context.Context, task domain.AITask, token string, cause error, document, forceTerminal bool) (time.Time, bool, error) {
+	if cause == nil {
+		cause = errors.New("unknown error")
+	}
 	delay, retry := domain.RetryDelay(task.AttemptNo)
+	if forceTerminal {
+		retry = false
+	}
 	status := domain.TaskDead
 	available := time.Now().UTC()
 	if retry {
@@ -163,6 +189,23 @@ func (s *Store) Fail(ctx context.Context, task domain.AITask, token string, caus
 		}
 		if result.RowsAffected != 1 {
 			return errors.New("task lease lost")
+		}
+		if document {
+			documentID, err := documentIDFromTask(task)
+			if err != nil {
+				return err
+			}
+			documentStatus := "failed"
+			errorMessage := cause.Error()
+			if retry {
+				documentStatus = "uploaded"
+				errorMessage = ""
+			}
+			if err := tx.Model(&domain.Document{}).
+				Where("id=? AND indexing_task_id=? AND status NOT IN ('ready','deleting')", documentID, task.ID).
+				Updates(map[string]any{"status": documentStatus, "error_message": errorMessage, "updated_at": now}).Error; err != nil {
+				return err
+			}
 		}
 		if retry {
 			payload, _ := json.Marshal(map[string]any{"task_id": task.ID})
@@ -206,7 +249,7 @@ func (s *Store) CreateDocument(ctx context.Context, document domain.Document) (d
 	return document, task, err
 }
 
-func (s *Store) CompleteWithoutReport(ctx context.Context, task domain.AITask, token string) error {
+func (s *Store) CompleteDocumentIndex(ctx context.Context, task domain.AITask, token string, documentID uint64) error {
 	now := time.Now().UTC()
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Exec(`UPDATE ai_tasks SET status='succeeded',lease_token='',lease_until=NULL,updated_at=?
@@ -218,7 +261,25 @@ func (s *Store) CompleteWithoutReport(ctx context.Context, task domain.AITask, t
 		if result.RowsAffected != 1 {
 			return errors.New("task lease lost")
 		}
+		documentResult := tx.Exec(`UPDATE documents SET status='ready',error_message='',updated_at=?
+			WHERE id=? AND indexing_task_id=? AND status='indexing'`, now, documentID, task.ID)
+		if documentResult.Error != nil {
+			return documentResult.Error
+		}
+		if documentResult.RowsAffected != 1 {
+			return errors.New("document state changed before index completion")
+		}
 		return tx.Exec(`UPDATE task_attempts SET status='succeeded',finished_at=?
 			WHERE task_id=? AND execution_generation=? AND lease_token=?`, now, task.ID, task.ExecutionGeneration, token).Error
 	})
+}
+
+func documentIDFromTask(task domain.AITask) (uint64, error) {
+	var payload struct {
+		DocumentID uint64 `json:"document_id"`
+	}
+	if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil || payload.DocumentID == 0 {
+		return 0, errors.New("invalid document task payload")
+	}
+	return payload.DocumentID, nil
 }

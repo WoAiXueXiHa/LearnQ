@@ -18,7 +18,7 @@ func testQueue(t *testing.T) *queue.Redis {
 	t.Helper()
 	addr := os.Getenv("LEARNQ_TEST_REDIS_ADDR")
 	if addr == "" {
-		addr = "127.0.0.1:6379"
+		t.Skip("LEARNQ_TEST_REDIS_ADDR is required")
 	}
 	client := redis.NewClient(&redis.Options{Addr: addr})
 	if err := client.Ping(context.Background()).Err(); err != nil {
@@ -70,5 +70,24 @@ func TestFutureTaskIsNotClaimed(t *testing.T) {
 	}
 	if _, ok, err := q.Claim(ctx, time.Minute, "token"); err != nil || ok {
 		t.Fatalf("claim ok=%v err=%v", ok, err)
+	}
+}
+
+func TestWorkerHeartbeatExpires(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	alive, err := q.WorkerAlive(ctx)
+	if err != nil || alive {
+		t.Fatalf("initial alive=%v err=%v", alive, err)
+	}
+	if err := q.Heartbeat(ctx, 50*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if alive, err = q.WorkerAlive(ctx); err != nil || !alive {
+		t.Fatalf("heartbeat alive=%v err=%v", alive, err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if alive, err = q.WorkerAlive(ctx); err != nil || alive {
+		t.Fatalf("expired alive=%v err=%v", alive, err)
 	}
 }

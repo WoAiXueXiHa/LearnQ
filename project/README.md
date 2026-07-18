@@ -1,57 +1,187 @@
-# LearnQ
+# LearnQ 应用手册
 
-LearnQ 是面向本地单用户的 AI 学习任务调度参考项目。它把 MySQL 作为事实来源，通过 Transactional Outbox、Redis ZSet/Lua、lease fencing 和 Worker Pool 实现至少一次投递下的结果收敛，并在同一条 Skill 工作流中支持 Fake/Real 模型、Multi-Agent、混合 RAG 与离线评估。
+本手册只说明如何启动、配置、验证和排查 LearnQ。项目定位、架构和设计取舍见仓库根目录的 [README](../README.md)。
 
-> 安全边界：系统没有认证，只适合本机或受信网络。Compose 只把 API 绑定到 `127.0.0.1`，不要直接暴露公网。
+> LearnQ 没有用户认证。Compose 默认仅监听 `127.0.0.1`，请勿直接暴露到公网。
 
-## 架构
+## 环境要求
 
-```text
-Web/API -> MySQL(study/task/outbox/report/review/trace)
-                    |                  ^
-               Dispatcher             | fenced update
-                    v                  |
-             Redis ready ZSet --Lua-> Worker Pool(4)
-                                         |
-                             Skill / deterministic agents
-                               | Chat/Embedding model
-                               v
-                  Qdrant(dense + sparse + RRF, derived)
-```
+- Docker Engine 与 Docker Compose v2
+- `curl`、`jq` 和 `make`
+- 仅在本地直接运行 Go 进程或执行测试时需要 Go 1.25
 
-Task 状态机：
-
-```text
-pending -> queued -> processing -> succeeded
-                         |
-                         +-> retry_wait -> queued
-                         |
-                         +-> dead -> pending (人工新 generation)
-```
-
-MySQL 的 `study_records -> ai_tasks -> reports -> review_tasks` 保存业务事实；`outbox_events` 跨存储发布；`task_attempts` 和 agent/tool 表保存执行轨迹。Redis 和 Qdrant 是可从 MySQL 重建的派生状态。
-
-## 目录
-
-- `cmd/api`、`cmd/worker`、`cmd/migrate`：三个可执行入口。
-- `internal/store|queue|worker|dispatcher`：可靠异步闭环。
-- `internal/skill|model`：五个 Skill、确定性工作流与 Fake/Real adapter。
-- `internal/rag`：切块、dense/sparse、Qdrant RRF、指标。
-- `internal/api|web`：JSON API 与嵌入式中文页面。
-- `migrations`：只执行一次且校验 checksum 的 SQL migration。
-- `docs/reproduction`：从零复现材料。
-
-## Fake 模式启动
-
-有 Docker 时：
+## 启动与停止
 
 ```bash
 cp .env.example .env
-docker compose up --build
-curl http://127.0.0.1:8080/health/ready
+docker compose up --build -d
+curl -fsS http://127.0.0.1:8080/health/ready | jq
 ```
 
-页面位于 `http://127.0.0.1:8080/`。无 Docker 时可自行启动 MySQL/Redis/Qdrant，再运行：
+浏览器访问 <http://127.0.0.1:8080/>。就绪响应中的 `mysql`、`redis`、`qdrant` 和 `worker` 应全部为 `ok`。
+
+查看状态和日志：
+
+```bash
+docker compose ps
+docker compose logs -f api worker
+```
+
+停止服务并保留数据卷：
+
+```bash
+make down
+```
+
+仅在确认不需要本地数据时清空数据卷：
+
+```bash
+make reset-data
+```
+
+如果 8080 端口被占用，可以修改 `.env`：
+
+```dotenv
+LEARNQ_HTTP_PORT=18080
+```
+
+随后使用对应端口访问页面和健康检查。
+
+## 模型配置
+
+默认配置为 `AI_MODE=fake`，不会调用外部模型，也不需要 API Key。该模式能够演示学习报告、复习、文档索引、RAG、Skill 和 Trace 的完整链路，推荐用于本地开发和自动验收。
+
+真实模型模式需要同时配置 Chat 与 Embedding：
+
+```dotenv
+AI_MODE=real
+AI_CHAT_BASE_URL=https://api.deepseek.com
+AI_CHAT_API_KEY=replace-me
+AI_CHAT_MODEL=deepseek-v4-pro
+AI_EMBEDDING_BASE_URL=https://api.openai.com/v1
+AI_EMBEDDING_API_KEY=replace-me
+AI_EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIM=64
+```
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `HTTP_ADDR` | `127.0.0.1:8080` | 本地进程监听地址；Compose 内部会覆盖为 `0.0.0.0:8080` |
+| `MYSQL_DSN` | 见 `.env.example` | MySQL 连接串 |
+| `REDIS_ADDR` | `127.0.0.1:6379` | Redis 地址 |
+| `QDRANT_URL` | `http://127.0.0.1:6333` | Qdrant HTTP 地址 |
+| `AI_MODE` | `fake` | `fake` 或 `real` |
+| `REPORT_DIR` | `data/reports` | Markdown 报告导出目录 |
+| `LEARNQ_HTTP_PORT` | `8080` | Compose 对宿主机暴露的端口 |
+
+不要提交包含真实密钥的 `.env`。修改 `EMBEDDING_DIM` 后，必须确保它与现有 Qdrant collection 一致；开发环境中如需重建索引，应先确认数据可以清除。
+
+## 核心 API
+
+成功响应使用 `data/request_id` envelope，错误响应包含 `code`、`message`、`request_id` 和 `details`；所有响应都带有 `X-Request-ID`。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/health/live` | 进程存活检查 |
+| `GET` | `/health/ready` | MySQL、Redis、Qdrant、Worker 就绪检查 |
+| `POST` | `/api/v1/study-records` | 创建学习记录和异步报告任务 |
+| `GET` | `/api/v1/study-records` | 查询最近学习记录 |
+| `GET` | `/api/v1/tasks/:id/detail` | 查询任务、报告、复习和 Trace |
+| `POST` | `/api/v1/tasks/:id/retry` | 重试已经终止的任务 |
+| `GET` | `/api/v1/review-tasks?scope=due` | 查询复习任务；空结果为 `[]` |
+| `POST` | `/api/v1/review-tasks/:id/complete` | 完成复习并提交掌握程度 |
+| `POST` | `/api/v1/review-tasks/:id/skip` | 延后一天 |
+| `GET` | `/api/v1/skills` | 查询 Skill Registry |
+| `POST` | `/api/v1/skills/:name/runs` | 手动运行 Skill |
+| `POST` | `/api/v1/documents` | 上传 UTF-8 Markdown、TXT 或 JSON 文档 |
+| `GET` | `/api/v1/documents` | 查询文档及索引状态 |
+| `DELETE` | `/api/v1/documents/:id` | 删除文档和向量索引 |
+| `POST` | `/api/v1/rag/query` | 基于已就绪文档进行 RAG 查询 |
+| `POST` | `/api/v1/evaluations/rag` | 执行 RAG 离线评估 |
+| `GET` | `/api/v1/analytics/weekly` | 查询周统计 |
+
+创建学习记录：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/study-records \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: readme-demo-001' \
+  -d '{
+    "title":"Redis 任务队列",
+    "summary":"整理 ZSet、Lua 原子领取和 lease fencing",
+    "duration_minutes":60,
+    "modules":[{"category":"backend","content":"完成任务领取与恢复测试"}]
+  }' | jq
+```
+
+查询任务详情：
+
+```bash
+curl -fsS http://127.0.0.1:8080/api/v1/tasks/1/detail | jq
+```
+
+上传并查询文档：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/documents \
+  -F 'file=@README.md;type=text/markdown' | jq
+
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/rag/query \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"LearnQ 的任务如何恢复？","top_k":5}' | jq
+```
+
+## 验证
+
+代码质量与单元测试：
+
+```bash
+make fmt-check
+make vet
+make test
+GOWORK=off go test -race ./...
+```
+
+带 MySQL 和 Redis 的集成测试：
+
+```bash
+make test-integration
+```
+
+执行前应提供测试所需的 `MYSQL_DSN`、`REDIS_ADDR` 和 `QDRANT_URL`。测试会使用独立数据并在结束后清理。
+
+完整验收：
+
+```bash
+make acceptance
+```
+
+验收脚本会创建独立的 Compose 项目、端口和数据卷，覆盖：
+
+- 服务构建与就绪检查
+- 学习记录、异步报告、复习计划与幂等
+- Skill、Multi-Agent 和执行轨迹
+- 文档索引、RAG 引用和离线评估
+- 周统计与 Worker 停启恢复
+
+脚本退出时会清理自己的容器和数据卷，不影响默认 LearnQ 环境。自动测试始终使用 Fake 或 Mock 模型，不会产生付费 API 调用。
+
+## 常见问题
+
+| 现象 | 检查与处理 |
+|---|---|
+| `/health/ready` 返回 503 | 查看响应中的 `dependencies`，再检查对应容器和 `api/worker` 日志 |
+| 页面一直显示任务处理中 | 确认 `worker` 为 `ok`，查看任务 `last_error` 和 Worker 日志 |
+| 8080 端口被占用 | 在 `.env` 设置新的 `LEARNQ_HTTP_PORT` 后重启 Compose |
+| Real 模式启动失败 | 检查两套 Base URL、API Key、模型名和 `EMBEDDING_DIM` 是否完整 |
+| Qdrant 提示维度不一致 | 恢复原维度；仅在可丢弃本地索引时才清理并重建数据卷 |
+| 文档无法索引 | 确认文件为 UTF-8 的 Markdown、TXT 或 JSON，且不超过 5 MiB |
+| RAG 按钮不可用 | 至少等待一个文档状态变为“可查询” |
+| 需要重新开始演示 | 先确认本地数据无保留价值，再运行 `make reset-data` 并重新启动 |
+
+## 本地直接运行
+
+仅在已经自行准备 MySQL、Redis 和 Qdrant 时使用：
 
 ```bash
 GOWORK=off go run ./cmd/migrate
@@ -59,34 +189,4 @@ GOWORK=off go run ./cmd/worker
 GOWORK=off go run ./cmd/api
 ```
 
-## Real 模式
-
-设置 `AI_MODE=real`、`AI_BASE_URL`、`AI_API_KEY`、`AI_CHAT_MODEL`、`AI_EMBEDDING_MODEL` 和 `EMBEDDING_DIM`。Real adapter 使用 OpenAI-compatible Chat Completions/Embeddings 接口；密钥不得提交。Fake 与 Real 共用 Skill、Schema 和工作流边界。
-
-## API 与 Web
-
-实现了需求列出的 `/api/v1/study-records`、Task/trace/retry、report、review、skills、documents、RAG、evaluation、weekly analytics，以及 `/health/live|ready`。成功响应使用 `data/request_id` envelope，错误返回 `code/message/request_id/details`，所有 HTTP 响应含 `X-Request-ID`。
-
-学习记录提交需要最大 128 bytes 的 `Idempotency-Key`；同键同请求重放首次结果，不同请求返回 409。上传接受 UTF-8 Markdown/TXT/JSON，最大 5 MiB。
-
-## RAG 与评估
-
-文本按约 800 rune、120 rune 重叠切块并保留标题、顺序、行号与 SHA-256。稀疏向量是英文 token + 中文 unigram/bigram + FNV-1a + log-TF 的 hashed lexical retrieval，不称为 BM25。Qdrant adapter 发送 dense/sparse 各 Top 20 的 prefetch，并由 Query API 做 RRF。
-
-离线指标代码提供 Recall@K、NDCG 和引用覆盖率，报告区分 Fake `pipeline_test` 与 Real `retrieval_benchmark`。
-
-## 构建和测试
-
-```bash
-make fmt-check
-make vet
-make test
-make test-integration   # 需要依赖
-make acceptance        # 需要 Docker
-```
-
-任务硬超时 45s、lease 60s、最多执行 3 次，前两次失败分别等待 2s/4s。系统不承诺 exactly-once：Redis Lua 只能原子领取队列项，旧 Worker 的外部调用仍可能发生；最终 MySQL 写入同时检查状态、generation、lease token 和 lease 有效期。
-
-故障恢复由 Outbox 重放、lease Reaper 和 Reconciler 负责。报告正文以 MySQL 为准，`data/reports` 只是可重建的原子导出副本。
-
-验收矩阵见 [docs/ACCEPTANCE_MATRIX.md](docs/ACCEPTANCE_MATRIX.md)，复现入口见 [docs/reproduction/00-overview.md](docs/reproduction/00-overview.md)。
+三个进程需要使用同一套环境变量；先执行迁移，再启动 Worker 和 API。

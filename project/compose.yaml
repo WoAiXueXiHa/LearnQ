@@ -1,3 +1,18 @@
+x-app-environment: &app-environment
+  MYSQL_DSN: learnq:learnq@tcp(mysql:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true&timeout=5s&readTimeout=10s&writeTimeout=10s
+  REDIS_ADDR: redis:6379
+  QDRANT_URL: http://qdrant:6333
+  AI_MODE: ${AI_MODE:-fake}
+  AI_CHAT_BASE_URL: ${AI_CHAT_BASE_URL:-https://api.deepseek.com}
+  AI_CHAT_API_KEY: ${AI_CHAT_API_KEY:-}
+  AI_CHAT_MODEL: ${AI_CHAT_MODEL:-deepseek-v4-pro}
+  AI_EMBEDDING_BASE_URL: ${AI_EMBEDDING_BASE_URL:-https://api.openai.com/v1}
+  AI_EMBEDDING_API_KEY: ${AI_EMBEDDING_API_KEY:-}
+  AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-text-embedding-3-small}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-64}
+  HTTP_ADDR: 0.0.0.0:8080
+  REPORT_DIR: /app/data/reports
+
 services:
   mysql:
     image: mysql:8.4.10
@@ -32,26 +47,21 @@ services:
     volumes: [qdrant-data:/qdrant/storage]
   migration:
     build: {context: ., args: {TARGET: migrate}}
-    environment: &env
-      MYSQL_DSN: learnq:learnq@tcp(mysql:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true
-      REDIS_ADDR: redis:6379
-      QDRANT_URL: http://qdrant:6333
-      AI_MODE: fake
-      HTTP_ADDR: 0.0.0.0:8080
-      REPORT_DIR: /app/data/reports
+    environment:
+      MYSQL_DSN: learnq:learnq@tcp(mysql:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true&timeout=5s&readTimeout=10s&writeTimeout=10s
     depends_on:
       mysql: {condition: service_healthy}
   api:
     build: {context: ., args: {TARGET: api}}
-    environment: *env
-    ports: ["127.0.0.1:8080:8080"]
+    environment: *app-environment
+    ports: ["127.0.0.1:${LEARNQ_HTTP_PORT:-8080}:8080"]
     depends_on:
       migration: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
       qdrant: {condition: service_healthy}
   worker:
     build: {context: ., args: {TARGET: worker}}
-    environment: *env
+    environment: *app-environment
     volumes: [reports:/app/data/reports]
     depends_on:
       migration: {condition: service_completed_successfully}

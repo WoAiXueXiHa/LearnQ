@@ -50,7 +50,25 @@ func (f Fake) Generate(ctx context.Context, req ChatRequest) (ChatResponse, erro
 	case "invalid_json":
 		return ChatResponse{Content: "{"}, nil
 	}
-	inputSummary := compactJSON(req.Input, 180)
+	if req.Skill == "rag-answer" {
+		var input struct {
+			Question string `json:"question"`
+			Evidence []struct {
+				Source  string `json:"source"`
+				Content string `json:"content"`
+			} `json:"evidence"`
+		}
+		if err := json.Unmarshal(req.Input, &input); err != nil || len(input.Evidence) == 0 {
+			return ChatResponse{}, errors.New("rag answer requires evidence")
+		}
+		answer := fmt.Sprintf("关于“%s”，可核验资料指出：%s [%s]", input.Question, strings.TrimSpace(input.Evidence[0].Content), input.Evidence[0].Source)
+		content, _ := json.Marshal(map[string]string{"answer": answer})
+		return ChatResponse{
+			Content: string(content), InputTokens: len([]rune(req.Prompt)) / 4,
+			OutputTokens: len(content) / 4, Model: "learnq-fake-chat-v1",
+		}, nil
+	}
+	inputSummary, topic := summarizeFakeInput(req.Input)
 	title, summary := "LearnQ 学习报告", "已根据输入事实生成确定性结果。"
 	sections := []map[string]string{{"heading": "输入事实", "content": inputSummary}}
 	switch req.Skill {
@@ -58,8 +76,9 @@ func (f Fake) Generate(ctx context.Context, req ChatRequest) (ChatResponse, erro
 		title = "每日学习复盘"
 		summary = "复盘仅使用本次学习记录中的事实。"
 		sections = append(sections,
-			map[string]string{"heading": "回顾", "content": "整理本次主题、模块与投入时间。"},
-			map[string]string{"heading": "下一步", "content": "依据记录内容安排一次可验证的后续行动。"})
+			map[string]string{"heading": "理解检查", "content": fmt.Sprintf("- 不看笔记，用自己的话解释“%s”。\n- 说明一个容易出错的边界条件。", topic)},
+			map[string]string{"heading": "面试追问", "content": fmt.Sprintf("为什么在“%s”中采用当前方案？如果依赖失败或并发增加，正确性如何保证？", topic)},
+			map[string]string{"heading": "下一步", "content": fmt.Sprintf("围绕“%s”完成一次最小可运行验证，并记录输入、预期结果和实际结果。", topic)})
 	case "algorithm-diagnosis":
 		title = "算法学习诊断"
 		summary = "从思路、边界和复杂度三个角度检查算法记录。"
@@ -104,6 +123,52 @@ func compactJSON(raw json.RawMessage, limit int) string {
 		value = string(runes[:limit]) + "…"
 	}
 	return value
+}
+
+func summarizeFakeInput(raw json.RawMessage) (string, string) {
+	var input struct {
+		Title           string `json:"title"`
+		Topic           string `json:"topic"`
+		Summary         string `json:"summary"`
+		Question        string `json:"question"`
+		DurationMinutes int    `json:"duration_minutes"`
+		Modules         []struct {
+			Category string `json:"category"`
+			Content  string `json:"content"`
+		} `json:"modules"`
+	}
+	if json.Unmarshal(raw, &input) != nil {
+		return compactJSON(raw, 240), "本次学习主题"
+	}
+	topic := strings.TrimSpace(input.Title)
+	if topic == "" {
+		topic = strings.TrimSpace(input.Topic)
+	}
+	if topic == "" {
+		topic = "本次学习主题"
+	}
+	lines := []string{"- 主题：" + topic}
+	if value := strings.TrimSpace(input.Summary); value != "" {
+		lines = append(lines, "- 摘要："+value)
+	}
+	if value := strings.TrimSpace(input.Question); value != "" {
+		lines = append(lines, "- 问题："+value)
+	}
+	if input.DurationMinutes > 0 {
+		lines = append(lines, fmt.Sprintf("- 投入：%d 分钟", input.DurationMinutes))
+	}
+	for _, module := range input.Modules {
+		content := strings.TrimSpace(module.Content)
+		if content == "" {
+			continue
+		}
+		category := strings.TrimSpace(module.Category)
+		if category == "" {
+			category = "未分类"
+		}
+		lines = append(lines, fmt.Sprintf("- 模块（%s）：%s", category, content))
+	}
+	return strings.Join(lines, "\n"), topic
 }
 
 func (f Fake) Embed(ctx context.Context, texts []string) ([][]float32, error) {

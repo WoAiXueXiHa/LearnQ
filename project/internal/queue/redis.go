@@ -9,10 +9,33 @@ import (
 )
 
 const (
-	ReadyKey      = "learnq:tasks:ready"
-	ProcessingKey = "learnq:tasks:processing"
-	LeaseTokenKey = "learnq:tasks:lease_tokens"
+	ReadyKey           = "learnq:tasks:ready"
+	ProcessingKey      = "learnq:tasks:processing"
+	LeaseTokenKey      = "learnq:tasks:lease_tokens"
+	WorkerHeartbeatKey = "learnq:worker:heartbeat"
 )
+
+var ackScript = redis.NewScript(`
+local member = KEYS[1]
+local stored = redis.call("HGET", KEYS[2], member)
+if stored == ARGV[1] then
+	redis.call("ZREM", KEYS[3], member)
+	redis.call("HDEL", KEYS[2], member)
+	return 1
+end
+return 0
+`)
+
+var cleanupScript = redis.NewScript(`
+local member = KEYS[1]
+local stored = redis.call("HGET", KEYS[2], member)
+if (ARGV[1] == "__missing__" and not stored) or stored == ARGV[1] then
+	redis.call("ZREM", KEYS[3], member)
+	redis.call("HDEL", KEYS[2], member)
+	return 1
+end
+return 0
+`)
 
 var claimScript = redis.NewScript(`
 local now = redis.call("TIME")
@@ -48,36 +71,42 @@ func (q *Redis) Claim(ctx context.Context, lease time.Duration, token string) (u
 
 func (q *Redis) Ack(ctx context.Context, id uint64, token string) error {
 	key := strconv.FormatUint(id, 10)
-	current, err := q.client.HGet(ctx, LeaseTokenKey, key).Result()
-	if err != nil && err != redis.Nil {
-		return err
-	}
-	if current != token {
+	_, err := ackScript.Run(ctx, q.client, []string{key, LeaseTokenKey, ProcessingKey}, token).Result()
+	if err == redis.Nil {
 		return nil
 	}
-	pipe := q.client.TxPipeline()
-	pipe.ZRem(ctx, ProcessingKey, key)
-	pipe.HDel(ctx, LeaseTokenKey, key)
-	_, err = pipe.Exec(ctx)
 	return err
 }
 
-func (q *Redis) Expired(ctx context.Context) ([]uint64, error) {
-	now, err := q.client.Time(ctx).Result()
-	if err != nil {
-		return nil, err
+// Cleanup removes an observed stale processing entry without racing a newer
+// claim. The Lua script only removes the entry if its token is still the one
+// observed before reconciliation.
+func (q *Redis) Cleanup(ctx context.Context, id uint64) error {
+	key := strconv.FormatUint(id, 10)
+	token, err := q.client.HGet(ctx, LeaseTokenKey, key).Result()
+	if err == redis.Nil {
+		token = "__missing__"
+	} else if err != nil {
+		return err
 	}
-	values, err := q.client.ZRangeByScore(ctx, ProcessingKey, &redis.ZRangeBy{Min: "-inf", Max: strconv.FormatInt(now.UnixMilli(), 10)}).Result()
-	if err != nil {
-		return nil, err
+	_, err = cleanupScript.Run(ctx, q.client, []string{key, LeaseTokenKey, ProcessingKey}, token).Result()
+	if err == redis.Nil {
+		return nil
 	}
-	out := make([]uint64, 0, len(values))
-	for _, value := range values {
-		if id, parseErr := strconv.ParseUint(value, 10, 64); parseErr == nil {
-			out = append(out, id)
-		}
-	}
-	return out, nil
+	return err
+}
+
+func (q *Redis) Processing(ctx context.Context) ([]string, error) {
+	return q.client.ZRange(ctx, ProcessingKey, 0, -1).Result()
+}
+
+func (q *Redis) Heartbeat(ctx context.Context, ttl time.Duration) error {
+	return q.client.Set(ctx, WorkerHeartbeatKey, time.Now().UTC().Format(time.RFC3339Nano), ttl).Err()
+}
+
+func (q *Redis) WorkerAlive(ctx context.Context) (bool, error) {
+	count, err := q.client.Exists(ctx, WorkerHeartbeatKey).Result()
+	return count == 1, err
 }
 
 func (q *Redis) Client() *redis.Client { return q.client }

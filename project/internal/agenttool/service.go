@@ -3,6 +3,7 @@ package agenttool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -55,8 +56,11 @@ func (s Service) RAGQuery(ctx context.Context, input json.RawMessage) (json.RawM
 		return nil, nil, fmt.Errorf("rag_query needs question, topic, summary or title")
 	}
 	vectors, err := s.Embedding.Embed(ctx, []string{question})
-	if err != nil || len(vectors) != 1 {
+	if err != nil {
 		return nil, nil, fmt.Errorf("embed query: %w", err)
+	}
+	if len(vectors) != 1 {
+		return nil, nil, fmt.Errorf("embed query returned %d vectors, want 1", len(vectors))
 	}
 	hits, err := s.Vectors.Hybrid(ctx, vectors[0], rag.Sparse(question), 5)
 	if err != nil {
@@ -70,7 +74,10 @@ func (s Service) RAGQuery(ctx context.Context, input json.RawMessage) (json.RawM
 			Joins("JOIN documents d ON d.id=dc.document_id").
 			Where("dc.id=? AND d.status='ready'", chunkID).Take(&chunk)
 		if result.Error != nil {
-			continue
+			if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+				continue
+			}
+			return nil, nil, fmt.Errorf("load RAG citation %s: %w", chunkID, result.Error)
 		}
 		citations = append(citations, map[string]any{
 			"source": fmt.Sprintf("S%d", len(citations)+1), "document_id": chunk.DocumentID,

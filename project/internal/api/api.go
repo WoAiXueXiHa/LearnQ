@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -27,11 +29,15 @@ type Server struct {
 	skills    *skill.Registry
 	engine    *gin.Engine
 	recorder  trace.Recorder
+	chat      model.ChatModel
 	embedding model.EmbeddingModel
 	vectors   interface {
 		evaluation.Retriever
 		DeleteDocument(context.Context, uint64) error
 	}
+	redisCheck  func(context.Context) error
+	qdrantCheck func(context.Context) error
+	workerCheck func(context.Context) (bool, error)
 }
 
 type errBody struct {
@@ -43,13 +49,27 @@ type errBody struct {
 
 type Option func(*Server)
 
-func WithRAG(embedding model.EmbeddingModel, vectors interface {
+func WithRAG(chat model.ChatModel, embedding model.EmbeddingModel, vectors interface {
 	evaluation.Retriever
 	DeleteDocument(context.Context, uint64) error
 }) Option {
 	return func(server *Server) {
+		server.chat = chat
 		server.embedding = embedding
 		server.vectors = vectors
+	}
+}
+
+func WithHealthChecks(redisCheck, qdrantCheck func(context.Context) error) Option {
+	return func(server *Server) {
+		server.redisCheck = redisCheck
+		server.qdrantCheck = qdrantCheck
+	}
+}
+
+func WithWorkerCheck(check func(context.Context) (bool, error)) Option {
+	return func(server *Server) {
+		server.workerCheck = check
 	}
 }
 
@@ -122,12 +142,49 @@ func (s *Server) routes() {
 }
 
 func (s *Server) ready(c *gin.Context) {
+	dependencies := gin.H{"mysql": "ok", "redis": "not_configured", "qdrant": "not_configured", "worker": "not_configured"}
+	unavailable := make([]string, 0, 4)
 	sqlDB, err := s.store.DB.DB()
-	if err != nil || sqlDB.PingContext(c) != nil {
-		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "MySQL is unavailable", nil)
+	mysqlCtx, mysqlCancel := context.WithTimeout(c, 2*time.Second)
+	if err != nil || sqlDB.PingContext(mysqlCtx) != nil {
+		dependencies["mysql"] = "unavailable"
+		unavailable = append(unavailable, "mysql")
+	}
+	mysqlCancel()
+	if s.redisCheck != nil {
+		dependencies["redis"] = "ok"
+		checkCtx, cancel := context.WithTimeout(c, 2*time.Second)
+		if err := s.redisCheck(checkCtx); err != nil {
+			dependencies["redis"] = "unavailable"
+			unavailable = append(unavailable, "redis")
+		}
+		cancel()
+	}
+	if s.qdrantCheck != nil {
+		dependencies["qdrant"] = "ok"
+		checkCtx, cancel := context.WithTimeout(c, 2*time.Second)
+		if err := s.qdrantCheck(checkCtx); err != nil {
+			dependencies["qdrant"] = "unavailable"
+			unavailable = append(unavailable, "qdrant")
+		}
+		cancel()
+	}
+	if s.workerCheck != nil {
+		dependencies["worker"] = "ok"
+		checkCtx, cancel := context.WithTimeout(c, 2*time.Second)
+		alive, err := s.workerCheck(checkCtx)
+		cancel()
+		if err != nil || !alive {
+			dependencies["worker"] = "unavailable"
+			unavailable = append(unavailable, "worker")
+		}
+	}
+	if len(unavailable) > 0 {
+		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "dependencies are unavailable",
+			gin.H{"status": "not_ready", "dependencies": dependencies, "unavailable": unavailable})
 		return
 	}
-	ok(c, 200, gin.H{"status": "ready"})
+	ok(c, 200, gin.H{"status": "ready", "dependencies": dependencies})
 }
 
 func parseID(c *gin.Context) (uint64, bool) {
@@ -137,6 +194,18 @@ func parseID(c *gin.Context) (uint64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+func lookupFailed(c *gin.Context, err error, message string) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		notFound(c)
+		return true
+	}
+	fail(c, 500, "INTERNAL_ERROR", message, nil)
+	return true
 }
 
 func (s *Server) createStudyRecord(c *gin.Context) {
@@ -257,25 +326,50 @@ func (s *Server) getStudyRecord(c *gin.Context) {
 		return
 	}
 	var record domain.StudyRecord
-	if err := s.store.DB.Preload("Modules").First(&record, id).Error; err != nil {
-		notFound(c)
+	if lookupFailed(c, s.store.DB.Preload("Modules").First(&record, id).Error, "could not load study record") {
 		return
 	}
 	ok(c, 200, record)
 }
 func (s *Server) listStudyRecords(c *gin.Context) {
 	var records []domain.StudyRecord
-	s.store.DB.Preload("Modules").Order("id DESC").Limit(100).Find(&records)
+	if err := s.store.DB.Preload("Modules").Order("id DESC").Limit(100).Find(&records).Error; err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not list study records", nil)
+		return
+	}
 	type item struct {
 		domain.StudyRecord
 		TaskID     uint64            `json:"task_id"`
 		TaskStatus domain.TaskStatus `json:"task_status"`
 	}
+	recordIDs := make([]uint64, 0, len(records))
+	for _, record := range records {
+		recordIDs = append(recordIDs, record.ID)
+	}
+	var tasks []domain.AITask
+	if len(recordIDs) > 0 {
+		if err := s.store.DB.Where(`kind='study_report' AND CAST(JSON_UNQUOTE(JSON_EXTRACT(payload_json,'$.study_record_id')) AS UNSIGNED) IN ?`, recordIDs).
+			Order("id").Find(&tasks).Error; err != nil {
+			fail(c, 500, "INTERNAL_ERROR", "could not list study record tasks", nil)
+			return
+		}
+	}
+	latest := make(map[uint64]domain.AITask, len(tasks))
+	for _, task := range tasks {
+		var payload struct {
+			StudyRecordID uint64 `json:"study_record_id"`
+		}
+		if json.Unmarshal([]byte(task.PayloadJSON), &payload) == nil {
+			latest[payload.StudyRecordID] = task
+		}
+	}
 	result := make([]item, 0, len(records))
 	for _, record := range records {
-		var task domain.AITask
-		s.store.DB.Where(`kind='study_report' AND JSON_UNQUOTE(JSON_EXTRACT(payload_json,'$.study_record_id'))=?`, record.ID).
-			Order("id DESC").First(&task)
+		task, exists := latest[record.ID]
+		if !exists {
+			result = append(result, item{StudyRecord: record, TaskID: 0, TaskStatus: "pending"})
+			continue
+		}
 		result = append(result, item{StudyRecord: record, TaskID: task.ID, TaskStatus: task.Status})
 	}
 	ok(c, 200, result)
@@ -286,8 +380,7 @@ func (s *Server) getTask(c *gin.Context) {
 		return
 	}
 	var task domain.AITask
-	if err := s.store.DB.First(&task, id).Error; err != nil {
-		notFound(c)
+	if lookupFailed(c, s.store.DB.First(&task, id).Error, "could not load task") {
 		return
 	}
 	ok(c, 200, task)
@@ -298,36 +391,65 @@ func (s *Server) taskDetail(c *gin.Context) {
 		return
 	}
 	var task domain.AITask
-	if err := s.store.DB.First(&task, id).Error; err != nil {
-		notFound(c)
+	if lookupFailed(c, s.store.DB.First(&task, id).Error, "could not load task detail") {
 		return
 	}
 	var payload struct {
 		StudyRecordID uint64 `json:"study_record_id"`
 		DocumentID    uint64 `json:"document_id"`
 	}
-	_ = json.Unmarshal([]byte(task.PayloadJSON), &payload)
+	if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "task payload is invalid", nil)
+		return
+	}
 	var record *domain.StudyRecord
 	if payload.StudyRecordID != 0 {
 		var value domain.StudyRecord
-		if s.store.DB.Preload("Modules").First(&value, payload.StudyRecordID).Error == nil {
+		err := s.store.DB.Preload("Modules").First(&value, payload.StudyRecordID).Error
+		if err == nil {
 			record = &value
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			fail(c, 500, "INTERNAL_ERROR", "could not load task study record", nil)
+			return
+		}
+	}
+	var document *domain.Document
+	if payload.DocumentID != 0 {
+		var value domain.Document
+		err := s.store.DB.First(&value, payload.DocumentID).Error
+		if err == nil {
+			document = &value
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			fail(c, 500, "INTERNAL_ERROR", "could not load task document", nil)
+			return
 		}
 	}
 	var report *domain.Report
 	var review *domain.ReviewTask
 	var reportValue domain.Report
-	if s.store.DB.Where("task_id=?", task.ID).First(&reportValue).Error == nil {
+	reportErr := s.store.DB.Where("task_id=?", task.ID).First(&reportValue).Error
+	if reportErr == nil {
 		report = &reportValue
 		var reviewValue domain.ReviewTask
-		if s.store.DB.Where("report_id=?", reportValue.ID).First(&reviewValue).Error == nil {
+		reviewErr := s.store.DB.Where("report_id=?", reportValue.ID).First(&reviewValue).Error
+		if reviewErr == nil {
 			review = &reviewValue
+		} else if !errors.Is(reviewErr, gorm.ErrRecordNotFound) {
+			fail(c, 500, "INTERNAL_ERROR", "could not load task review", nil)
+			return
 		}
+	} else if !errors.Is(reportErr, gorm.ErrRecordNotFound) {
+		fail(c, 500, "INTERNAL_ERROR", "could not load task report", nil)
+		return
 	}
-	traceData := s.loadTrace(task.ID)
+	traceData, err := s.loadTrace(task.ID)
+	if err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not load task trace", nil)
+		return
+	}
 	ok(c, 200, gin.H{
 		"task": task, "study_record": record, "report": report, "review_task": review,
-		"trace": traceData, "document_id": payload.DocumentID,
+		"trace": traceData, "document_id": payload.DocumentID, "document": document,
 	})
 }
 func (s *Server) trace(c *gin.Context) {
@@ -335,14 +457,27 @@ func (s *Server) trace(c *gin.Context) {
 	if !valid {
 		return
 	}
-	ok(c, 200, s.loadTrace(id))
+	var task domain.AITask
+	if lookupFailed(c, s.store.DB.First(&task, id).Error, "could not load task") {
+		return
+	}
+	traceData, err := s.loadTrace(id)
+	if err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not load task trace", nil)
+		return
+	}
+	ok(c, 200, traceData)
 }
 
-func (s *Server) loadTrace(id uint64) gin.H {
+func (s *Server) loadTrace(id uint64) (gin.H, error) {
 	var attempts []domain.TaskAttempt
-	s.store.DB.Where("task_id=?", id).Order("execution_generation,attempt_no").Find(&attempts)
+	if err := s.store.DB.Where("task_id=?", id).Order("execution_generation,attempt_no").Find(&attempts).Error; err != nil {
+		return nil, err
+	}
 	var runs []map[string]any
-	s.store.DB.Table("agent_runs").Where("task_id=?", id).Order("id").Find(&runs)
+	if err := s.store.DB.Table("agent_runs").Where("task_id=?", id).Order("id").Find(&runs).Error; err != nil {
+		return nil, err
+	}
 	runIDs := make([]uint64, 0, len(runs))
 	for _, run := range runs {
 		switch value := run["id"].(type) {
@@ -354,25 +489,83 @@ func (s *Server) loadTrace(id uint64) gin.H {
 	}
 	var steps, tools []map[string]any
 	if len(runIDs) > 0 {
-		s.store.DB.Table("agent_steps").Where("agent_run_id IN ?", runIDs).Order("id").Find(&steps)
-		s.store.DB.Table("tool_calls").Where("agent_run_id IN ?", runIDs).Order("id").Find(&tools)
+		if err := s.store.DB.Table("agent_steps").Where("agent_run_id IN ?", runIDs).Order("id").Find(&steps).Error; err != nil {
+			return nil, err
+		}
+		if err := s.store.DB.Table("tool_calls").Where("agent_run_id IN ?", runIDs).Order("id").Find(&tools).Error; err != nil {
+			return nil, err
+		}
 	}
-	return gin.H{"attempts": attempts, "agent_runs": runs, "agent_steps": steps, "tool_calls": tools}
+	return gin.H{"attempts": attempts, "agent_runs": runs, "agent_steps": steps, "tool_calls": tools}, nil
 }
 func (s *Server) retryTask(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
 		return
 	}
-	now := time.Now().UTC()
-	result := s.store.DB.Exec(`UPDATE ai_tasks SET status='pending',attempt_no=0,execution_generation=execution_generation+1,
-		available_at=?,last_error='',updated_at=? WHERE id=? AND status='dead'`, now, now, id)
-	if result.RowsAffected != 1 {
+	var task domain.AITask
+	if lookupFailed(c, s.store.DB.First(&task, id).Error, "could not load task") {
+		return
+	}
+	if task.Status != domain.TaskDead {
 		fail(c, 409, "TASK_NOT_RETRYABLE", "only dead tasks may be retried", nil)
 		return
 	}
-	payload, _ := json.Marshal(gin.H{"task_id": id})
-	s.store.DB.Create(&domain.OutboxEvent{AggregateID: id, EventType: "ai_task.manual_retry", PayloadJSON: string(payload), CreatedAt: now})
+	var documentID uint64
+	if task.Kind == "document_index" {
+		var payload struct {
+			DocumentID uint64 `json:"document_id"`
+		}
+		if json.Unmarshal([]byte(task.PayloadJSON), &payload) != nil || payload.DocumentID == 0 {
+			fail(c, 500, "INTERNAL_ERROR", "document task payload is invalid", nil)
+			return
+		}
+		var document domain.Document
+		if lookupFailed(c, s.store.DB.First(&document, payload.DocumentID).Error, "could not load task document") {
+			return
+		}
+		if document.Status != "failed" {
+			fail(c, 409, "DOCUMENT_NOT_RETRYABLE", "only failed documents may be retried", gin.H{"status": document.Status})
+			return
+		}
+		documentID = document.ID
+	}
+	now := time.Now().UTC()
+	var updated bool
+	err := s.store.DB.Transaction(func(tx *gorm.DB) error {
+		result := tx.Exec(`UPDATE ai_tasks SET status='pending',attempt_no=0,execution_generation=execution_generation+1,
+			available_at=?,last_error='',updated_at=? WHERE id=? AND status='dead'`, now, now, id)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		if documentID != 0 {
+			result = tx.Model(&domain.Document{}).Where("id=? AND status='failed'", documentID).
+				Updates(map[string]any{"status": "uploaded", "error_message": "", "updated_at": now})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return fmt.Errorf("document state changed before retry")
+			}
+		}
+		payload, _ := json.Marshal(gin.H{"task_id": id})
+		if err := tx.Create(&domain.OutboxEvent{AggregateID: id, EventType: "ai_task.manual_retry", PayloadJSON: string(payload), CreatedAt: now}).Error; err != nil {
+			return err
+		}
+		updated = true
+		return nil
+	})
+	if err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "retry failed", nil)
+		return
+	}
+	if !updated {
+		fail(c, 409, "TASK_NOT_RETRYABLE", "only dead tasks may be retried", nil)
+		return
+	}
 	ok(c, 202, gin.H{"task_id": id, "status": "pending"})
 }
 func (s *Server) getReport(c *gin.Context) {
@@ -381,8 +574,7 @@ func (s *Server) getReport(c *gin.Context) {
 		return
 	}
 	var v domain.Report
-	if s.store.DB.First(&v, id).Error != nil {
-		notFound(c)
+	if lookupFailed(c, s.store.DB.First(&v, id).Error, "could not load report") {
 		return
 	}
 	ok(c, 200, v)
@@ -393,10 +585,9 @@ func (s *Server) reportMarkdown(c *gin.Context) {
 		return
 	}
 	var v domain.Report
-	if s.store.DB.First(&v, id).Error != nil {
-		notFound(c)
+	if lookupFailed(c, s.store.DB.First(&v, id).Error, "could not load report") {
 		return
 	}
 	c.Data(200, "text/markdown; charset=utf-8", []byte(v.MarkdownContent))
 }
-func notFound(c *gin.Context) { fail(c, 404, "VALIDATION_FAILED", "resource not found", nil) }
+func notFound(c *gin.Context) { fail(c, 404, "NOT_FOUND", "resource not found", nil) }

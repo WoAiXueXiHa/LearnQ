@@ -8,7 +8,7 @@ import (
 func ReviewInterval(mastery int) (time.Duration, error) {
 	days := []int{1, 2, 4, 7, 14, 30}
 	if mastery < 0 || mastery >= len(days) {
-		return 0, fmt.Errorf("mastery must be between 0 and 5")
+		return 0, fmt.Errorf("mastery must be between 0 and %d", len(days)-1)
 	}
 	return time.Duration(days[mastery]) * 24 * time.Hour, nil
 }

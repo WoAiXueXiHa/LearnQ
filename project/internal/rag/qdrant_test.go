@@ -52,6 +52,35 @@ func TestQdrantUsesNamedDenseSparseAndRRF(t *testing.T) {
 	}
 }
 
+func TestEnsureCollectionRejectsDimensionDrift(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPut {
+			return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+		}
+		body := `{"result":{"config":{"params":{"vectors":{"dense":{"size":1536}}}}}}`
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	q := Qdrant{BaseURL: "http://qdrant.test", Collection: "learnq_chunks", Client: client}
+	err := q.EnsureCollection(context.Background(), 64)
+	if err == nil || !strings.Contains(err.Error(), "configured EMBEDDING_DIM is 64") {
+		t.Fatalf("dimension drift error = %v", err)
+	}
+}
+
+func TestEnsureCollectionAcceptsMatchingExistingDimension(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodPut {
+			return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+		}
+		body := `{"result":{"config":{"params":{"vectors":{"dense":{"size":64}}}}}}`
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	q := Qdrant{BaseURL: "http://qdrant.test", Collection: "learnq_chunks", Client: client}
+	if err := q.EnsureCollection(context.Background(), 64); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

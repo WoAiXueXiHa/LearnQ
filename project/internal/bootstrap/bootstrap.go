@@ -1,6 +1,8 @@
 package bootstrap
 
 import (
+	"net/http"
+
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/config"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/model"
 	"github.com/go-redis/redis/v8"
@@ -19,11 +21,16 @@ func Redis(cfg config.Config) *redis.Client {
 
 func Models(cfg config.Config) (model.ChatModel, model.EmbeddingModel) {
 	if cfg.AIMode == "real" {
-		real := &model.OpenAICompatible{
-			BaseURL: cfg.AIBaseURL, APIKey: cfg.AIAPIKey, ChatModel: cfg.AIChatModel,
-			EmbeddingModel: cfg.AIEmbeddingModel, Dimension: cfg.EmbeddingDim,
+		chat := &model.OpenAICompatible{
+			BaseURL: cfg.AIChatBaseURL, APIKey: cfg.AIChatAPIKey, ChatModel: cfg.AIChatModel,
+			Client: &http.Client{Timeout: cfg.TaskTimeout},
 		}
-		return real, real
+		embedding := &model.OpenAICompatible{
+			BaseURL: cfg.AIEmbeddingBaseURL, APIKey: cfg.AIEmbeddingAPIKey,
+			EmbeddingModel: cfg.AIEmbeddingModel, Dimension: cfg.EmbeddingDim,
+			Client: &http.Client{Timeout: cfg.TaskTimeout},
+		}
+		return chat, embedding
 	}
 	fake := &model.Fake{Dimension: cfg.EmbeddingDim}
 	return fake, fake

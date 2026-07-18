@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/api"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/bootstrap"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/config"
+	"github.com/WoAiXueXiHa/LeranQ/project/internal/queue"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/rag"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/skill"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/store"
@@ -21,22 +21,40 @@ import (
 
 func main() {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		slog.Error("config", "error", err)
+		os.Exit(1)
+	}
 	db, err := bootstrap.MySQL(cfg)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("mysql", "error", err)
+		os.Exit(1)
 	}
 	chat, embedding := bootstrap.Models(cfg)
-	vectors := rag.Qdrant{BaseURL: cfg.QdrantURL, Collection: "learnq_chunks"}
+	vectors := rag.Qdrant{BaseURL: cfg.QdrantURL, Collection: "learnq_chunks", Client: &http.Client{Timeout: 10 * time.Second}}
+	redisClient := bootstrap.Redis(cfg)
+	defer redisClient.Close()
+	taskQueue := queue.New(redisClient)
 	registry := skill.New(chat)
 	tools := agenttool.Service{DB: db, Embedding: embedding, Vectors: vectors}
 	registry.RegisterTool("weekly_stats", tools.WeeklyStats)
 	registry.RegisterTool("rag_query", tools.RAGQuery)
-	handler := api.New(store.New(db), registry, api.WithRAG(embedding, vectors)).Handler()
-	server := &http.Server{Addr: cfg.HTTPAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	handler := api.New(store.New(db), registry, api.WithRAG(chat, embedding, vectors),
+		api.WithHealthChecks(func(ctx context.Context) error {
+			return redisClient.Ping(ctx).Err()
+		}, vectors.Ready),
+		api.WithWorkerCheck(func(ctx context.Context) (bool, error) {
+			return taskQueue.WorkerAlive(ctx)
+		})).Handler()
+	server := &http.Server{
+		Addr: cfg.HTTPAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second,
+	}
 	go func() {
 		slog.Info("api listening", "address", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
+			slog.Error("api listen", "error", err)
+			os.Exit(1)
 		}
 	}()
 	stop, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

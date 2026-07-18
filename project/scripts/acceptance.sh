@@ -2,69 +2,119 @@
 set -eu
 command -v curl >/dev/null
 command -v jq >/dev/null
+
+# A stalled local socket must fail the assertion instead of hanging CI forever.
+curl() {
+  command curl --connect-timeout "${CURL_CONNECT_TIMEOUT:-3}" \
+    --max-time "${CURL_MAX_TIME:-20}" "$@"
+}
+
+COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-learnq_acceptance_$$}"
+LEARNQ_HTTP_PORT="${LEARNQ_HTTP_PORT:-18080}"
+BASE_URL="http://127.0.0.1:${LEARNQ_HTTP_PORT}"
+export COMPOSE_PROJECT_NAME LEARNQ_HTTP_PORT
 docker compose up --build -d
 trap 'docker compose down -v' EXIT
 attempt=0
-until curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; do
+while :; do
+  if curl -fsS "$BASE_URL/health/ready" >/dev/null; then
+    break
+  fi
   attempt=$((attempt+1))
   [ "$attempt" -lt 60 ] || { docker compose logs; exit 1; }
   sleep 2
 done
-response=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/study-records \
+curl -fsS "$BASE_URL/health/ready" | jq -e '.data.dependencies.worker == "ok"' >/dev/null
+curl -fsS "$BASE_URL/" | grep -q 'id="recordForm"'
+curl -fsS "$BASE_URL/static/app.js" | grep -q 'taskPollFailures'
+for scope in due upcoming all; do
+  curl -fsS "$BASE_URL/api/v1/review-tasks?scope=$scope" |
+    jq -e '.data | type == "array" and length == 0' >/dev/null
+done
+curl -fsS "$BASE_URL/api/v1/documents" | jq -e '.data | type == "array" and length == 0' >/dev/null
+response=$(curl -fsS -X POST "$BASE_URL/api/v1/study-records" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: acceptance-001' \
   -d '{"title":"验收记录","summary":"Fake 模式","duration_minutes":30,"modules":[{"category":"algorithm","content":"二分搜索"}]}')
 echo "$response"
 task_id=$(printf '%s' "$response" | jq -r '.data.task_id')
 attempt=0
 while :; do
-  task_status=$(curl -fsS "http://127.0.0.1:8080/api/v1/tasks/$task_id" | jq -r '.data.status')
+  task_status=$(curl -fsS "$BASE_URL/api/v1/tasks/$task_id" | jq -r '.data.status')
   [ "$task_status" = succeeded ] && break
   [ "$task_status" != dead ] || exit 1
   attempt=$((attempt+1))
   [ "$attempt" -lt 60 ] || exit 1
   sleep 1
 done
-curl -fsS "http://127.0.0.1:8080/api/v1/tasks/$task_id/trace" | jq -e '.data.agent_runs | length > 0' >/dev/null
-detail=$(curl -fsS "http://127.0.0.1:8080/api/v1/tasks/$task_id/detail")
+curl -fsS "$BASE_URL/api/v1/tasks/$task_id/trace" | jq -e '.data | (.agent_runs | length == 1) and .agent_runs[0].skill_name == "daily-review"' >/dev/null
+detail=$(curl -fsS "$BASE_URL/api/v1/tasks/$task_id/detail")
 printf '%s' "$detail" | jq -e '.data.report.export_status == "succeeded" and .data.review_task.status == "scheduled"' >/dev/null
+printf '%s' "$detail" | jq -e '.data.report.markdown_content | contains("面试追问") and (contains("_tool_results") | not)' >/dev/null
 report_id=$(printf '%s' "$detail" | jq -r '.data.report.id')
 docker compose exec -T worker test -r "/app/data/reports/$report_id.md"
-curl -fsS 'http://127.0.0.1:8080/api/v1/review-tasks?scope=upcoming' | jq -e '.data | length > 0' >/dev/null
+curl -fsS "$BASE_URL/api/v1/review-tasks?scope=upcoming" | jq -e '.data | length > 0' >/dev/null
 
-duplicate=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/study-records \
+duplicate=$(curl -fsS -X POST "$BASE_URL/api/v1/study-records" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: acceptance-duplicate' \
   -d '{"title":"验收记录","summary":"Fake 模式","duration_minutes":30,"modules":[{"category":"algorithm","content":"二分搜索"}]}')
 printf '%s' "$duplicate" | jq -e --argjson task "$task_id" '.data.deduplicated == true and .data.task_id == $task' >/dev/null
 
-curl -fsS http://127.0.0.1:8080/api/v1/skills
-daily=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/skills/daily-review/runs -H 'Content-Type: application/json' -d '{"title":"验收记录","summary":"二分搜索"}')
-weekly=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/skills/weekly-plan/runs -H 'Content-Type: application/json' -d '{"title":"本周计划"}')
+curl -fsS "$BASE_URL/api/v1/skills"
+workflow=$(curl -fsS -X POST "$BASE_URL/api/v1/skills/multi-agent/runs" -H 'Content-Type: application/json' \
+  -d '{"title":"验收实验","summary":"独立 Agent 输出","modules":["algorithm","project"]}')
+printf '%s' "$workflow" | jq -e '.data.workflow.outputs["algorithm-diagnosis"].Content and .data.agent_run_ids["weekly-plan"]' >/dev/null
+daily=$(curl -fsS -X POST "$BASE_URL/api/v1/skills/daily-review/runs" -H 'Content-Type: application/json' -d '{"title":"验收记录","summary":"二分搜索"}')
+weekly=$(curl -fsS -X POST "$BASE_URL/api/v1/skills/weekly-plan/runs" -H 'Content-Type: application/json' -d '{"title":"本周计划"}')
 [ "$(printf '%s' "$daily" | jq -r '.data.output.title')" != "$(printf '%s' "$weekly" | jq -r '.data.output.title')" ]
 weekly_run=$(printf '%s' "$weekly" | jq -r '.data.agent_run_id')
-curl -fsS "http://127.0.0.1:8080/api/v1/agent-runs/$weekly_run" |
+curl -fsS "$BASE_URL/api/v1/agent-runs/$weekly_run" |
   jq -e '.data.tool_calls[0].response_json | contains("\"fact_source\":\"mysql\"")' >/dev/null
 
-upload=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/documents -F 'file=@README.md;type=text/markdown')
+upload=$(curl -fsS -X POST "$BASE_URL/api/v1/documents" -F 'file=@README.md;type=text/markdown')
 document_id=$(printf '%s' "$upload" | jq -r '.data.document_id')
 attempt=0
 while :; do
-  document_status=$(curl -fsS "http://127.0.0.1:8080/api/v1/documents/$document_id/status" | jq -r '.data.status')
+  document_status=$(curl -fsS "$BASE_URL/api/v1/documents/$document_id/status" | jq -r '.data.status')
   [ "$document_status" = ready ] && break
   [ "$document_status" != failed ] || exit 1
   attempt=$((attempt+1))
   [ "$attempt" -lt 60 ] || exit 1
   sleep 1
 done
-curl -fsS http://127.0.0.1:8080/api/v1/documents | jq -e '.data[0].status == "ready"' >/dev/null
+curl -fsS "$BASE_URL/api/v1/documents" | jq -e '.data[0].status == "ready"' >/dev/null
+indexing_task_id=$(printf '%s' "$upload" | jq -r '.data.indexing_task_id')
+curl -fsS "$BASE_URL/api/v1/tasks/$indexing_task_id/detail" |
+  jq -e '.data.task.kind == "document_index" and .data.document.status == "ready" and .data.report == null' >/dev/null
 
-rag=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/rag/query \
+rag=$(curl -fsS -X POST "$BASE_URL/api/v1/rag/query" \
   -H 'Content-Type: application/json' -d '{"question":"LearnQ 如何启动 Compose？","top_k":5}')
 printf '%s' "$rag" | jq -e '.data.answer | contains("[S1]")' >/dev/null
 chunk_id=$(printf '%s' "$rag" | jq -r '.data.citations[0].chunk_id')
 printf '{"id":"acceptance-rag","question":"LearnQ 如何启动 Compose？","relevant_chunks":[{"chunk_id":"%s","relevance":3}],"citation_text":"Compose 启动说明","correct_answer":"使用 docker compose 启动","tags":["compose"],"difficulty":"easy"}\n' "$chunk_id" |
-  curl -fsS -X POST http://127.0.0.1:8080/api/v1/evaluations/rag \
+  curl -fsS -X POST "$BASE_URL/api/v1/evaluations/rag" \
     -H 'Content-Type: application/jsonl' --data-binary @- |
   jq -e '.data.status == "succeeded"' >/dev/null
 
-curl -fsS http://127.0.0.1:8080/api/v1/analytics/weekly | jq -e '.data.fact_source == "mysql"' >/dev/null
+curl -fsS "$BASE_URL/api/v1/analytics/weekly" | jq -e '.data.fact_source == "mysql"' >/dev/null
+
+docker compose stop worker
+attempt=0
+while :; do
+  stopped_health=$(curl -sS "$BASE_URL/health/ready")
+  printf '%s' "$stopped_health" | jq -e '.error.details.dependencies.worker == "unavailable"' >/dev/null && break
+  attempt=$((attempt+1))
+  [ "$attempt" -lt 20 ] || { printf '%s\n' "$stopped_health"; exit 1; }
+  sleep 1
+done
+docker compose start worker
+attempt=0
+while :; do
+  if curl -fsS "$BASE_URL/health/ready" | jq -e '.data.dependencies.worker == "ok"' >/dev/null; then
+    break
+  fi
+  attempt=$((attempt+1))
+  [ "$attempt" -lt 20 ] || exit 1
+  sleep 1
+done
+
 echo "LearnQ acceptance passed"

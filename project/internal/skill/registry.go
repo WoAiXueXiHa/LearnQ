@@ -87,10 +87,15 @@ func compileSchema(name string) *jsonschema.Schema {
 
 func (r *Registry) List() []Definition {
 	order := []string{"daily-review", "algorithm-diagnosis", "interview-followup", "project-explanation", "weekly-plan"}
-	out := make([]Definition, 0, len(order))
+	out := make([]Definition, 0, len(order)+1)
 	for _, name := range order {
 		out = append(out, r.definitions[name])
 	}
+	out = append(out, Definition{
+		Name: "multi-agent", Version: "1.0.0",
+		Description:   "Multi-Agent 手动实验（不参与异步报告主链）",
+		PromptVersion: "workflow-v1", SchemaVersion: "v1", TargetAgent: "Experiment",
+	})
 	return out
 }
 
@@ -118,8 +123,11 @@ func (r *Registry) RunDetailed(ctx context.Context, name string, input json.RawM
 		return model.ChatResponse{}, nil, errors.New("skill input must be valid JSON")
 	}
 	var inputValue any
-	if err := json.Unmarshal(input, &inputValue); err != nil || r.inputSchema.Validate(inputValue) != nil {
-		return model.ChatResponse{}, nil, errors.New("skill input does not match JSON Schema")
+	if err := json.Unmarshal(input, &inputValue); err != nil {
+		return model.ChatResponse{}, nil, fmt.Errorf("skill input is not valid JSON: %w", err)
+	}
+	if err := r.inputSchema.Validate(inputValue); err != nil {
+		return model.ChatResponse{}, nil, fmt.Errorf("skill input does not match JSON Schema: %w", err)
 	}
 	definition, ok := r.Get(name)
 	if !ok {

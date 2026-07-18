@@ -11,11 +11,14 @@ import (
 
 func TestRegistry(t *testing.T) {
 	r := New(model.Fake{})
-	if len(r.List()) != 5 {
+	if len(r.List()) != 6 {
 		t.Fatalf("got %d skills", len(r.List()))
 	}
 	if _, ok := r.Get("weekly-plan"); !ok {
 		t.Fatal("weekly-plan missing")
+	}
+	if r.List()[5].Name != "multi-agent" {
+		t.Fatalf("multi-agent experiment missing: %#v", r.List())
 	}
 	if _, err := r.Run(context.Background(), "missing", json.RawMessage(`{}`)); err == nil {
 		t.Fatal("unknown skill accepted")

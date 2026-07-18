@@ -25,6 +25,7 @@ import (
 type memoryVectors struct {
 	dimension int
 	points    []rag.Point
+	onUpsert  func()
 }
 
 func (m *memoryVectors) EnsureCollection(_ context.Context, dimension int) error {
@@ -33,6 +34,19 @@ func (m *memoryVectors) EnsureCollection(_ context.Context, dimension int) error
 }
 func (m *memoryVectors) Upsert(_ context.Context, points []rag.Point) error {
 	m.points = append(m.points, points...)
+	if m.onUpsert != nil {
+		m.onUpsert()
+	}
+	return nil
+}
+func (m *memoryVectors) DeleteDocument(_ context.Context, documentID uint64) error {
+	kept := m.points[:0]
+	for _, point := range m.points {
+		if point.Payload["document_id"] != documentID {
+			kept = append(kept, point)
+		}
+	}
+	m.points = kept
 	return nil
 }
 
@@ -73,10 +87,11 @@ func TestDocumentTaskIndexesAsynchronously(t *testing.T) {
 	}
 	vectors := &memoryVectors{}
 	processor := &indexer.Indexer{Store: s, Embedding: model.Fake{Dimension: 64}, Vectors: vectors, Dimension: 64}
-	if err := processor.Process(context.Background(), acquired); err != nil {
+	documentID, err := processor.Process(context.Background(), acquired)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CompleteWithoutReport(context.Background(), acquired, "index-token"); err != nil {
+	if err := s.CompleteDocumentIndex(context.Background(), acquired, "index-token", documentID); err != nil {
 		t.Fatal(err)
 	}
 	var ready domain.Document
@@ -118,11 +133,17 @@ func TestIndexerFailureResetsOrTerminatesDocument(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	processor := &indexer.Indexer{Store: s}
+	if err := s.DispatchOutbox(context.Background(), func(context.Context, uint64, time.Time) error { return nil }, 10); err != nil {
+		t.Fatal(err)
+	}
+	acquired, ok, err := s.Acquire(context.Background(), task.ID, "retry-token", time.Now().Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("acquire=%v err=%v", ok, err)
+	}
 	if err := db.Model(&document).Update("status", "indexing").Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := processor.HandleFailure(context.Background(), task, false, errors.New("temporary")); err != nil {
+	if _, retry, err := s.FailDocument(context.Background(), acquired, "retry-token", errors.New("temporary"), false); err != nil || !retry {
 		t.Fatal(err)
 	}
 	if err := db.First(&document, document.ID).Error; err != nil {
@@ -131,7 +152,17 @@ func TestIndexerFailureResetsOrTerminatesDocument(t *testing.T) {
 	if document.Status != "uploaded" {
 		t.Fatalf("retry status = %q, want uploaded", document.Status)
 	}
-	if err := processor.HandleFailure(context.Background(), task, true, errors.New("terminal")); err != nil {
+	if err := s.DispatchOutbox(context.Background(), func(context.Context, uint64, time.Time) error { return nil }, 10); err != nil {
+		t.Fatal(err)
+	}
+	acquired, ok, err = s.Acquire(context.Background(), task.ID, "terminal-token", time.Now().Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("acquire terminal=%v err=%v", ok, err)
+	}
+	if err := db.Model(&document).Update("status", "indexing").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, retry, err := s.FailDocument(context.Background(), acquired, "terminal-token", errors.New("terminal"), true); err != nil || retry {
 		t.Fatal(err)
 	}
 	if err := db.First(&document, document.ID).Error; err != nil {
@@ -139,5 +170,67 @@ func TestIndexerFailureResetsOrTerminatesDocument(t *testing.T) {
 	}
 	if document.Status != "failed" {
 		t.Fatalf("terminal status = %q, want failed", document.Status)
+	}
+	if err := db.Model(&document).Update("status", "deleting").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.First(&document, document.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if document.Status != "deleting" {
+		t.Fatalf("deleting document was resurrected as %q", document.Status)
+	}
+}
+
+func TestDeletingDocumentCannotBeResurrectedAfterVectorUpsert(t *testing.T) {
+	cfg := config.Load()
+	cfg.MySQLDSN = os.Getenv("LEARNQ_TEST_MYSQL_DSN")
+	if cfg.MySQLDSN == "" {
+		t.Skip("LEARNQ_TEST_MYSQL_DSN is required")
+	}
+	db, err := bootstrap.MySQL(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Run(db); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		for _, table := range []string{"document_chunks", "documents", "task_attempts", "outbox_events", "ai_tasks"} {
+			db.Exec("DELETE FROM " + table)
+		}
+	})
+	s := store.New(db)
+	document, task, err := s.CreateDocument(context.Background(), domain.Document{
+		Filename: "delete-race.md", MediaType: "md", ContentHash: "delete-race",
+		Content: "# Delete race\n" + strings.Repeat("worker upsert race ", 100),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DispatchOutbox(context.Background(), func(context.Context, uint64, time.Time) error { return nil }, 10); err != nil {
+		t.Fatal(err)
+	}
+	acquired, ok, err := s.Acquire(context.Background(), task.ID, "delete-race-token", time.Now().Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("acquire=%v err=%v", ok, err)
+	}
+	vectors := &memoryVectors{onUpsert: func() {
+		if err := db.Model(&domain.Document{}).Where("id=?", document.ID).Update("status", "deleting").Error; err != nil {
+			t.Errorf("mark deleting: %v", err)
+		}
+	}}
+	processor := &indexer.Indexer{Store: s, Embedding: model.Fake{Dimension: 64}, Vectors: vectors, Dimension: 64}
+	if _, err := processor.Process(context.Background(), acquired); err == nil {
+		t.Fatal("delete race unexpectedly completed")
+	}
+	var current domain.Document
+	if err := db.First(&current, document.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	var chunks int64
+	db.Model(&domain.DocumentChunk{}).Where("document_id=?", document.ID).Count(&chunks)
+	if current.Status != "deleting" || chunks != 0 || len(vectors.points) != 0 {
+		t.Fatalf("status=%s chunks=%d points=%d", current.Status, chunks, len(vectors.points))
 	}
 }

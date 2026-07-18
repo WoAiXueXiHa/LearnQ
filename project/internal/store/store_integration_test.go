@@ -19,10 +19,12 @@ import (
 
 func database(t *testing.T) *store.Store {
 	t.Helper()
-	cfg := config.Load()
-	if dsn := os.Getenv("LEARNQ_TEST_MYSQL_DSN"); dsn != "" {
-		cfg.MySQLDSN = dsn
+	dsn := os.Getenv("LEARNQ_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("LEARNQ_TEST_MYSQL_DSN is required")
 	}
+	cfg := config.Load()
+	cfg.MySQLDSN = dsn
 	db, err := bootstrap.MySQL(cfg)
 	if err != nil {
 		t.Fatal(err)

@@ -17,6 +17,7 @@ type einoInput struct {
 type einoAgentOutput struct {
 	Response model.ChatResponse
 	Tools    []ToolExecution
+	Error    string
 }
 
 // RunEinoWorkflow uses Eino Compose v0.9.12 for the project workflow while
@@ -36,7 +37,11 @@ func (r *Registry) RunEinoWorkflow(ctx context.Context, modules []string, input 
 		route := route
 		lambda := compose.InvokableLambda(func(ctx context.Context, in einoInput) (einoAgentOutput, error) {
 			response, tools, err := r.RunDetailed(ctx, route, in.Payload)
-			return einoAgentOutput{Response: response, Tools: tools}, err
+			output := einoAgentOutput{Response: response, Tools: tools}
+			if err != nil {
+				output.Error = err.Error()
+			}
+			return output, nil
 		})
 		if err := graph.AddLambdaNode(route, lambda, compose.WithOutputKey(route)); err != nil {
 			return WorkflowResult{}, err
@@ -57,8 +62,12 @@ func (r *Registry) RunEinoWorkflow(ctx context.Context, modules []string, input 
 			if !ok {
 				return result, fmt.Errorf("agent %s returned %T", route, value)
 			}
-			result.Outputs[route] = agentOutput.Response
-			result.Tools[route] = agentOutput.Tools
+			if agentOutput.Error != "" {
+				result.Errors[route] = agentOutput.Error
+			} else {
+				result.Outputs[route] = agentOutput.Response
+				result.Tools[route] = agentOutput.Tools
+			}
 		}
 		plan, tools, err := r.RunDetailed(ctx, "weekly-plan", input)
 		result.Routes = append(result.Routes, "weekly-plan")

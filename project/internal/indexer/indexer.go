@@ -18,6 +18,7 @@ import (
 type VectorStore interface {
 	EnsureCollection(context.Context, int) error
 	Upsert(context.Context, []rag.Point) error
+	DeleteDocument(context.Context, uint64) error
 }
 
 type Indexer struct {
@@ -27,49 +28,26 @@ type Indexer struct {
 	Dimension int
 }
 
-// HandleFailure makes indexing retryable and exposes terminal failure on the
-// document. Chunks and vector point IDs are deterministic, so rebuilding them
-// after resetting the state is idempotent.
-func (i *Indexer) HandleFailure(ctx context.Context, task domain.AITask, terminal bool, cause error) error {
+func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, error) {
 	var payload struct {
 		DocumentID uint64 `json:"document_id"`
 	}
 	if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil || payload.DocumentID == 0 {
-		return fmt.Errorf("invalid document task payload")
-	}
-	status := "uploaded"
-	if terminal {
-		status = "failed"
-	}
-	errorMessage := ""
-	if terminal {
-		errorMessage = cause.Error()
-	}
-	return i.Store.DB.WithContext(ctx).Model(&domain.Document{}).
-		Where("id = ? AND status <> 'ready'", payload.DocumentID).
-		Updates(map[string]any{"status": status, "error_message": errorMessage, "updated_at": time.Now().UTC()}).Error
-}
-
-func (i *Indexer) Process(ctx context.Context, task domain.AITask) error {
-	var payload struct {
-		DocumentID uint64 `json:"document_id"`
-	}
-	if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil || payload.DocumentID == 0 {
-		return fmt.Errorf("invalid document task payload")
+		return 0, fmt.Errorf("invalid document task payload")
 	}
 	var document domain.Document
 	if err := i.Store.DB.WithContext(ctx).First(&document, payload.DocumentID).Error; err != nil {
-		return err
+		return 0, err
 	}
 	if err := i.status(ctx, document.ID, "uploaded", "parsing"); err != nil {
-		return err
+		return 0, err
 	}
 	chunks := rag.ChunkText(document.Content, 800, 120)
 	if len(chunks) == 0 {
-		return fmt.Errorf("document produced no chunks")
+		return 0, fmt.Errorf("document produced no chunks")
 	}
 	if err := i.status(ctx, document.ID, "parsing", "embedding"); err != nil {
-		return err
+		return 0, err
 	}
 	texts := make([]string, len(chunks))
 	for index := range chunks {
@@ -77,27 +55,27 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) error {
 	}
 	dense, err := i.Embedding.Embed(ctx, texts)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if len(dense) != len(chunks) {
-		return fmt.Errorf("embedding result count mismatch")
+		return 0, fmt.Errorf("embedding result count mismatch")
 	}
 	for _, vector := range dense {
 		if len(vector) != i.Dimension {
-			return fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
+			return 0, fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
 		}
 	}
 	if err := i.status(ctx, document.ID, "embedding", "indexing"); err != nil {
-		return err
+		return 0, err
 	}
 	if err := i.Vectors.EnsureCollection(ctx, i.Dimension); err != nil {
-		return err
+		return 0, err
 	}
 	rows := make([]domain.DocumentChunk, len(chunks))
 	points := make([]rag.Point, len(chunks))
 	now := time.Now().UTC()
 	for index, chunk := range chunks {
-		id := stableID(document.ID, chunk.Hash)
+		id := stableID(document.ID, chunk.Index, chunk.Hash)
 		rows[index] = domain.DocumentChunk{ID: id, DocumentID: document.ID, ChunkIndex: chunk.Index, Title: chunk.Title, StartLine: chunk.StartLine, EndLine: chunk.EndLine, Content: chunk.Content, ContentHash: chunk.Hash, CreatedAt: now}
 		points[index] = rag.Point{ID: uuidFromHash(id), Dense: dense[index], Sparse: rag.Sparse(chunk.Content), Payload: map[string]any{
 			"document_id": document.ID, "chunk_id": id, "title": chunk.Title, "start_line": chunk.StartLine,
@@ -112,12 +90,23 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) error {
 		}
 		return nil
 	}); err != nil {
-		return err
+		return 0, err
 	}
 	if err := i.Vectors.Upsert(ctx, points); err != nil {
-		return err
+		return 0, err
 	}
-	return i.status(ctx, document.ID, "indexing", "ready")
+	if err := i.requireStatus(ctx, document.ID, "indexing"); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		cleanupErr := i.Vectors.DeleteDocument(cleanupCtx, document.ID)
+		_ = i.Store.DB.WithContext(cleanupCtx).
+			Where("document_id=?", document.ID).Delete(&domain.DocumentChunk{}).Error
+		if cleanupErr != nil {
+			return 0, fmt.Errorf("%w; vector cleanup failed: %v", err, cleanupErr)
+		}
+		return 0, err
+	}
+	return document.ID, nil
 }
 
 func (i *Indexer) status(ctx context.Context, id uint64, from, to string) error {
@@ -133,8 +122,20 @@ func (i *Indexer) status(ctx context.Context, id uint64, from, to string) error 
 	return nil
 }
 
-func stableID(documentID uint64, contentHash string) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%s", documentID, contentHash)))
+func (i *Indexer) requireStatus(ctx context.Context, id uint64, expected string) error {
+	var current string
+	result := i.Store.DB.WithContext(ctx).Raw("SELECT status FROM documents WHERE id=?", id).Scan(&current)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 || current != expected {
+		return fmt.Errorf("document state changed before index completion (current=%s)", current)
+	}
+	return nil
+}
+
+func stableID(documentID uint64, chunkIndex int, contentHash string) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s", documentID, chunkIndex, contentHash)))
 	return hex.EncodeToString(sum[:])
 }
 

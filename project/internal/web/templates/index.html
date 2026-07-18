@@ -11,17 +11,17 @@
   <div><h1>LearnQ</h1><p>把学习记录变成报告、复习与可检索知识</p></div>
   <span id="health" class="badge">正在连接…</span>
 </header>
-<nav class="tabs" aria-label="主导航">
-  <button class="active" data-view="records">学习记录</button>
-  <button data-view="task">任务与报告</button>
-  <button data-view="reviews">复习计划</button>
-  <button data-view="skills">AI Skill</button>
-  <button data-view="knowledge">知识库与 RAG</button>
+<nav class="tabs" role="tablist" aria-label="功能模块">
+  <button id="tab-records" class="active" role="tab" aria-selected="true" aria-controls="records" data-view="records">学习记录</button>
+  <button id="tab-task" role="tab" aria-selected="false" aria-controls="task" data-view="task">任务与报告</button>
+  <button id="tab-reviews" role="tab" aria-selected="false" aria-controls="reviews" data-view="reviews">复习计划</button>
+  <button id="tab-skills" role="tab" aria-selected="false" aria-controls="skills" data-view="skills">AI Skill</button>
+  <button id="tab-knowledge" role="tab" aria-selected="false" aria-controls="knowledge" data-view="knowledge">知识库与 RAG</button>
 </nav>
 <main>
   <div id="notice" class="notice" hidden></div>
 
-  <section id="records">
+  <section id="records" role="tabpanel" aria-labelledby="tab-records">
     <div class="section-head"><div><h2>记录今天学了什么</h2><p>提交后会自动生成报告和复习计划。</p></div></div>
     <form id="recordForm" class="card form-grid">
       <label>标题<input name="title" placeholder="例如：Go 并发学习" required></label>
@@ -39,19 +39,19 @@
     <div id="recordList" class="cards"></div>
   </section>
 
-  <section id="task" hidden>
+  <section id="task" role="tabpanel" aria-labelledby="tab-task" hidden>
     <div class="section-head"><div><h2>任务与报告</h2><p>状态会自动刷新，成功后直接显示报告与执行轨迹。</p></div></div>
-    <div class="toolbar"><input id="taskID" inputmode="numeric" placeholder="输入 Task ID"><button type="button" onclick="openTask(taskID.value)">查询</button></div>
+    <form id="taskLookupForm" class="toolbar"><input id="taskID" inputmode="numeric" min="1" pattern="[1-9][0-9]*" placeholder="输入 Task ID" required><button type="submit">查询</button></form>
     <div id="taskDetail" class="stack empty">从学习记录中打开一个任务，或输入 Task ID。</div>
   </section>
 
-  <section id="reviews" hidden>
+  <section id="reviews" role="tabpanel" aria-labelledby="tab-reviews" hidden>
     <div class="section-head"><div><h2>复习计划</h2><p>新报告先进入“即将复习”，到期后自动移动到“现在到期”。</p></div><button class="secondary" onclick="loadReviews()">刷新</button></div>
     <h3>现在到期</h3><div id="dueList" class="cards"></div>
     <h3>即将复习</h3><div id="upcomingList" class="cards"></div>
   </section>
 
-  <section id="skills" hidden>
+  <section id="skills" role="tabpanel" aria-labelledby="tab-skills" hidden>
     <div class="section-head"><div><h2>AI Skill 工作台</h2><p>选择不同 Skill 会使用不同分析路径和真实工具。</p></div></div>
     <form id="skillForm" class="card form-grid">
       <label>Skill<select id="skillName"></select></label>
@@ -61,7 +61,7 @@
     <div id="skillResult" class="stack empty">运行后将在这里显示结构化产物和工具证据。</div>
   </section>
 
-  <section id="knowledge" hidden>
+  <section id="knowledge" role="tabpanel" aria-labelledby="tab-knowledge" hidden>
     <div class="section-head"><div><h2>知识库与 RAG</h2><p>先上传文档并等待 ready，再基于可核验证据提问。</p></div></div>
     <form id="uploadForm" class="card upload">
       <input id="documentFile" name="file" type="file" accept=".md,.txt,.json" required>

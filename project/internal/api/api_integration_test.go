@@ -166,6 +166,19 @@ func TestTaskDetailAndUpcomingReviewReadModels(t *testing.T) {
 	}
 }
 
+func TestReviewTaskListsReturnEmptyArrays(t *testing.T) {
+	f := setup(t)
+	for _, scope := range []string{"due", "upcoming", "all"} {
+		response := request(t, f, http.MethodGet, "/api/v1/review-tasks?scope="+scope, "", nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("scope=%s status=%d body=%s", scope, response.Code, response.Body)
+		}
+		if !strings.Contains(response.Body.String(), `"data":[]`) {
+			t.Fatalf("scope=%s must return an empty JSON array: %s", scope, response.Body)
+		}
+	}
+}
+
 func TestReviewCompleteAndSkipPersistEvents(t *testing.T) {
 	f := setup(t)
 	now := time.Now().UTC()
@@ -177,23 +190,53 @@ func TestReviewCompleteAndSkipPersistEvents(t *testing.T) {
 	if err := f.store.DB.Create(&review).Error; err != nil {
 		t.Fatal(err)
 	}
+	missing := request(t, f, http.MethodPost, "/api/v1/review-tasks/"+strconvFormat(review.ID)+"/complete", `{}`, map[string]string{"Content-Type": "application/json"})
+	if missing.Code != 422 || !strings.Contains(missing.Body.String(), "mastery is required") {
+		t.Fatalf("missing mastery=%d %s", missing.Code, missing.Body)
+	}
 	complete := request(t, f, http.MethodPost, "/api/v1/review-tasks/"+strconvFormat(review.ID)+"/complete", `{"mastery":3}`, map[string]string{"Content-Type": "application/json"})
 	if complete.Code != 200 {
 		t.Fatalf("complete=%d %s", complete.Code, complete.Body)
 	}
-	skip := request(t, f, http.MethodPost, "/api/v1/review-tasks/"+strconvFormat(review.ID)+"/skip", `{}`, map[string]string{"Content-Type": "application/json"})
+	duplicate := request(t, f, http.MethodPost, "/api/v1/review-tasks/"+strconvFormat(review.ID)+"/complete", `{"mastery":3}`, map[string]string{"Content-Type": "application/json"})
+	if duplicate.Code != http.StatusConflict || !strings.Contains(duplicate.Body.String(), "REVIEW_NOT_DUE") {
+		t.Fatalf("duplicate complete=%d %s", duplicate.Code, duplicate.Body)
+	}
+	skipReview := domain.ReviewTask{ReportID: report.ID, Mastery: 2, Status: "scheduled", DueAt: now.Add(-time.Minute), CreatedAt: now, UpdatedAt: now}
+	if err := f.store.DB.Create(&skipReview).Error; err != nil {
+		t.Fatal(err)
+	}
+	skip := request(t, f, http.MethodPost, "/api/v1/review-tasks/"+strconvFormat(skipReview.ID)+"/skip", `{}`, map[string]string{"Content-Type": "application/json"})
 	if skip.Code != 200 {
 		t.Fatalf("skip=%d %s", skip.Code, skip.Body)
 	}
 	var events []domain.ReviewEvent
-	f.store.DB.Where("review_task_id=?", review.ID).Order("id").Find(&events)
-	if len(events) != 2 || events[0].Action != "complete" || events[1].Action != "skip" || events[1].OldMastery != 3 || events[1].NewMastery != 3 {
+	f.store.DB.Order("id").Find(&events)
+	if len(events) != 2 || events[0].Action != "complete" || events[1].Action != "skip" || events[1].OldMastery != 2 || events[1].NewMastery != 2 {
 		t.Fatalf("events=%#v", events)
+	}
+}
+
+func TestReadinessReportsDependencyFailure(t *testing.T) {
+	f := setup(t)
+	f.handler = api.New(f.store, skill.New(model.Fake{}), api.WithHealthChecks(
+		func(context.Context) error { return nil },
+		func(context.Context) error { return fmt.Errorf("qdrant unavailable") },
+	), api.WithWorkerCheck(func(context.Context) (bool, error) {
+		return false, nil
+	})).Handler()
+	ready := request(t, f, http.MethodGet, "/health/ready", "", nil)
+	if ready.Code != 503 || !strings.Contains(ready.Body.String(), `"qdrant":"unavailable"`) || !strings.Contains(ready.Body.String(), `"worker":"unavailable"`) {
+		t.Fatalf("ready=%d %s", ready.Code, ready.Body)
 	}
 }
 
 func TestDocumentValidationAndRAGNoEvidence(t *testing.T) {
 	f := setup(t)
+	list := request(t, f, http.MethodGet, "/api/v1/documents", "", nil)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"data":[]`) {
+		t.Fatalf("empty document list must be an array: status=%d body=%s", list.Code, list.Body)
+	}
 	noEvidence := request(t, f, http.MethodPost, "/api/v1/rag/query", `{"question":"不存在的证据"}`, map[string]string{"Content-Type": "application/json"})
 	if noEvidence.Code != http.StatusNotFound || !strings.Contains(noEvidence.Body.String(), "RAG_NO_EVIDENCE") {
 		t.Fatalf("no evidence=%d %s", noEvidence.Code, noEvidence.Body)
@@ -219,6 +262,22 @@ func TestDocumentValidationAndRAGNoEvidence(t *testing.T) {
 	f.store.DB.Model(&domain.AITask{}).Where("kind='document_index' AND status='pending'").Count(&tasks)
 	if uploaded != 3 || tasks != 3 {
 		t.Fatalf("uploaded=%d indexing tasks=%d", uploaded, tasks)
+	}
+	var document domain.Document
+	if err := f.store.DB.Order("id").First(&document).Error; err != nil {
+		t.Fatal(err)
+	}
+	detail := request(t, f, http.MethodGet, "/api/v1/tasks/"+strconvFormat(document.IndexingTaskID)+"/detail", "", nil)
+	if detail.Code != 200 || !strings.Contains(detail.Body.String(), `"kind":"document_index"`) || !strings.Contains(detail.Body.String(), `"document":`) {
+		t.Fatalf("document detail=%d %s", detail.Code, detail.Body)
+	}
+	deleted := request(t, f, http.MethodDelete, "/api/v1/documents/"+strconvFormat(document.ID), "", nil)
+	if deleted.Code != 200 {
+		t.Fatalf("delete document=%d %s", deleted.Code, deleted.Body)
+	}
+	var canceled domain.AITask
+	if err := f.store.DB.First(&canceled, document.IndexingTaskID).Error; err != nil || canceled.Status != domain.TaskDead || canceled.LastError != "document deleted by user" {
+		t.Fatalf("canceled task=%#v err=%v", canceled, err)
 	}
 }
 

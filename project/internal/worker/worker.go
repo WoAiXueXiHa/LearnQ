@@ -6,7 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -30,8 +32,7 @@ type Pool struct {
 	log         *slog.Logger
 	wg          sync.WaitGroup
 	indexer     interface {
-		Process(context.Context, domain.AITask) error
-		HandleFailure(context.Context, domain.AITask, bool, error) error
+		Process(context.Context, domain.AITask) (uint64, error)
 	}
 	skills *skill.Registry
 	trace  trace.Recorder
@@ -42,8 +43,7 @@ func New(s *store.Store, q *queue.Redis, m model.ChatModel, reportDir string, lo
 }
 
 func (p *Pool) WithIndexer(indexer interface {
-	Process(context.Context, domain.AITask) error
-	HandleFailure(context.Context, domain.AITask, bool, error) error
+	Process(context.Context, domain.AITask) (uint64, error)
 }) *Pool {
 	p.indexer = indexer
 	return p
@@ -83,7 +83,11 @@ func (p *Pool) loop(ctx context.Context) {
 func (p *Pool) claimAndRun(parent context.Context) {
 	token := randomToken()
 	id, ok, err := p.queue.Claim(parent, p.lease, token)
-	if err != nil || !ok {
+	if err != nil {
+		p.log.Error("queue claim failed", "error", err)
+		return
+	}
+	if !ok {
 		return
 	}
 	task, acquired, err := p.store.Acquire(parent, id, token, time.Now().UTC().Add(p.lease))
@@ -91,45 +95,50 @@ func (p *Pool) claimAndRun(parent context.Context) {
 		_ = p.queue.Ack(parent, id, token)
 		return
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			p.log.Error("worker panic recovered", "task_id", id, "panic", r, "stack", string(debug.Stack()))
+			p.failAndAck(task, token, fmt.Errorf("worker panic: %v", r), task.Kind == "document_index")
+		}
+	}()
 	ctx, cancel := context.WithTimeout(parent, p.timeout)
 	defer cancel()
 	if task.Kind == "document_index" {
+		var documentID uint64
 		if p.indexer == nil {
 			err = errors.New("document indexer is not configured")
 		} else {
-			err = p.indexer.Process(ctx, task)
+			documentID, err = p.indexer.Process(ctx, task)
 		}
 		if err == nil {
-			err = p.store.CompleteWithoutReport(context.WithoutCancel(parent), task, token)
+			persistCtx, persistCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err = p.store.CompleteDocumentIndex(persistCtx, task, token, documentID)
+			persistCancel()
 		}
 		if err != nil {
-			failureContext := context.WithoutCancel(parent)
-			_, retry, failErr := p.store.Fail(failureContext, task, token, err)
-			var documentErr error
-			if p.indexer != nil {
-				documentErr = p.indexer.HandleFailure(failureContext, task, !retry, err)
-			}
-			p.log.Error("document indexing failed", "task_id", id, "execution_generation", task.ExecutionGeneration, "error", err, "persist_error", failErr, "document_error", documentErr)
+			p.failAndAck(task, token, err, true)
+			return
 		}
-		_ = p.queue.Ack(context.WithoutCancel(parent), id, token)
+		p.ack(id, token)
 		return
 	}
 	var response model.ChatResponse
 	if p.skills != nil {
-		modules, input := p.workflowInput(task)
-		started := time.Now()
-		result, workflowErr := p.skills.RunEinoWorkflow(ctx, modules, input)
-		err = workflowErr
-		for _, route := range result.Routes {
-			output, exists := result.Outputs[route]
-			if !exists {
-				continue
+		input, inputErr := p.workflowInput(ctx, task)
+		if inputErr != nil {
+			err = inputErr
+		} else {
+			definition, _ := p.skills.Get("daily-review")
+			hash, _ := p.skills.PromptHash("daily-review")
+			started := time.Now()
+			var executions []skill.ToolExecution
+			var runErr error
+			response, executions, runErr = p.skills.RunDetailed(ctx, "daily-review", input)
+			err = runErr
+			if _, traceErr := p.trace.Record(task.ID, definition, hash, string(input), response, time.Since(started), executions, runErr); traceErr != nil {
+				p.log.Error("trace persist failed", "task_id", task.ID, "error", traceErr)
 			}
-			definition, _ := p.skills.Get(route)
-			hash, _ := p.skills.PromptHash(route)
-			_, _ = p.trace.Record(task.ID, definition, hash, string(input), output, time.Since(started), result.Tools[route], nil)
 		}
-		response = result.Outputs["daily-review"]
 	} else {
 		response, err = p.model.Generate(ctx, model.ChatRequest{Prompt: task.PayloadJSON, Skill: "daily-review", Input: []byte(task.PayloadJSON)})
 	}
@@ -138,35 +147,70 @@ func (p *Pool) claimAndRun(parent context.Context) {
 		markdown, err = model.MarkdownFromJSON(response.Content)
 	}
 	if err != nil {
-		_, _, failErr := p.store.Fail(context.WithoutCancel(parent), task, token, err)
-		p.log.Error("task failed", "task_id", id, "execution_generation", task.ExecutionGeneration, "error", err, "persist_error", failErr)
-		_ = p.queue.Ack(context.WithoutCancel(parent), id, token)
+		p.failAndAck(task, token, err, false)
 		return
 	}
-	saved, err := p.store.Complete(context.WithoutCancel(parent), task, token, markdown)
-	if err == nil {
-		if exportErr := report.Export(p.reportDir, saved.ID, markdown); exportErr != nil {
-			p.store.DB.Model(&saved).Updates(map[string]any{"export_status": "failed", "export_error": exportErr.Error()})
-		} else {
-			p.store.DB.Model(&saved).Update("export_status", "succeeded")
-		}
+	persistCtx, persistCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	saved, err := p.store.Complete(persistCtx, task, token, markdown)
+	persistCancel()
+	if err != nil {
+		p.failAndAck(task, token, err, false)
+		return
 	}
-	_ = p.queue.Ack(context.WithoutCancel(parent), id, token)
+	if exportErr := report.Export(p.reportDir, saved.ID, markdown); exportErr != nil {
+		p.log.Error("report export failed", "report_id", saved.ID, "error", exportErr)
+		p.store.DB.Model(&saved).Updates(map[string]any{"export_status": "failed", "export_error": exportErr.Error()})
+	} else {
+		p.store.DB.Model(&saved).Update("export_status", "succeeded")
+	}
+	p.ack(id, token)
 }
 
-func (p *Pool) workflowInput(task domain.AITask) ([]string, json.RawMessage) {
+func (p *Pool) failAndAck(task domain.AITask, token string, cause error, document bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	terminal := !retryable(cause)
+	var failErr error
+	if document {
+		_, _, failErr = p.store.FailDocument(ctx, task, token, cause, terminal)
+	} else if terminal {
+		_, _, failErr = p.store.FailTerminal(ctx, task, token, cause)
+	} else {
+		_, _, failErr = p.store.Fail(ctx, task, token, cause)
+	}
+	if failErr != nil {
+		p.log.Error("task failure could not be persisted", "task_id", task.ID,
+			"execution_generation", task.ExecutionGeneration, "error", cause, "persist_error", failErr)
+		return
+	}
+	p.log.Error("task failed", "task_id", task.ID, "execution_generation", task.ExecutionGeneration, "error", cause)
+	p.ack(task.ID, token)
+}
+
+func (p *Pool) ack(id uint64, token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.queue.Ack(ctx, id, token); err != nil {
+		p.log.Error("queue ack failed", "task_id", id, "error", err)
+	}
+}
+
+func retryable(cause error) bool {
+	var dependency *model.DependencyError
+	return !errors.As(cause, &dependency) || dependency.Retryable
+}
+
+func (p *Pool) workflowInput(ctx context.Context, task domain.AITask) (json.RawMessage, error) {
 	var payload struct {
 		StudyRecordID uint64 `json:"study_record_id"`
 	}
 	_ = json.Unmarshal([]byte(task.PayloadJSON), &payload)
 	var record domain.StudyRecord
-	p.store.DB.Preload("Modules").First(&record, payload.StudyRecordID)
-	modules := make([]string, 0, len(record.Modules))
-	for _, module := range record.Modules {
-		modules = append(modules, module.Category)
+	if err := p.store.DB.WithContext(ctx).Preload("Modules").First(&record, payload.StudyRecordID).Error; err != nil {
+		return nil, fmt.Errorf("study record %d: %w", payload.StudyRecordID, err)
 	}
 	input, _ := json.Marshal(record)
-	return modules, input
+	return input, nil
 }
 
 func randomToken() string {

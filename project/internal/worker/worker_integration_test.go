@@ -78,7 +78,9 @@ func TestWorkerRunsEinoWorkflowWritesReportReviewAndTrace(t *testing.T) {
 	db.Table("agent_runs").Where("task_id=?", task.ID).Count(&runs)
 	db.Table("agent_steps").Count(&steps)
 	db.Table("tool_calls").Count(&tools)
-	if current.Status != domain.TaskSucceeded || reports != 1 || reviews != 1 || runs != 4 || steps != 4 || tools == 0 {
+	var review domain.ReviewTask
+	db.Where("report_id IN (SELECT id FROM reports WHERE task_id=?)", task.ID).First(&review)
+	if current.Status != domain.TaskSucceeded || reports != 1 || reviews != 1 || runs != 1 || steps != 1 || tools == 0 || review.Mastery != 0 {
 		t.Fatalf("status=%s reports=%d reviews=%d runs=%d steps=%d tools=%d", current.Status, reports, reviews, runs, steps, tools)
 	}
 }
