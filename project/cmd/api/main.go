@@ -20,6 +20,8 @@ import (
 )
 
 func main() {
+	// API 进程只负责同步请求、查询与依赖探活，不在请求协程中执行耗时 AI 任务。
+	// 学习报告和文档索引统一写入任务表，由独立 Worker 消费，避免模型延迟拖垮 HTTP 服务。
 	cfg := config.Load()
 	if err := cfg.Validate(); err != nil {
 		slog.Error("config", "error", err)
@@ -31,6 +33,7 @@ func main() {
 		os.Exit(1)
 	}
 	chat, embedding := bootstrap.Models(cfg)
+	// Chat、Embedding 和向量库都通过窄接口注入，fake/real 模式共用同一条业务链路。
 	vectors := rag.Qdrant{BaseURL: cfg.QdrantURL, Collection: "learnq_chunks", Client: &http.Client{Timeout: 10 * time.Second}}
 	redisClient := bootstrap.Redis(cfg)
 	defer redisClient.Close()
@@ -47,6 +50,7 @@ func main() {
 			return taskQueue.WorkerAlive(ctx)
 		})).Handler()
 	server := &http.Server{
+		// ReadHeaderTimeout 防慢请求；WriteTimeout 要覆盖一次同步 Skill/RAG 调用的最长耗时。
 		Addr: cfg.HTTPAddr, Handler: handler, ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second,
 	}
@@ -60,6 +64,7 @@ func main() {
 	stop, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	<-stop.Done()
+	// 先停止接收新请求，再给在途请求最多 15 秒完成，防止响应写到一半被进程终止。
 	ctx, done := context.WithTimeout(context.Background(), 15*time.Second)
 	defer done()
 	if err := server.Shutdown(ctx); err != nil {

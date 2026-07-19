@@ -6,6 +6,7 @@ import (
 )
 
 func ReviewInterval(mastery int) (time.Duration, error) {
+	// 掌握度由用户提交，系统只把它映射为复习间隔，不替用户判断是否已经掌握。
 	days := []int{1, 2, 4, 7, 14, 30}
 	if mastery < 0 || mastery >= len(days) {
 		return 0, fmt.Errorf("mastery must be between 0 and %d", len(days)-1)
@@ -25,6 +26,7 @@ type ReviewTask struct {
 }
 
 type ReviewEvent struct {
+	// ReviewTask 保存当前计划，ReviewEvent 追加记录每次完成/跳过前后的值，便于复盘变更历史。
 	ID           uint64 `gorm:"primaryKey"`
 	ReviewTaskID uint64
 	Action       string

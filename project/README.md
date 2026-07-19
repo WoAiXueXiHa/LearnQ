@@ -51,18 +51,38 @@ LEARNQ_HTTP_PORT=18080
 
 默认配置为 `AI_MODE=fake`，不会调用外部模型，也不需要 API Key。该模式能够演示学习报告、复习、文档索引、RAG、Skill 和 Trace 的完整链路，推荐用于本地开发和自动验收。
 
-真实模型模式需要同时配置 Chat 与 Embedding：
+真实模型模式需要同时配置 Chat 与 Embedding。推荐使用 DeepSeek Chat，并通过本机 Ollama
+运行 `qwen3-embedding:0.6b`，Embedding 不产生云端 API 调用费用。
+
+先在宿主机准备 Ollama：
+
+```bash
+docker run -d \
+  --name ollama \
+  --restart unless-stopped \
+  -v ollama-models:/root/.ollama \
+  -p 11434:11434 \
+  ollama/ollama
+
+docker exec ollama ollama pull qwen3-embedding:0.6b
+```
+
+然后修改被 Git 忽略的 `.env`：
 
 ```dotenv
 AI_MODE=real
 AI_CHAT_BASE_URL=https://api.deepseek.com
-AI_CHAT_API_KEY=replace-me
+AI_CHAT_API_KEY=replace-with-your-deepseek-key
 AI_CHAT_MODEL=deepseek-v4-pro
-AI_EMBEDDING_BASE_URL=https://api.openai.com/v1
-AI_EMBEDDING_API_KEY=replace-me
-AI_EMBEDDING_MODEL=text-embedding-3-small
+AI_EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
+AI_EMBEDDING_API_KEY=ollama
+AI_EMBEDDING_MODEL=qwen3-embedding:0.6b
 EMBEDDING_DIM=64
 ```
+
+`AI_EMBEDDING_API_KEY=ollama` 只是兼容接口所需的占位值，不是真实密钥。
+Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接运行 Go 进程时，
+将 `AI_EMBEDDING_BASE_URL` 改为 `http://127.0.0.1:11434/v1`。
 
 | 变量 | 默认值 | 用途 |
 |---|---|---|
@@ -71,10 +91,14 @@ EMBEDDING_DIM=64
 | `REDIS_ADDR` | `127.0.0.1:6379` | Redis 地址 |
 | `QDRANT_URL` | `http://127.0.0.1:6333` | Qdrant HTTP 地址 |
 | `AI_MODE` | `fake` | `fake` 或 `real` |
+| `AI_EMBEDDING_BASE_URL` | `http://host.docker.internal:11434/v1` | Compose 访问宿主机 Ollama 的 OpenAI 兼容地址 |
+| `AI_EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | 本地 Embedding 模型 |
 | `REPORT_DIR` | `data/reports` | Markdown 报告导出目录 |
 | `LEARNQ_HTTP_PORT` | `8080` | Compose 对宿主机暴露的端口 |
 
-不要提交包含真实密钥的 `.env`。修改 `EMBEDDING_DIM` 后，必须确保它与现有 Qdrant collection 一致；开发环境中如需重建索引，应先确认数据可以清除。
+不要把真实密钥写入 `.env.example` 或其他受 Git 跟踪的文件；本地密钥只保存在 `.env`。
+修改 `EMBEDDING_DIM` 后，必须确保它与现有 Qdrant collection 一致；开发环境中如需重建索引，
+应先确认数据可以清除。
 
 ## 核心 API
 
@@ -174,6 +198,7 @@ make acceptance
 | 页面一直显示任务处理中 | 确认 `worker` 为 `ok`，查看任务 `last_error` 和 Worker 日志 |
 | 8080 端口被占用 | 在 `.env` 设置新的 `LEARNQ_HTTP_PORT` 后重启 Compose |
 | Real 模式启动失败 | 检查两套 Base URL、API Key、模型名和 `EMBEDDING_DIM` 是否完整 |
+| Ollama Embedding 调用失败 | 检查 `ollama` 容器、宿主机 `11434` 端口以及模型是否已经拉取 |
 | Qdrant 提示维度不一致 | 恢复原维度；仅在可丢弃本地索引时才清理并重建数据卷 |
 | 文档无法索引 | 确认文件为 UTF-8 的 Markdown、TXT 或 JSON，且不超过 5 MiB |
 | RAG 按钮不可用 | 至少等待一个文档状态变为“可查询” |

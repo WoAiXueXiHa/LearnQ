@@ -35,8 +35,8 @@ func (s *Store) CreateStudyRecord(ctx context.Context, input CreateRecord) (doma
 	return record, task, err
 }
 
-// CreateStudyRecordTx lets API idempotency and the business write share one
-// transaction. Callers must already be inside a transaction.
+// CreateStudyRecordTx 在调用方已有事务中创建学习记录、AI 任务和 Outbox 事件。
+// API 的幂等键与这些业务写入因此可以共享一次提交：响应被记住时，任务也一定已经存在。
 func CreateStudyRecordTx(tx *gorm.DB, input CreateRecord) (domain.StudyRecord, domain.AITask, error) {
 	now := time.Now().UTC()
 	record := domain.StudyRecord{
@@ -64,8 +64,9 @@ func CreateStudyRecordTx(tx *gorm.DB, input CreateRecord) (domain.StudyRecord, d
 	return record, task, tx.Create(&event).Error
 }
 
-// DispatchOutbox holds row locks until Redis has accepted each idempotent ZADD and
-// the task/outbox state is committed. A crash between stores is repaired by replay.
+// DispatchOutbox 使用 SKIP LOCKED 让多个 Dispatcher 分摊事件而不重复争抢同一行。
+// Redis ZADD 本身幂等；若进程在 Redis 成功后、MySQL 提交前崩溃，未发布事件会被再次投递，
+// 因而这里选择“至少一次投递 + 幂等入队”，而不是追求跨存储的伪原子事务。
 func (s *Store) DispatchOutbox(ctx context.Context, enqueue func(context.Context, uint64, time.Time) error, limit int) error {
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var events []domain.OutboxEvent
@@ -97,6 +98,8 @@ func (s *Store) DispatchOutbox(ctx context.Context, enqueue func(context.Context
 }
 
 func (s *Store) Acquire(ctx context.Context, id uint64, token string, leaseUntil time.Time) (domain.AITask, bool, error) {
+	// Redis Claim 只取得调度资格；这里用 status='queued' 的条件更新在 MySQL 中最终确权。
+	// 只有确权成功才创建 Attempt，避免重复消息导致同一任务被并发执行。
 	now := time.Now().UTC()
 	var task domain.AITask
 	acquired := false
@@ -123,8 +126,8 @@ func (s *Store) Complete(ctx context.Context, task domain.AITask, token, markdow
 	var report domain.Report
 	err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := time.Now().UTC()
-		// The token and generation are fencing conditions: an expired worker cannot
-		// overwrite the valid result produced by a later lease.
+		// token、generation 和未过期 lease 是三重栅栏：旧 Worker 即使晚到，
+		// 也不能覆盖新租约已经产生的有效结果。
 		result := tx.Exec(`UPDATE ai_tasks SET status='succeeded', lease_token='', lease_until=NULL, updated_at=?
 			WHERE id=? AND status='processing' AND execution_generation=? AND lease_token=? AND lease_until>=?`,
 			now, task.ID, task.ExecutionGeneration, token, now)
@@ -153,14 +156,14 @@ func (s *Store) Fail(ctx context.Context, task domain.AITask, token string, caus
 	return s.fail(ctx, task, token, cause, false, false)
 }
 
-// FailTerminal persists a non-retryable failure, such as invalid model
-// credentials or an invalid provider request, without wasting later attempts.
+// FailTerminal 持久化不可重试错误（如凭证无效或请求参数被供应商拒绝），
+// 直接进入 dead，避免浪费后续尝试和外部调用额度。
 func (s *Store) FailTerminal(ctx context.Context, task domain.AITask, token string, cause error) (time.Time, bool, error) {
 	return s.fail(ctx, task, token, cause, false, true)
 }
 
-// FailDocument changes the task and its document in one transaction. A retry
-// returns the document to uploaded; a terminal failure exposes failed to users.
+// FailDocument 在同一事务中修改任务和文档：可重试时文档回到 uploaded，
+// 终止失败时对外显示 failed，避免两个聚合暴露互相矛盾的状态。
 func (s *Store) FailDocument(ctx context.Context, task domain.AITask, token string, cause error, terminal bool) (time.Time, bool, error) {
 	return s.fail(ctx, task, token, cause, true, terminal)
 }
@@ -208,6 +211,7 @@ func (s *Store) fail(ctx context.Context, task domain.AITask, token string, caus
 			}
 		}
 		if retry {
+			// 重试不直接写 Redis，而是再次写 Outbox，复用同一条可靠投递路径。
 			payload, _ := json.Marshal(map[string]any{"task_id": task.ID})
 			event := domain.OutboxEvent{AggregateID: task.ID, EventType: "ai_task.retry", PayloadJSON: string(payload), CreatedAt: now}
 			if err := tx.Create(&event).Error; err != nil {
@@ -226,6 +230,7 @@ func HashRequest(body []byte) string {
 }
 
 func (s *Store) CreateDocument(ctx context.Context, document domain.Document) (domain.Document, domain.AITask, error) {
+	// 原文、索引任务和 Outbox 一次提交；客户端拿到 202 时即可确信异步索引意图不会丢失。
 	var task domain.AITask
 	err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := time.Now().UTC()
@@ -250,6 +255,7 @@ func (s *Store) CreateDocument(ctx context.Context, document domain.Document) (d
 }
 
 func (s *Store) CompleteDocumentIndex(ctx context.Context, task domain.AITask, token string, documentID uint64) error {
+	// 任务成功与文档 ready 必须原子提交，否则检索端可能读取到尚未完整落库的切片。
 	now := time.Now().UTC()
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Exec(`UPDATE ai_tasks SET status='succeeded',lease_token='',lease_until=NULL,updated_at=?

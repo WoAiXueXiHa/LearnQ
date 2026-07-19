@@ -4,7 +4,7 @@
 
 LearnQ 是一个面向个人学习复盘的本地 AI 应用。用户提交一次学习记录后，系统会异步生成结构化报告和复习任务；也可以上传个人文档，通过混合检索获得带来源引用的回答。
 
-项目重点不在堆叠页面或模型调用，而在于把一次 AI 请求扩展成可恢复、可追踪、可验证的完整后端链路，适合作为 Go 后端校招项目进行讲解和复现。
+项目重点不在堆叠页面或模型调用，而在于把一次 AI 请求扩展成可恢复、可追踪、可验证的完整后端链路，适合作为 Go 后端和 ai 工程化的学习项目。
 
 ## 核心功能
 
@@ -24,7 +24,7 @@ Browser
 Gin API + Embedded Web
    |
    +---- MySQL ----------------------------------------+
-   |     业务事实 / 任务 / Outbox / 报告 / Trace       |
+   |     业务事实 / 任务 / Outbox / 报告 / Trace        |
    |                                                   |
    +--> Outbox Dispatcher --> Redis ready queue        |
                                  |                     |
@@ -92,7 +92,7 @@ Reaper 从 MySQL 扫描过期任务并推进重试或终止；Reconciler 根据�
 | AI 编排 | CloudWeGo Eino Compose、版本化 Skill Registry |
 | 前端 | 原生 HTML、CSS、JavaScript，随 Go 服务嵌入 |
 | 工程化 | Docker Compose、Makefile、GitHub Actions |
-| 模型适配 | 内置 Fake Adapter、DeepSeek Chat、OpenAI Embedding |
+| 模型适配 | 内置 Fake Adapter、DeepSeek Chat、Ollama Qwen3 Embedding |
 
 ## 仓库结构
 
@@ -119,7 +119,7 @@ Reaper 从 MySQL 扫描过期任务并推进重试或终止；Reconciler 根据�
 
 ## 项目边界
 
-- 这是单用户、本地优先的校招项目，不包含认证、RBAC、多租户或公网部署能力。
+- 这是单用户、本地优先的学习项目，不包含认证、RBAC、多租户或公网部署能力。
 - Compose 默认只将 API 暴露到 `127.0.0.1`，不应直接开放到公网。
 - 异步任务采用至少一次投递和最终状态收敛，不宣称 exactly-once。
 - Fake 模式可离线演示完整业务链路；真实模型密钥只从环境变量读取。

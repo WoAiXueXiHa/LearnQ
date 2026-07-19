@@ -17,6 +17,8 @@ import (
 var files embed.FS
 
 func Run(db *gorm.DB) error {
+	// 已执行迁移记录内容校验和：迁移文件一旦发布就不可原地修改，只能追加新版本，
+	// 否则不同环境可能在同一版本号下得到不同表结构。
 	if err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
 		version VARCHAR(255) PRIMARY KEY,
 		checksum CHAR(64) NOT NULL,

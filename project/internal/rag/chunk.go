@@ -23,6 +23,8 @@ type runeAt struct {
 }
 
 func ChunkText(text string, size, overlap int) []Chunk {
+	// 按 rune 而非 byte 切片，避免截断 UTF-8 中文；重叠窗口保留跨块语义，
+	// 行号则用于最终引用定位。当前策略刻意简单、确定，便于重建稳定索引。
 	if size <= 0 {
 		size = 800
 	}
@@ -39,6 +41,7 @@ func ChunkText(text string, size, overlap int) []Chunk {
 		}
 	}
 	for _, candidate := range strings.Split(text, "\n") {
+		// 提取首个 Markdown 标题作为块级元数据，不改写正文，确保引用仍能回到原文。
 		if strings.HasPrefix(strings.TrimSpace(candidate), "#") {
 			title = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(candidate), "#"))
 			break

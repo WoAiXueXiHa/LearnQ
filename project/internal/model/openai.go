@@ -22,6 +22,7 @@ func (e *DependencyError) Error() string {
 }
 
 func classifyStatus(status int) *DependencyError {
+	// 只重试限流、超时和上游 5xx；鉴权/参数类 4xx 直接终止，防止无意义重放。
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return &DependencyError{Status: status, Code: "AI_AUTH_FAILED"}
@@ -36,9 +37,8 @@ func classifyStatus(status int) *DependencyError {
 	}
 }
 
-// OpenAICompatible keeps Real mode behind the same narrow interfaces as Fake.
-// Eino/Compose orchestration can wrap this adapter without leaking SDK types
-// into LearnQ's task, skill, or workflow packages.
+// OpenAICompatible 把 real 模式封装在与 Fake 相同的窄接口后。
+// Eino/Compose 只看到项目接口，供应商协议不会泄漏到任务、Skill 或工作流包。
 type OpenAICompatible struct {
 	BaseURL        string
 	APIKey         string
@@ -96,6 +96,7 @@ func (m OpenAICompatible) Embed(ctx context.Context, texts []string) ([][]float3
 	out := make([][]float32, len(texts))
 	seen := make([]bool, len(texts))
 	for _, item := range response.Data {
+		// 供应商可能乱序返回 embedding，按 index 复原输入顺序并拒绝重复、缺失或维度漂移。
 		if item.Index < 0 || item.Index >= len(out) || seen[item.Index] ||
 			len(item.Embedding) == 0 || (m.Dimension > 0 && len(item.Embedding) != m.Dimension) {
 			return nil, fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
@@ -139,6 +140,7 @@ func (m OpenAICompatible) call(ctx context.Context, path string, input, output a
 		return classifyStatus(response.StatusCode)
 	}
 	const maxResponse = 4 << 20
+	// 限制响应体，避免异常上游用超大 JSON 持续占用 Worker 内存。
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponse+1))
 	if err != nil {
 		return fmt.Errorf("read AI response: %w", err)

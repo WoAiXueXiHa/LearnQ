@@ -8,6 +8,8 @@ import (
 type TaskStatus string
 
 const (
+	// 任务状态机把“已写数据库但未投递”“已进入队列”“已被 Worker 租用”分开表达，
+	// 使崩溃恢复可以根据持久化状态精确补偿，而不是猜测任务是否执行过。
 	TaskPending    TaskStatus = "pending"
 	TaskQueued     TaskStatus = "queued"
 	TaskProcessing TaskStatus = "processing"
@@ -24,8 +26,10 @@ var transitions = map[TaskStatus]map[TaskStatus]bool{
 	TaskDead:       {TaskPending: true},
 }
 
+// CanTransition 是任务状态机的唯一合法边集合；新增状态时需同时检查 Store 中的条件更新。
 func CanTransition(from, to TaskStatus) bool { return transitions[from][to] }
 
+// RetryDelay 采用有上限的退避。当前最多重试两次，避免永久故障持续占用模型和队列资源。
 func RetryDelay(attempt int) (time.Duration, bool) {
 	switch attempt {
 	case 1:
@@ -38,18 +42,20 @@ func RetryDelay(attempt int) (time.Duration, bool) {
 }
 
 type AITask struct {
-	ID                  uint64     `json:"id" gorm:"primaryKey"`
-	Kind                string     `json:"kind"`
-	Status              TaskStatus `json:"status"`
-	PayloadJSON         string     `json:"-" gorm:"column:payload_json"`
-	AttemptNo           int        `json:"attempt_no"`
-	ExecutionGeneration int        `json:"execution_generation"`
-	LeaseToken          string     `json:"-" gorm:"column:lease_token"`
-	LeaseUntil          *time.Time `json:"lease_until,omitempty"`
-	AvailableAt         time.Time  `json:"available_at"`
-	LastError           string     `json:"last_error,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	ID          uint64     `json:"id" gorm:"primaryKey"`
+	Kind        string     `json:"kind"`
+	Status      TaskStatus `json:"status"`
+	PayloadJSON string     `json:"-" gorm:"column:payload_json"`
+	AttemptNo   int        `json:"attempt_no"`
+	// ExecutionGeneration 在人工重试时递增，隔离同一任务的不同执行世代。
+	ExecutionGeneration int `json:"execution_generation"`
+	// LeaseToken 标识一次具体领取；所有完成/失败写入都必须携带它作为 fencing token。
+	LeaseToken  string     `json:"-" gorm:"column:lease_token"`
+	LeaseUntil  *time.Time `json:"lease_until,omitempty"`
+	AvailableAt time.Time  `json:"available_at"`
+	LastError   string     `json:"last_error,omitempty"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
 func (t *AITask) Transition(to TaskStatus) error {
@@ -78,6 +84,7 @@ type StudyModule struct {
 }
 
 type OutboxEvent struct {
+	// OutboxEvent 与业务对象同事务写入，把跨 MySQL/Redis 的原子性问题转化为可重放投递。
 	ID          uint64 `gorm:"primaryKey"`
 	AggregateID uint64
 	EventType   string
@@ -87,6 +94,7 @@ type OutboxEvent struct {
 }
 
 type TaskAttempt struct {
+	// TaskAttempt 保存每次租约执行的审计记录；Task 是当前快照，Attempt 是不可丢失的历史。
 	ID                  uint64 `gorm:"primaryKey"`
 	TaskID              uint64
 	ExecutionGeneration int
@@ -112,6 +120,7 @@ type Document struct {
 }
 
 type DocumentChunk struct {
+	// ID 由文档、块序号和内容哈希稳定生成，重复索引会覆盖同一点而不是制造副本。
 	ID          string    `json:"id" gorm:"primaryKey;size:64"`
 	DocumentID  uint64    `json:"document_id"`
 	ChunkIndex  int       `json:"chunk_index"`

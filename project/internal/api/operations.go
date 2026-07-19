@@ -84,6 +84,8 @@ func (s *Server) completeReview(c *gin.Context) {
 	next := now.Add(interval)
 	updated := false
 	err = s.store.DB.Transaction(func(tx *gorm.DB) error {
+		// 条件更新同时校验 scheduled 与到期时间，使重复点击或并发请求只有一个成功。
+		// 当前计划和审计事件同事务写入，后续可以完整还原间隔变化。
 		result := tx.Exec(`UPDATE review_tasks SET mastery=?,status='scheduled',due_at=?,completed_at=?,updated_at=?
 			WHERE id=? AND status='scheduled' AND due_at<=?`, *input.Mastery, next, now, now, id, now)
 		if result.Error != nil || result.RowsAffected != 1 {
@@ -146,6 +148,7 @@ func (s *Server) skipReview(c *gin.Context) {
 }
 
 func (s *Server) runSkill(c *gin.Context) {
+	// 同步实验接口与异步报告共用 Registry 和 Trace；差别只在是否经过任务队列。
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
 	if err != nil || !json.Valid(body) {
 		fail(c, 422, "VALIDATION_FAILED", "valid JSON input is required", nil)
@@ -153,6 +156,7 @@ func (s *Server) runSkill(c *gin.Context) {
 	}
 	started := time.Now()
 	if c.Param("name") == "multi-agent" {
+		// 多 Agent 每条成功路由单独落 trace，局部失败仍保留其他节点的可观察结果。
 		var workflowInput struct {
 			Modules []string `json:"modules"`
 		}
@@ -235,6 +239,7 @@ func (s *Server) uploadDocument(c *gin.Context) {
 	}
 	defer file.Close()
 	body, err := io.ReadAll(io.LimitReader(file, (5<<20)+1))
+	// 多读 1 字节用于区分“恰好达到上限”和“已经超限”，并在入库前验证 UTF-8/JSON。
 	if err != nil || !rag.ValidDocument(body) {
 		fail(c, 422, "VALIDATION_FAILED", "file must be non-empty UTF-8 and at most 5 MiB", nil)
 		return
@@ -296,6 +301,8 @@ func (s *Server) deleteDocument(c *gin.Context) {
 		return
 	}
 	if document.Status != "deleting" {
+		// 先持久化 deleting，立即把文档从证据可见集合中隔离；若 Qdrant 暂时失败，
+		// 客户端可安全重试删除，而检索端不会再信任该文档的残留向量。
 		result := s.store.DB.Model(&domain.Document{}).Where("id=? AND status=?", id, document.Status).
 			Updates(map[string]any{"status": "deleting", "error_message": "", "updated_at": time.Now().UTC()})
 		if result.Error != nil {
@@ -314,6 +321,8 @@ func (s *Server) deleteDocument(c *gin.Context) {
 		}
 	}
 	if err := s.store.DB.Transaction(func(tx *gorm.DB) error {
+		// 外部向量删除成功后，再原子终止未完成索引任务并清理 MySQL 元数据。
+		// Qdrant 删除按 document_id 过滤且可重复，重试不会误伤其他文档。
 		if document.IndexingTaskID != 0 {
 			now := time.Now().UTC()
 			if err := tx.Model(&domain.AITask{}).Where("id=? AND status NOT IN ('succeeded','dead')", document.IndexingTaskID).
@@ -377,6 +386,8 @@ func (s *Server) ragQuery(c *gin.Context) {
 	citations := make([]gin.H, 0, len(hits))
 	evidence := make([]map[string]any, 0, len(hits))
 	for _, hit := range hits {
+		// 不直接信任 Qdrant payload：回 MySQL 读取原文并确认文档仍为 ready，
+		// 以数据库状态封住索引/删除过程中的跨存储短暂不一致。
 		chunkID, _ := hit.Payload["chunk_id"].(string)
 		var chunk domain.DocumentChunk
 		result := s.store.DB.Table("document_chunks dc").Select("dc.*").Joins("JOIN documents d ON d.id=dc.document_id").Where("dc.id=? AND d.status='ready'", chunkID).Take(&chunk)
@@ -421,6 +432,7 @@ func (s *Server) ragQuery(c *gin.Context) {
 		return
 	}
 	references := regexp.MustCompile(`\[S([0-9]+)\]`).FindAllStringSubmatch(generated.Answer, -1)
+	// 模型输出视为不可信数据：必须至少引用一条证据，且每个 [Sn] 都要落在本次候选范围内。
 	if len(references) == 0 {
 		fail(c, 502, "AI_INVALID_RESPONSE", "model answer contains no evidence citation", nil)
 		return
@@ -465,6 +477,7 @@ func truncate(v string, n int) string {
 }
 
 func (s *Server) evaluateRAG(c *gin.Context) {
+	// 评估数据可由请求提供，也可使用内嵌固定集；结果连同检索配置持久化，便于跨版本比较。
 	if s.embedding == nil || s.vectors == nil {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "retrieval dependencies are not configured", nil)
 		return

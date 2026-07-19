@@ -6,7 +6,8 @@ import (
 	"path/filepath"
 )
 
-// Export writes a replaceable copy. MySQL remains the report's source of truth.
+// Export 写出可替换副本，MySQL Report 仍是真相源。
+// 临时文件落盘并 Sync 后再 Rename，读者不会看到只写了一半的 Markdown。
 func Export(dir string, id uint64, markdown string) error {
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err

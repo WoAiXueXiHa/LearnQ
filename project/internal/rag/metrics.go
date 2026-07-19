@@ -3,6 +3,7 @@ package rag
 import "math"
 
 func RecallAtK(results []string, relevant map[string]int, k int) float64 {
+	// Recall@K 衡量相关块是否被找全，不关心它们在前 K 名中的具体顺序。
 	if len(relevant) == 0 {
 		return 0
 	}
@@ -19,6 +20,7 @@ func RecallAtK(results []string, relevant map[string]int, k int) float64 {
 }
 
 func NDCGAtK(results []string, relevant map[string]int, k int) float64 {
+	// NDCG 同时考虑相关性等级和排名位置，并用理想排序归一化到 [0,1]。
 	if k > len(results) {
 		k = len(results)
 	}
@@ -52,6 +54,7 @@ func NDCGAtK(results []string, relevant map[string]int, k int) float64 {
 }
 
 func CitationCoverage(required, cited []string) float64 {
+	// 引用覆盖率关注标注证据是否进入候选集，与生成答案的语言质量解耦。
 	if len(required) == 0 {
 		return 1
 	}

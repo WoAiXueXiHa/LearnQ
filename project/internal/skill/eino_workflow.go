@@ -20,10 +20,9 @@ type einoAgentOutput struct {
 	Error    string
 }
 
-// RunEinoWorkflow uses Eino Compose v0.9.12 for the project workflow while
-// keeping routing deterministic in Go. The Algorithm node is not added unless
-// an algorithm module exists; independent nodes are connected from START and
-// therefore execute in parallel. Planner is the single convergence node.
+// RunEinoWorkflow 使用 Eino Compose 构图，但路由仍由 Go 确定。
+// 只有输入包含算法模块时才添加 Algorithm；各独立节点从 START 并行出发，
+// Planner 是唯一汇聚节点，因此模型无法自行改写拓扑或越权调用其他 Skill。
 func (r *Registry) RunEinoWorkflow(ctx context.Context, modules []string, input json.RawMessage) (WorkflowResult, error) {
 	routes := []string{"daily-review", "interview-followup"}
 	for _, module := range modules {

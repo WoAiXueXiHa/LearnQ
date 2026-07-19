@@ -66,6 +66,8 @@ func ReadJSONL(reader io.Reader) ([]Case, error) {
 }
 
 func Run(ctx context.Context, cases []Case, embedding model.EmbeddingModel, retriever Retriever, topK int, real bool) (Report, error) {
+	// 同一数据集分别跑 dense、sparse、hybrid，指标差异才能归因于检索器而非输入变化。
+	// fake 模式定位为管线测试；只有真实 embedding 的结果才标记为检索基准。
 	started := time.Now()
 	mode := "pipeline_test"
 	if real {

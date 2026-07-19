@@ -10,6 +10,8 @@ import (
 )
 
 func Run(ctx context.Context, s *store.Store, q *queue.Redis, logger *slog.Logger) {
+	// Dispatcher 只搬运 Outbox，不执行任务。短轮询换取低投递延迟，每批设上限避免
+	// 大量历史事件长期占有事务和行锁。
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 	for {

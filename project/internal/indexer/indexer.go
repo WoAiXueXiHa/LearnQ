@@ -16,6 +16,7 @@ import (
 )
 
 type VectorStore interface {
+	// VectorStore 隔离 Qdrant 细节，使索引流程可用内存桩验证状态机和补偿逻辑。
 	EnsureCollection(context.Context, int) error
 	Upsert(context.Context, []rag.Point) error
 	DeleteDocument(context.Context, uint64) error
@@ -29,6 +30,8 @@ type Indexer struct {
 }
 
 func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, error) {
+	// 文档状态按 uploaded -> parsing -> embedding -> indexing -> ready 单向推进。
+	// 每一步都用条件更新做并发保护，删除请求或重复 Worker 无法悄悄覆盖当前状态。
 	var payload struct {
 		DocumentID uint64 `json:"document_id"`
 	}
@@ -75,6 +78,7 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 	points := make([]rag.Point, len(chunks))
 	now := time.Now().UTC()
 	for index, chunk := range chunks {
+		// 稳定 ID 让重试具有幂等性；同一内容块会覆盖原记录和向量点。
 		id := stableID(document.ID, chunk.Index, chunk.Hash)
 		rows[index] = domain.DocumentChunk{ID: id, DocumentID: document.ID, ChunkIndex: chunk.Index, Title: chunk.Title, StartLine: chunk.StartLine, EndLine: chunk.EndLine, Content: chunk.Content, ContentHash: chunk.Hash, CreatedAt: now}
 		points[index] = rag.Point{ID: uuidFromHash(id), Dense: dense[index], Sparse: rag.Sparse(chunk.Content), Payload: map[string]any{
@@ -96,6 +100,8 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 		return 0, err
 	}
 	if err := i.requireStatus(ctx, document.ID, "indexing"); err != nil {
+		// MySQL 与 Qdrant 无法共享事务。若向量写入期间文档被删除/改态，
+		// 立即反向删除两侧切片，避免“文档不可见但向量仍可召回”的幽灵证据。
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		cleanupErr := i.Vectors.DeleteDocument(cleanupCtx, document.ID)

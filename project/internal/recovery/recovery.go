@@ -12,8 +12,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// Reap scans the MySQL source of truth, so a Redis restart or a lost processing
-// entry cannot strand a task forever. Fail fences the old worker before ACK.
+// Reap 从 MySQL 真相源扫描过期租约，因此 Redis 重启或 processing 项丢失都不会永久卡住任务。
+// 先用 Store.Fail 的租约条件写入封锁旧 Worker，再 ACK Redis，顺序不能颠倒。
 func Reap(ctx context.Context, s *store.Store, q *queue.Redis) error {
 	var tasks []domain.AITask
 	if err := s.DB.WithContext(ctx).
@@ -40,7 +40,8 @@ func Reap(ctx context.Context, s *store.Store, q *queue.Redis) error {
 	return nil
 }
 
-// Reconcile rebuilds ready work and removes stale ready/processing Redis ghosts.
+// Reconcile 以 MySQL 状态重建 ready 队列，并删除 Redis 中已经终态或不存在的幽灵项。
+// 整个过程幂等，可周期执行，也可用于服务重启后的自愈。
 func Reconcile(ctx context.Context, s *store.Store, q *queue.Redis) error {
 	var queued []domain.AITask
 	if err := s.DB.WithContext(ctx).Where("status='queued'").Find(&queued).Error; err != nil {

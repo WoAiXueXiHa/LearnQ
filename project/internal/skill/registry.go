@@ -18,6 +18,7 @@ import (
 var assets embed.FS
 
 type Definition struct {
+	// 版本与哈希会写入 trace，使一次模型输出可以还原到具体 Skill、Prompt 和 Schema。
 	Name          string   `json:"name"`
 	Version       string   `json:"version"`
 	Description   string   `json:"description"`
@@ -28,6 +29,7 @@ type Definition struct {
 }
 
 type Registry struct {
+	// AllowedTools 是每个 Skill 的显式能力白名单；模型只消费工具结果，不自行选择任意函数。
 	definitions  map[string]Definition
 	model        model.ChatModel
 	inputSchema  *jsonschema.Schema
@@ -47,6 +49,7 @@ type ToolExecution struct {
 type ToolFunc func(context.Context, json.RawMessage) (json.RawMessage, json.RawMessage, error)
 
 func New(chat model.ChatModel) *Registry {
+	// Skill 元数据集中注册，Prompt/Schema 则编译进二进制，部署时不会依赖外部文件漂移。
 	defs := []Definition{
 		{"daily-review", "1.0.0", "生成每日学习复盘", "v1", "v1", "Review", []string{"weekly_stats"}},
 		{"algorithm-diagnosis", "1.0.0", "诊断算法学习记录", "v1", "v1", "Algorithm", []string{"rag_query"}},
@@ -119,6 +122,8 @@ func (r *Registry) Run(ctx context.Context, name string, input json.RawMessage) 
 }
 
 func (r *Registry) RunDetailed(ctx context.Context, name string, input json.RawMessage) (model.ChatResponse, []ToolExecution, error) {
+	// 输入先过 JSON Schema，再执行白名单工具；模型输出再次过 Schema。
+	// 这把不可信模型限制在“生成结构化内容”，路由、权限和状态写入仍由 Go 控制。
 	if !json.Valid(input) {
 		return model.ChatResponse{}, nil, errors.New("skill input must be valid JSON")
 	}
@@ -140,6 +145,8 @@ func (r *Registry) RunDetailed(ctx context.Context, name string, input json.RawM
 	executions := make([]ToolExecution, 0, len(definition.AllowedTools))
 	toolResults := map[string]any{}
 	for _, toolName := range definition.AllowedTools {
+		// 工具失败作为结构化上下文交给模型，同时保留 execution 供审计；
+		// 单个辅助工具不可用不必直接中断整个 Skill。
 		execution := ToolExecution{Name: toolName, Request: append(json.RawMessage(nil), input...), Citations: json.RawMessage("[]")}
 		started := time.Now()
 		tool, exists := r.tools[toolName]

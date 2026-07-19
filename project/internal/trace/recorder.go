@@ -12,6 +12,8 @@ import (
 type Recorder struct{ DB *gorm.DB }
 
 func (r Recorder) Record(taskID uint64, definition skill.Definition, promptHash, input string, response model.ChatResponse, latency time.Duration, executions []skill.ToolExecution, runErr error) (uint64, error) {
+	// run、step、tool_calls 在同一事务写入，避免详情页出现只有主记录、缺少工具证据的半条 trace。
+	// 输入仅保存截断摘要；完整模型输出与 Prompt 哈希用于复现和版本对比。
 	reason := ""
 	if runErr != nil {
 		reason = runErr.Error()

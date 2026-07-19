@@ -25,6 +25,7 @@ type Service struct {
 }
 
 func (s Service) WeeklyStats(ctx context.Context, _ json.RawMessage) (json.RawMessage, json.RawMessage, error) {
+	// 统计事实由 SQL 计算，模型只负责解释，避免让 LLM 自己从自然语言估算时长和次数。
 	since := time.Now().UTC().AddDate(0, 0, -7)
 	var summary struct {
 		Minutes int `json:"minutes"`
@@ -51,6 +52,8 @@ func (s Service) WeeklyStats(ctx context.Context, _ json.RawMessage) (json.RawMe
 }
 
 func (s Service) RAGQuery(ctx context.Context, input json.RawMessage) (json.RawMessage, json.RawMessage, error) {
+	// Qdrant 只负责候选召回；每个命中还要回 MySQL 验证文档为 ready，
+	// 防止删除中、索引失败或残留向量成为 Agent 可见证据。
 	question := questionFrom(input)
 	if question == "" {
 		return nil, nil, fmt.Errorf("rag_query needs question, topic, summary or title")

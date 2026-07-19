@@ -30,6 +30,7 @@ type Config struct {
 }
 
 func Load() Config {
+	// 默认 fake 模式保证仓库开箱可验证；real 模式必须显式提供两类模型配置。
 	return Config{
 		HTTPAddr:           env("HTTP_ADDR", "127.0.0.1:8080"),
 		MySQLDSN:           env("MYSQL_DSN", "learnq:learnq@tcp(127.0.0.1:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true"),
@@ -40,9 +41,9 @@ func Load() Config {
 		AIChatBaseURL:      env("AI_CHAT_BASE_URL", "https://api.deepseek.com"),
 		AIChatAPIKey:       os.Getenv("AI_CHAT_API_KEY"),
 		AIChatModel:        env("AI_CHAT_MODEL", "deepseek-v4-pro"),
-		AIEmbeddingBaseURL: env("AI_EMBEDDING_BASE_URL", "https://api.openai.com/v1"),
+		AIEmbeddingBaseURL: env("AI_EMBEDDING_BASE_URL", "http://127.0.0.1:11434/v1"),
 		AIEmbeddingAPIKey:  os.Getenv("AI_EMBEDDING_API_KEY"),
-		AIEmbeddingModel:   env("AI_EMBEDDING_MODEL", "text-embedding-3-small"),
+		AIEmbeddingModel:   env("AI_EMBEDDING_MODEL", "qwen3-embedding:0.6b"),
 		EmbeddingDim:       envInt("EMBEDDING_DIM", 64),
 		TaskTimeout:        45 * time.Second,
 		LeaseDuration:      60 * time.Second,
@@ -52,6 +53,7 @@ func Load() Config {
 }
 
 func (c Config) Validate() error {
+	// 在进程启动阶段集中失败，避免任务领取后才发现密钥或 URL 配置不可用。
 	if c.EmbeddingDim <= 0 {
 		return fmt.Errorf("EMBEDDING_DIM must be a positive integer")
 	}

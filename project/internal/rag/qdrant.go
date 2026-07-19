@@ -29,6 +29,8 @@ type Point struct {
 }
 
 func (q Qdrant) EnsureCollection(ctx context.Context, dimension int) error {
+	// 创建冲突并不直接视为成功：继续读取现有集合并核对 dense 维度，
+	// 防止更换 embedding 模型后把不兼容向量写进旧集合。
 	body := map[string]any{"vectors": map[string]any{"dense": map[string]any{"size": dimension, "distance": "Cosine"}}, "sparse_vectors": map[string]any{"sparse": map[string]any{}}}
 	err := q.put(ctx, "/collections/"+q.Collection, body)
 	if err == nil {
@@ -114,8 +116,8 @@ func (q Qdrant) request(ctx context.Context, method, path string, input, output 
 	return nil
 }
 
-// Hybrid uses Qdrant's Query API: two prefetch branches retrieve dense and
-// hashed lexical sparse candidates, then the server performs RRF fusion.
+// Hybrid 通过 Qdrant Query API 并行预取 dense 语义候选和 hashed sparse 词法候选，
+// 再在服务端用 RRF 融合。这样既能召回语义近义表达，也能保留专有名词/代码符号匹配。
 func (q Qdrant) Hybrid(ctx context.Context, dense []float32, sparse SparseVector, topK int) ([]Hit, error) {
 	input := map[string]any{
 		"prefetch": []any{

@@ -25,6 +25,7 @@ import (
 )
 
 type Server struct {
+	// Server 通过 Option 注入可选外部能力；基础 CRUD 测试无需启动 Redis/Qdrant/真实模型。
 	store     *store.Store
 	skills    *skill.Registry
 	engine    *gin.Engine
@@ -87,6 +88,7 @@ func New(s *store.Store, skills *skill.Registry, options ...Option) *Server {
 func (s *Server) Handler() http.Handler { return s.engine }
 
 func requestID() gin.HandlerFunc {
+	// 优先透传调用方 request id，便于跨服务串联日志；缺失时生成本地随机标识。
 	return func(c *gin.Context) {
 		id := c.GetHeader("X-Request-ID")
 		if id == "" {
@@ -142,6 +144,8 @@ func (s *Server) routes() {
 }
 
 func (s *Server) ready(c *gin.Context) {
+	// live 只回答进程是否存活；ready 才检查接流量所需依赖和 Worker 心跳。
+	// 每项独立设置短超时，防止单个故障依赖拖住整个探针。
 	dependencies := gin.H{"mysql": "ok", "redis": "not_configured", "qdrant": "not_configured", "worker": "not_configured"}
 	unavailable := make([]string, 0, 4)
 	sqlDB, err := s.store.DB.DB()
@@ -234,6 +238,8 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 		return
 	}
 	scope := "POST:/api/v1/study-records:" + key
+	// 幂等键约束“同一个请求重放返回原响应”；request hash 不同则明确冲突，
+	// 避免调用方误复用 key 时静默接受另一份内容。
 	hash := store.HashRequest(body)
 	modules := make([]domain.StudyModule, len(input.Modules))
 	for i, item := range input.Modules {
@@ -279,6 +285,8 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 		var task domain.AITask
 		deduplicated := false
 		if !input.ForceCreate {
+			// 内容指纹去重与传输层幂等不同：即使没有 key，10 分钟内相同规范化内容
+			// 也复用记录；调用方可用 force_create 明确保留重复学习事件。
 			result := tx.Preload("Modules").Where("content_fingerprint=? AND created_at>=?", fingerprint, time.Now().UTC().Add(-10*time.Minute)).
 				Order("id DESC").First(&record)
 			if result.Error == nil {
@@ -304,6 +312,7 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 		payload := gin.H{"data": gin.H{"study_record": record, "task_id": task.ID, "deduplicated": deduplicated}, "request_id": c.GetString("request_id")}
 		encoded, _ = json.Marshal(payload)
 		if key != "" {
+			// 业务写入与幂等响应缓存同事务提交，不会出现“记住了响应但记录/任务不存在”。
 			return tx.Exec("UPDATE idempotency_keys SET status_code=?,response_json=? WHERE scope=?",
 				statusCode, string(encoded), scope).Error
 		}
@@ -533,6 +542,7 @@ func (s *Server) retryTask(c *gin.Context) {
 	now := time.Now().UTC()
 	var updated bool
 	err := s.store.DB.Transaction(func(tx *gorm.DB) error {
+		// generation 递增使上一世代的迟到 Worker 失去写入资格；attempt_no 清零后重新计算退避。
 		result := tx.Exec(`UPDATE ai_tasks SET status='pending',attempt_no=0,execution_generation=execution_generation+1,
 			available_at=?,last_error='',updated_at=? WHERE id=? AND status='dead'`, now, now, id)
 		if result.Error != nil {
@@ -552,6 +562,7 @@ func (s *Server) retryTask(c *gin.Context) {
 			}
 		}
 		payload, _ := json.Marshal(gin.H{"task_id": id})
+		// 人工重试仍走 Outbox，不直接写 Redis，保持所有入队入口的一致可靠性语义。
 		if err := tx.Create(&domain.OutboxEvent{AggregateID: id, EventType: "ai_task.manual_retry", PayloadJSON: string(payload), CreatedAt: now}).Error; err != nil {
 			return err
 		}

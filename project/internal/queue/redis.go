@@ -9,6 +9,8 @@ import (
 )
 
 const (
+	// ready/processing 使用 ZSET：score 分别表示可执行时间和租约截止时间。
+	// token 单独存 Hash，便于 Lua 在 ACK 时校验领取者身份。
 	ReadyKey           = "learnq:tasks:ready"
 	ProcessingKey      = "learnq:tasks:processing"
 	LeaseTokenKey      = "learnq:tasks:lease_tokens"
@@ -58,6 +60,8 @@ func (q *Redis) Enqueue(ctx context.Context, id uint64, at time.Time) error {
 }
 
 func (q *Redis) Claim(ctx context.Context, lease time.Duration, token string) (uint64, bool, error) {
+	// 领取必须在 Redis 内原子完成“取到期任务、移出 ready、加入 processing、记录 token”。
+	// 使用 Redis TIME 而不是各 Worker 本机时间，避免多机时钟偏差造成提前/延后领取。
 	values, err := claimScript.Run(ctx, q.client, []string{ReadyKey, ProcessingKey, LeaseTokenKey}, lease.Milliseconds(), token).StringSlice()
 	if err == redis.Nil || len(values) == 0 {
 		return 0, false, nil
@@ -70,6 +74,7 @@ func (q *Redis) Claim(ctx context.Context, lease time.Duration, token string) (u
 }
 
 func (q *Redis) Ack(ctx context.Context, id uint64, token string) error {
+	// ACK 只删除 token 仍匹配的 processing 项；旧 Worker 无法误删后来者的新租约。
 	key := strconv.FormatUint(id, 10)
 	_, err := ackScript.Run(ctx, q.client, []string{key, LeaseTokenKey, ProcessingKey}, token).Result()
 	if err == redis.Nil {
@@ -78,9 +83,8 @@ func (q *Redis) Ack(ctx context.Context, id uint64, token string) error {
 	return err
 }
 
-// Cleanup removes an observed stale processing entry without racing a newer
-// claim. The Lua script only removes the entry if its token is still the one
-// observed before reconciliation.
+// Cleanup 清理对账时观察到的幽灵 processing 项。先读 token，再由 Lua 比较并删除，
+// 防止读取后任务恰好被重新领取，从而误删新 Worker 的租约。
 func (q *Redis) Cleanup(ctx context.Context, id uint64) error {
 	key := strconv.FormatUint(id, 10)
 	token, err := q.client.HGet(ctx, LeaseTokenKey, key).Result()

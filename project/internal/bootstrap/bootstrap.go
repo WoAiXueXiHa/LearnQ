@@ -20,6 +20,8 @@ func Redis(cfg config.Config) *redis.Client {
 }
 
 func Models(cfg config.Config) (model.ChatModel, model.EmbeddingModel) {
+	// 选择模型实现集中在装配层，领域代码只依赖接口。这样 fake 模式可以离线、确定性地
+	// 覆盖完整工作流，real 模式也不会把供应商 SDK 类型扩散到业务包。
 	if cfg.AIMode == "real" {
 		chat := &model.OpenAICompatible{
 			BaseURL: cfg.AIChatBaseURL, APIKey: cfg.AIChatAPIKey, ChatModel: cfg.AIChatModel,

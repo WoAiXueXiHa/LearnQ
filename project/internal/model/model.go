@@ -24,6 +24,7 @@ type ChatResponse struct {
 	Model        string
 }
 type ChatModel interface {
+	// 业务层只依赖最小接口，供应商协议、鉴权和错误分类留在适配器内部。
 	Generate(context.Context, ChatRequest) (ChatResponse, error)
 }
 type EmbeddingModel interface {
@@ -31,6 +32,7 @@ type EmbeddingModel interface {
 }
 
 type Fake struct {
+	// Fake 不是随意占位：相同输入产生确定性输出，可在无外部密钥时跑通完整验收链路。
 	Dimension int
 	Delay     time.Duration
 	Failure   string

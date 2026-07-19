@@ -6,9 +6,9 @@ x-app-environment: &app-environment
   AI_CHAT_BASE_URL: ${AI_CHAT_BASE_URL:-https://api.deepseek.com}
   AI_CHAT_API_KEY: ${AI_CHAT_API_KEY:-}
   AI_CHAT_MODEL: ${AI_CHAT_MODEL:-deepseek-v4-pro}
-  AI_EMBEDDING_BASE_URL: ${AI_EMBEDDING_BASE_URL:-https://api.openai.com/v1}
-  AI_EMBEDDING_API_KEY: ${AI_EMBEDDING_API_KEY:-}
-  AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-text-embedding-3-small}
+  AI_EMBEDDING_BASE_URL: ${AI_EMBEDDING_BASE_URL:-http://host.docker.internal:11434/v1}
+  AI_EMBEDDING_API_KEY: ${AI_EMBEDDING_API_KEY:-ollama}
+  AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
   EMBEDDING_DIM: ${EMBEDDING_DIM:-64}
   HTTP_ADDR: 0.0.0.0:8080
   REPORT_DIR: /app/data/reports
@@ -54,6 +54,7 @@ services:
   api:
     build: {context: ., args: {TARGET: api}}
     environment: *app-environment
+    extra_hosts: ["host.docker.internal:host-gateway"]
     ports: ["127.0.0.1:${LEARNQ_HTTP_PORT:-8080}:8080"]
     depends_on:
       migration: {condition: service_completed_successfully}
@@ -62,6 +63,7 @@ services:
   worker:
     build: {context: ., args: {TARGET: worker}}
     environment: *app-environment
+    extra_hosts: ["host.docker.internal:host-gateway"]
     volumes: [reports:/app/data/reports]
     depends_on:
       migration: {condition: service_completed_successfully}

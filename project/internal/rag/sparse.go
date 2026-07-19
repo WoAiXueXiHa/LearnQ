@@ -13,6 +13,8 @@ type SparseVector struct {
 }
 
 func Sparse(text string) SparseVector {
+	// 这是无需词典的轻量词法召回：英文按连续字母数字分词，中文同时保留单字和双字。
+	// token 哈希到固定 uint32 空间，换取零词表部署；哈希碰撞是该方案接受的精度代价。
 	counts := map[uint32]int{}
 	var english strings.Builder
 	var chinese []rune
@@ -57,6 +59,7 @@ func Sparse(text string) SparseVector {
 	}
 	values := make([]float32, len(indices))
 	for i, index := range indices {
+		// 对词频取对数，保留重复词信号但避免高频词完全支配稀疏得分。
 		values[i] = float32(1 + math.Log(float64(counts[index])))
 	}
 	return SparseVector{Indices: indices, Values: values}
@@ -69,6 +72,7 @@ func hashToken(token string) uint32 {
 }
 
 func RRF(rankings [][]string, k int) []string {
+	// RRF 只融合名次，不要求 dense 与 sparse 的原始分数处在同一尺度。
 	if k <= 0 {
 		k = 60
 	}
