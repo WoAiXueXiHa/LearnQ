@@ -4,6 +4,9 @@ const $$ = selector => [...document.querySelectorAll(selector)];
 let lastRecordBody = null;
 let taskTimer = null;
 let documentTimer = null;
+let imageTimer = null;
+let imagePreviewURL = null;
+let imagePollFailures = 0;
 let taskRequestController = null;
 let ragRequestController = null;
 let taskRequestVersion = 0;
@@ -28,6 +31,28 @@ function showNotice(message, kind = "info") {
   box.textContent = message;
   clearTimeout(showNotice.timer);
   showNotice.timer = setTimeout(() => box.hidden = true, 6000);
+}
+
+function updateModelMode(mode, modelName = "") {
+  const badge = $("#modelMode");
+  if (!badge) return;
+  const normalizedMode = String(mode || "").toLowerCase();
+  const normalizedModel = String(modelName || "");
+  const fake = normalizedMode === "fake" || normalizedModel.toLowerCase().includes("fake");
+  if (fake) {
+    badge.textContent = `Fake 演示模式${normalizedModel ? ` · ${normalizedModel}` : ""}`;
+    badge.className = "badge warning";
+    badge.title = "当前结果用于验证流程，不能代表真实模型质量。";
+    return;
+  }
+  if (normalizedMode === "real" || normalizedModel) {
+    badge.textContent = `正式模型${normalizedModel ? ` · ${normalizedModel}` : ""}`;
+    badge.className = "badge success";
+    badge.title = "模型名称来自运行时信息或最近一次任务 Trace。";
+    return;
+  }
+  badge.textContent = "模型模式：以任务 Trace 为准";
+  badge.className = "badge";
 }
 
 function setButtonBusy(button, busy, busyText = "处理中…") {
@@ -111,6 +136,7 @@ function switchView(id, scroll = true) {
   }
   if (id !== "knowledge") {
     clearTimeout(documentTimer);
+    clearTimeout(imageTimer);
     ragRequestController?.abort();
   }
   $$("main > section").forEach(section => section.hidden = section.id !== id);
@@ -124,7 +150,10 @@ function switchView(id, scroll = true) {
   if (id === "records") loadRecords();
   if (id === "task" && currentTaskID) openTask(currentTaskID);
   if (id === "reviews") loadReviews();
-  if (id === "knowledge") loadDocuments();
+  if (id === "knowledge") {
+    loadDocuments();
+    loadImages();
+  }
 }
 
 $$(".tabs button").forEach(button => button.onclick = () => switchView(button.dataset.view));
@@ -134,6 +163,8 @@ async function health() {
   healthInFlight = true;
   try {
     const data = await fetchData("/health/ready", {cache: "no-store"}, 5000);
+    const runtime = data?.runtime || data?.ai || {};
+    updateModelMode(data?.ai_mode || runtime.mode, data?.chat_model || runtime.chat_model);
     healthDependencies = data?.dependencies || {};
     $("#health").textContent = "服务正常";
     $("#health").className = "badge success";
@@ -289,6 +320,8 @@ function renderMarkdown(markdown) {
 function renderTrace(trace) {
   const runs = trace?.agent_runs || [];
   const tools = trace?.tool_calls || [];
+  const latestModel = runs.find(run => run?.model_name)?.model_name;
+  if (latestModel) updateModelMode("", latestModel);
   return `<div class="card"><h3>Agent 执行轨迹</h3>
     ${runs.length ? runs.map(run => `<div class="trace-row"><strong>${escapeHTML(run.skill_name)}</strong><span>${escapeHTML(run.model_name)}</span><small>${run.latency_ms} ms · 输入 ${run.input_tokens} / 输出 ${run.output_tokens} tokens</small></div>`).join("") : `<p class="muted">Agent 尚未运行。</p>`}
     ${tools.length ? `<h4>真实工具调用</h4>${tools.map(tool => `<details><summary>${escapeHTML(tool.tool_name)} · ${tool.latency_ms} ms ${tool.error_reason ? "· 失败" : ""}</summary><pre>${escapeHTML(tool.response_json)}</pre>${tool.retrieval_citations_json !== "[]" ? `<pre>${escapeHTML(tool.retrieval_citations_json)}</pre>` : ""}</details>`).join("")}` : ""}
@@ -310,6 +343,24 @@ const documentStatusText = {
   deleting: "删除中",
   deleted: "已删除"
 };
+
+const imageStatusText = {
+  uploaded: "已上传",
+  pending: "等待分析",
+  queued: "等待分析",
+  processing: "分析中",
+  analyzing: "分析中",
+  ready: "分析完成",
+  failed: "分析失败",
+  indexing: "加入知识库中",
+  deleting: "删除中"
+};
+
+function renderStringList(heading, value) {
+  const items = Array.isArray(value) ? value.filter(Boolean) : value ? [value] : [];
+  if (!items.length) return "";
+  return `<section class="description-section"><h4>${escapeHTML(heading)}</h4><ul>${items.map(item => `<li>${escapeHTML(item)}</li>`).join("")}</ul></section>`;
+}
 
 const exportStatusText = {
   pending: "等待导出",
@@ -343,7 +394,27 @@ function renderTimeline(task) {
 }
 
 function renderTaskProduct(data) {
-  const {task, report, review, document} = data;
+  const {task, report, review_task: review, document, image} = data;
+  if (task.kind === "image_describe") {
+    if (!image) {
+      return `<div class="card ${task.status === "dead" ? "warning" : "danger"}">${task.status === "dead" ? "图片已删除，分析任务已取消。" : "分析任务找不到对应图片。"}</div>`;
+    }
+    const description = image.description || {};
+    return `<article class="card report">
+      <div class="card-title"><h3>${escapeHTML(description.title || "图片分析")}</h3><span class="status ${escapeHTML(image.status)}">${escapeHTML(imageStatusText[image.status] || image.status)}</span></div>
+      <p>${escapeHTML(description.summary || (task.status === "dead" ? "图片分析失败。" : "图片正在分析。"))}</p>
+      ${description.learning_explanation ? `<div class="markdown">${renderMarkdown(description.learning_explanation)}</div>` : ""}
+      ${description.extracted_text ? `<details><summary>查看提取文字</summary><pre>${escapeHTML(description.extracted_text)}</pre></details>` : ""}
+      ${renderStringList("关键点", description.key_points)}
+      ${renderStringList("不确定项", description.uncertainties)}
+      ${image.last_error ? `<p class="danger">${escapeHTML(image.last_error)}</p>` : ""}
+      <div class="actions">
+        ${image.status === "ready" && !image.derived_document_id ? `<button type="button" data-image-action="index" data-image-id="${image.id}">加入知识库</button>` : ""}
+        ${image.derived_document_id ? `<span class="badge success">已加入知识库 · Document #${image.derived_document_id}</span>` : ""}
+        ${image.status === "failed" ? `<button class="secondary" type="button" data-image-action="retry" data-image-id="${image.id}">重试分析</button>` : ""}
+      </div>
+    </article>`;
+  }
   if (task.kind === "document_index") {
     if (!document) {
       return `<div class="card ${task.status === "dead" ? "warning" : "danger"}">${task.status === "dead" ? "文档已删除，索引任务已取消。" : "索引任务找不到对应文档。"}</div>`;
@@ -398,7 +469,7 @@ async function openTask(id) {
     $("#taskDetail").innerHTML = `
       <article class="card">
         <div class="card-title"><h3>${escapeHTML(record?.title || data.document?.filename || task.kind)}</h3><span class="status ${task.status}">${escapeHTML(taskStatusText[task.status] || task.status)}</span></div>
-        <p>${escapeHTML(record?.summary || "任务处理中")}</p>
+        <p>${escapeHTML(record?.summary || (task.kind === "image_describe" ? "图片视觉理解任务" : task.kind === "document_index" ? "文档索引任务" : "任务处理中"))}</p>
         ${renderTimeline(task)}
         ${workerUnavailable ? `<p class="danger">Worker 未运行，任务暂时无法继续处理。</p>` : ""}
         ${stalled && !workerUnavailable ? `<p class="warning-text">任务超过预期时间没有推进，正在降低刷新频率；请检查 Worker 或模型调用日志。</p>` : ""}
@@ -524,7 +595,7 @@ $("#skillForm").onsubmit = async event => {
   setButtonBusy(button, true, "正在运行…");
   try {
     JSON.parse($("#skillInput").value);
-    const data = await request(`/skills/${name}/runs`, {method: "POST", headers: {"Content-Type": "application/json"}, body: $("#skillInput").value}, 55000);
+    const data = await request(`/skills/${name}/runs`, {method: "POST", headers: {"Content-Type": "application/json"}, body: $("#skillInput").value}, 85000);
     if (name === "multi-agent") {
       const workflow = data.workflow;
       const cards = workflow.routes.map(route => {
@@ -565,6 +636,174 @@ $("#uploadForm").onsubmit = async event => {
     loadDocuments(true);
   } catch (error) { showNotice(error.message, "danger"); }
   finally { setButtonBusy(button, false); }
+};
+
+function switchMaterial(kind) {
+  const image = kind === "image";
+  $("#documentUploadPanel").hidden = image;
+  $("#imageUploadPanel").hidden = !image;
+  $("#materialDocumentTab").classList.toggle("active", !image);
+  $("#materialImageTab").classList.toggle("active", image);
+  $("#materialDocumentTab").setAttribute("aria-selected", String(!image));
+  $("#materialImageTab").setAttribute("aria-selected", String(image));
+}
+
+$("#materialDocumentTab").onclick = () => switchMaterial("document");
+$("#materialImageTab").onclick = () => switchMaterial("image");
+$("#materialRefresh").onclick = () => {
+  loadDocuments();
+  loadImages(true);
+};
+
+function clearImagePreview() {
+  if (imagePreviewURL) URL.revokeObjectURL(imagePreviewURL);
+  imagePreviewURL = null;
+  $("#imagePreview").removeAttribute("src");
+  $("#imagePreviewBox").hidden = true;
+}
+
+$("#imageFile").onchange = () => {
+  clearImagePreview();
+  const file = $("#imageFile").files[0];
+  if (!file) return;
+  const supported = ["image/png", "image/jpeg"];
+  if (!supported.includes(file.type)) {
+    $("#imageFile").value = "";
+    showNotice("仅支持 PNG 或 JPEG 图片。", "warning");
+    return;
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    $("#imageFile").value = "";
+    showNotice("图片不能超过 5 MiB。", "warning");
+    return;
+  }
+  imagePreviewURL = URL.createObjectURL(file);
+  $("#imagePreview").src = imagePreviewURL;
+  $("#imagePreview").alt = `${file.name} 的上传预览`;
+  $("#imagePreviewName").textContent = file.name;
+  $("#imagePreviewMeta").textContent = `${(file.size / 1024).toFixed(1)} KiB`;
+  $("#imagePreviewBox").hidden = false;
+};
+
+$("#imagePreview").onload = event => {
+  const image = event.currentTarget;
+  $("#imagePreviewMeta").textContent += ` · ${image.naturalWidth} × ${image.naturalHeight}`;
+};
+
+window.addEventListener("beforeunload", clearImagePreview);
+
+$("#imageUploadForm").onsubmit = async event => {
+  event.preventDefault();
+  const button = event.submitter;
+  const file = $("#imageFile").files[0];
+  if (!file) return;
+  setButtonBusy(button, true, "正在上传…");
+  const form = new FormData();
+  form.append("file", file);
+  form.append("prompt", $("#imagePrompt").value.trim());
+  try {
+    const data = await request("/images", {method: "POST", body: form}, 30000);
+    showNotice(`图片 #${data.image_id || data.id} 已上传，正在分析。`, "success");
+    $("#imageUploadForm").reset();
+    clearImagePreview();
+    await loadImages(true);
+  } catch (error) {
+    showNotice(error.message, "danger");
+  } finally {
+    setButtonBusy(button, false);
+  }
+};
+
+function imageDescriptionMarkup(image) {
+  const description = image.description || {};
+  if (!description || !Object.keys(description).length) return "";
+  return `<div class="image-description">
+    ${description.summary ? `<p>${escapeHTML(description.summary)}</p>` : ""}
+    ${description.learning_explanation ? `<div class="markdown">${renderMarkdown(description.learning_explanation)}</div>` : ""}
+    ${description.extracted_text ? `<details><summary>查看提取文字</summary><pre>${escapeHTML(description.extracted_text)}</pre></details>` : ""}
+    ${renderStringList("关键点", description.key_points)}
+    ${renderStringList("不确定项", description.uncertainties)}
+  </div>`;
+}
+
+function imageCard(image) {
+  const status = imageStatusText[image.status] || image.status || "未知";
+  const active = ["uploaded", "pending", "queued", "processing", "analyzing", "indexing"].includes(image.status);
+  return `<article class="card image-card">
+    <div class="image-card-layout">
+      <img class="image-thumb" src="${api}/images/${image.id}/content" alt="${escapeHTML(image.original_filename || "已上传图片")}" loading="lazy">
+      <div>
+        <div class="card-title"><strong>${escapeHTML(image.original_filename || `图片 #${image.id}`)}</strong><span class="status ${escapeHTML(image.status)}">${escapeHTML(status)}</span></div>
+        <small>${image.width || "?"} × ${image.height || "?"} · ${image.size_bytes ? `${(image.size_bytes / 1024).toFixed(1)} KiB` : "大小未知"} · Image #${image.id}</small>
+        ${active ? `<p class="muted">处理完成后会自动更新。</p>` : ""}
+        ${imageDescriptionMarkup(image)}
+        ${image.last_error ? `<p class="danger">${escapeHTML(image.last_error)}</p>` : ""}
+        <div class="actions">
+          ${image.status === "ready" && !image.derived_document_id ? `<button type="button" data-image-action="index" data-image-id="${image.id}">加入知识库</button>` : ""}
+          ${image.derived_document_id ? `<span class="badge success">已加入知识库 · Document #${image.derived_document_id}</span>` : ""}
+          ${image.status === "failed" ? `<button class="secondary" type="button" data-image-action="retry" data-image-id="${image.id}">重试分析</button>` : ""}
+          <button class="secondary danger-outline" type="button" data-image-action="delete" data-image-id="${image.id}">删除</button>
+        </div>
+      </div>
+    </div>
+  </article>`;
+}
+
+async function loadImages(keepPolling = false) {
+  clearTimeout(imageTimer);
+  try {
+    let images = await request("/images", {cache: "no-store"});
+    images = Array.isArray(images) ? images : [];
+    const active = images.some(image => ["uploaded", "pending", "queued", "processing", "analyzing", "indexing", "deleting"].includes(image.status));
+    imagePollFailures = 0;
+    $("#imageList").innerHTML = images.length ? images.map(imageCard).join("") : `<div class="empty">还没有图片。可上传代码截图、架构图或学习笔记进行分析。</div>`;
+    if ((active || keepPolling) && currentView === "knowledge") imageTimer = setTimeout(() => loadImages(false), 1500);
+  } catch (error) {
+    imagePollFailures += 1;
+    $("#imageList").innerHTML = `<div class="empty danger">图片列表加载失败：${escapeHTML(error.message)} <button class="secondary" type="button" data-image-action="reload">重试</button></div>`;
+    if (retryable(error) && currentView === "knowledge") imageTimer = setTimeout(() => loadImages(true), Math.min(1500 * (2 ** imagePollFailures), 10000));
+  }
+}
+
+async function imageAction(action, id, button) {
+  if (action === "reload") return loadImages(true);
+  if (action === "delete" && !confirm("确认删除图片、分析结果及其知识库文档和向量索引？")) return;
+  if (action === "delete") {
+    ragRequestController?.abort();
+    knowledgeVersion += 1;
+  }
+  setButtonBusy(button, true, action === "delete" ? "正在删除…" : action === "index" ? "正在入库…" : "正在提交…");
+  try {
+    if (action === "delete") await request(`/images/${id}`, {method: "DELETE"});
+    if (action === "retry") await request(`/images/${id}/retry`, {method: "POST"});
+    if (action === "index") await request(`/images/${id}/index`, {method: "POST"});
+    showNotice(action === "delete" ? "图片已删除。" : action === "index" ? "正在将描述加入知识库。" : "图片已重新进入分析队列。", "success");
+    if (action === "delete") {
+      $("#ragResult").className = "stack empty";
+      $("#ragResult").textContent = "证据来源发生变化，请重新查询。";
+    }
+    await Promise.all([
+      loadImages(true),
+      ["delete", "index"].includes(action) ? loadDocuments(true) : Promise.resolve()
+    ]);
+  } catch (error) {
+    showNotice(error.message, "danger");
+    setButtonBusy(button, false);
+    if (action === "delete") await Promise.all([loadImages(true), loadDocuments(true)]);
+  }
+}
+
+$("#imageList").onclick = event => {
+  const button = event.target.closest("[data-image-action]");
+  if (!button) return;
+  imageAction(button.dataset.imageAction, Number(button.dataset.imageId), button);
+};
+
+$("#taskDetail").onclick = async event => {
+  const button = event.target.closest("[data-image-action]");
+  if (!button) return;
+  await imageAction(button.dataset.imageAction, Number(button.dataset.imageId), button);
+  if (currentView === "task" && currentTaskID) await openTask(currentTaskID);
 };
 
 async function loadDocuments(keepPolling = false) {
@@ -635,12 +874,17 @@ $("#ragForm").onsubmit = async event => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({question: $("#question").value, top_k: 5}),
       signal: ragRequestController.signal
-    }, 55000);
+    }, 85000);
     if (requestVersion !== ragRequestVersion || sourceVersion !== knowledgeVersion || currentView !== "knowledge") return;
     $("#ragResult").className = "stack";
     const citations = data.citations || [];
+    const usedSources = new Set([...String(data.answer || "").matchAll(/\[S(\d+)\]/g)].map(match => `S${match[1]}`));
+    const used = citations.filter(citation => usedSources.has(String(citation.source)));
+    const candidates = citations.filter(citation => !usedSources.has(String(citation.source)));
+    const citationCard = citation => `<article class="card citation"><div class="card-title"><strong>[${escapeHTML(citation.source)}] ${escapeHTML(citation.title)}</strong><span class="citation-score">${Number(citation.score).toFixed(3)}</span></div><p>${escapeHTML(citation.summary)}</p><small>文档 #${citation.document_id} · 行 ${citation.start_line}–${citation.end_line} · Chunk ${escapeHTML(citation.chunk_id)}</small></article>`;
     $("#ragResult").innerHTML = `<article class="card report"><h3>证据回答</h3><div class="markdown">${renderMarkdown(data.answer)}</div></article>
-      ${citations.length ? `<div class="cards">${citations.map(citation => `<article class="card citation"><div class="card-title"><strong>[${escapeHTML(citation.source)}] ${escapeHTML(citation.title)}</strong><span>${Number(citation.score).toFixed(3)}</span></div><p>${escapeHTML(citation.summary)}</p><small>文档 #${citation.document_id} · 行 ${citation.start_line}–${citation.end_line} · Chunk ${escapeHTML(citation.chunk_id)}</small></article>`).join("")}</div>` : `<div class="card warning">回答没有可核验引用，请调整问题或检查文档索引。</div>`}`;
+      ${used.length ? `<section><h3>回答实际引用</h3><div class="cards">${used.map(citationCard).join("")}</div></section>` : `<div class="card warning">回答没有标注可核验引用，请调整问题或检查模型输出。</div>`}
+      ${candidates.length ? `<details class="card retrieval-candidates"><summary>其他检索候选（${candidates.length}）</summary><p class="muted">这些片段参与了召回，但没有被当前回答直接引用。</p><div class="cards">${candidates.map(citationCard).join("")}</div></details>` : ""}`;
   } catch (error) {
     if (error.code === "REQUEST_CANCELLED") return;
     $("#ragResult").innerHTML = `<div class="card danger">${escapeHTML(error.message)}</div>`;

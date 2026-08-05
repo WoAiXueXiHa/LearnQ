@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/domain"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/evaluation"
@@ -19,13 +21,27 @@ import (
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/rag"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
+// 文档与 RAG 相关上限：文档 5 MiB、multipart 包裹 6 MiB、RAG 请求体 64 KiB、
+// 问题 2000 rune，RAG 全链路最长 80s 超时。
+const (
+	maxDocumentBytes      = 5 << 20
+	maxMultipartBodyBytes = maxDocumentBytes + (1 << 20)
+	maxRAGRequestBytes    = 64 << 10
+	maxRAGQuestionRunes   = 2000
+	ragRequestTimeout     = 80 * time.Second
+)
+
+// dueReviews 是 GET /api/v1/review-tasks 的 due 快捷入口：固定 scope=due 后复用 reviewTasks。
 func (s *Server) dueReviews(c *gin.Context) {
 	c.Request.URL.RawQuery = "scope=due"
 	s.reviewTasks(c)
 }
 
+// reviewTasks 处理 GET /api/v1/review-tasks：按 scope（due/upcoming/all）列出 scheduled
+// 复习任务，联表带出报告内容与学习记录标题；scope 非法时返回 422。
 func (s *Server) reviewTasks(c *gin.Context) {
 	scope := c.DefaultQuery("scope", "all")
 	now := time.Now().UTC()
@@ -33,6 +49,7 @@ func (s *Server) reviewTasks(c *gin.Context) {
 		Select(`rt.*, r.task_id, r.markdown_content,
 			COALESCE(sr.title,'学习报告') record_title`).
 		Joins("JOIN reports r ON r.id=rt.report_id").
+		// study_record_id 只存在 ai_task.payload_json 而非外键列，标题需要 SQL 侧 JSON 反查。
 		Joins(`LEFT JOIN ai_tasks at ON at.id=r.task_id`).
 		Joins(`LEFT JOIN study_records sr ON sr.id=
 			CAST(JSON_UNQUOTE(JSON_EXTRACT(at.payload_json,'$.study_record_id')) AS UNSIGNED)`).
@@ -55,6 +72,8 @@ func (s *Server) reviewTasks(c *gin.Context) {
 	ok(c, 200, rows)
 }
 
+// completeReview 处理 POST /api/v1/review-tasks/:id/complete：按 mastery 计算下一次间隔，
+// 条件更新（含到期校验）与审计事件同事务提交，并发或重复请求只有一个能生效。
 func (s *Server) completeReview(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -109,6 +128,7 @@ func (s *Server) completeReview(c *gin.Context) {
 	ok(c, 200, gin.H{"id": id, "mastery": *input.Mastery, "due_at": next})
 }
 
+// skipReview 处理 POST /api/v1/review-tasks/:id/skip：到期任务顺延 24 小时，同样以条件更新防重复。
 func (s *Server) skipReview(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -147,6 +167,8 @@ func (s *Server) skipReview(c *gin.Context) {
 	ok(c, 200, gin.H{"id": id, "mastery": task.Mastery, "due_at": next})
 }
 
+// runSkill 处理 POST /api/v1/skills/:name/runs：同步执行 Skill 并持久化 trace；
+// name=multi-agent 时走 Eino DAG，各成功路由单独落 trace。
 func (s *Server) runSkill(c *gin.Context) {
 	// 同步实验接口与异步报告共用 Registry 和 Trace；差别只在是否经过任务队列。
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
@@ -160,6 +182,7 @@ func (s *Server) runSkill(c *gin.Context) {
 		var workflowInput struct {
 			Modules []string `json:"modules"`
 		}
+		// 解析失败仅影响 modules 裁剪，忽略错误并退回默认路由集合。
 		_ = json.Unmarshal(body, &workflowInput)
 		result, runErr := s.skills.RunEinoWorkflow(c, workflowInput.Modules, body)
 		runIDs := make(map[string]uint64, len(result.Routes))
@@ -170,7 +193,7 @@ func (s *Server) runSkill(c *gin.Context) {
 			}
 			definition, _ := s.skills.Get(route)
 			hash, _ := s.skills.PromptHash(route)
-			runID, recordErr := s.recorder.Record(0, definition, hash, string(body), response, time.Since(started), result.Tools[route], nil)
+			runID, recordErr := s.recorder.Record(c.Request.Context(), 0, definition, hash, string(body), response, time.Since(started), result.Tools[route], nil)
 			if recordErr != nil {
 				fail(c, 500, "INTERNAL_ERROR", "workflow trace could not be persisted", nil)
 				return
@@ -201,7 +224,7 @@ func (s *Server) runSkill(c *gin.Context) {
 	}
 	definition, _ := s.skills.Get(c.Param("name"))
 	hash, _ := s.skills.PromptHash(c.Param("name"))
-	runID, recordErr := s.recorder.Record(0, definition, hash, string(body), output, time.Since(started), executions, nil)
+	runID, recordErr := s.recorder.Record(c.Request.Context(), 0, definition, hash, string(body), output, time.Since(started), executions, nil)
 	if recordErr != nil {
 		fail(c, 500, "INTERNAL_ERROR", "trace could not be persisted", nil)
 		return
@@ -209,6 +232,7 @@ func (s *Server) runSkill(c *gin.Context) {
 	ok(c, 200, gin.H{"agent_run_id": runID, "output": json.RawMessage(output.Content)})
 }
 
+// agentRun 处理 GET /api/v1/agent-runs/:id：返回单次执行的 run、steps 与 tool_calls。
 func (s *Server) agentRun(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -231,21 +255,46 @@ func (s *Server) agentRun(c *gin.Context) {
 	ok(c, 200, gin.H{"run": run, "steps": steps, "tool_calls": tools})
 }
 
+// uploadDocument 处理 POST /api/v1/documents：multipart 上传，限 5 MiB 且仅收 md/txt/json；
+// 校验内容与扩展名后写 documents 并创建 document_index 任务，返回 202。
 func (s *Server) uploadDocument(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxMultipartBodyBytes)
+	if err := c.Request.ParseMultipartForm(1 << 20); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			fail(c, http.StatusRequestEntityTooLarge, "VALIDATION_FAILED", "multipart request exceeds 6 MiB", nil)
+			return
+		}
+		fail(c, 422, "VALIDATION_FAILED", "multipart file is required", nil)
+		return
+	}
+	// multipart 解析会落盘临时文件，请求结束后及时清理。
+	if c.Request.MultipartForm != nil {
+		defer c.Request.MultipartForm.RemoveAll()
+	}
 	file, header, err := c.Request.FormFile("file")
 	if err != nil {
 		fail(c, 422, "VALIDATION_FAILED", "multipart file is required", nil)
 		return
 	}
 	defer file.Close()
-	body, err := io.ReadAll(io.LimitReader(file, (5<<20)+1))
+	body, err := io.ReadAll(io.LimitReader(file, maxDocumentBytes+1))
 	// 多读 1 字节用于区分“恰好达到上限”和“已经超限”，并在入库前验证 UTF-8/JSON。
-	if err != nil || !rag.ValidDocument(body) {
-		fail(c, 422, "VALIDATION_FAILED", "file must be non-empty UTF-8 and at most 5 MiB", nil)
+	if err != nil {
+		fail(c, 422, "VALIDATION_FAILED", "file could not be read", nil)
 		return
 	}
-	if len(body) > 5<<20 {
+	if len(body) > maxDocumentBytes {
 		fail(c, 413, "VALIDATION_FAILED", "file exceeds 5 MiB limit", nil)
+		return
+	}
+	if !rag.ValidDocument(body) {
+		fail(c, 422, "VALIDATION_FAILED", "file must be non-empty UTF-8", nil)
+		return
+	}
+	header.Filename = strings.TrimSpace(header.Filename)
+	if header.Filename == "" || utf8.RuneCountInString(header.Filename) > 255 {
+		fail(c, 422, "VALIDATION_FAILED", "filename is required and must not exceed 255 characters", nil)
 		return
 	}
 	dot := strings.LastIndex(header.Filename, ".")
@@ -272,6 +321,7 @@ func (s *Server) uploadDocument(c *gin.Context) {
 	ok(c, 202, gin.H{"document_id": doc.ID, "indexing_task_id": task.ID, "status": "uploaded"})
 }
 
+// documentStatus 处理 GET /api/v1/documents/:id/status：返回文档当前状态行。
 func (s *Server) documentStatus(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -283,6 +333,8 @@ func (s *Server) documentStatus(c *gin.Context) {
 	}
 	ok(c, 200, v)
 }
+
+// listDocuments 处理 GET /api/v1/documents：按 id 倒序返回最近 100 个文档。
 func (s *Server) listDocuments(c *gin.Context) {
 	documents := make([]domain.Document, 0)
 	if err := s.store.DB.Order("id DESC").Limit(100).Find(&documents).Error; err != nil {
@@ -291,6 +343,9 @@ func (s *Server) listDocuments(c *gin.Context) {
 	}
 	ok(c, 200, documents)
 }
+
+// deleteDocument 处理 DELETE /api/v1/documents/:id：两阶段删除——先标 deleting 隔离检索证据，
+// 再删 Qdrant 向量，最后同事务终止未完成任务并清理 chunks 与元数据。
 func (s *Server) deleteDocument(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -314,6 +369,7 @@ func (s *Server) deleteDocument(c *gin.Context) {
 			return
 		}
 	}
+	// RAG 未配置（无 vectors）时跳过外部删除，仅清理 MySQL 元数据。
 	if s.vectors != nil {
 		if err := s.vectors.DeleteDocument(c, id); err != nil {
 			fail(c, 503, "DEPENDENCY_UNAVAILABLE", "could not remove Qdrant points; document remains deleting and may be retried", nil)
@@ -325,12 +381,38 @@ func (s *Server) deleteDocument(c *gin.Context) {
 		// Qdrant 删除按 document_id 过滤且可重复，重试不会误伤其他文档。
 		if document.IndexingTaskID != 0 {
 			now := time.Now().UTC()
-			if err := tx.Model(&domain.AITask{}).Where("id=? AND status NOT IN ('succeeded','dead')", document.IndexingTaskID).
-				Updates(map[string]any{
-					"status": domain.TaskDead, "last_error": "document deleted by user",
-					"lease_token": "", "lease_until": nil, "updated_at": now,
-				}).Error; err != nil {
+			var task domain.AITask
+			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&task, document.IndexingTaskID).Error; err != nil {
 				return err
+			}
+			if task.Status != domain.TaskSucceeded && task.Status != domain.TaskDead {
+				if task.Status == domain.TaskProcessing {
+					attemptResult := tx.Model(&domain.TaskAttempt{}).
+						Where("task_id=? AND execution_generation=? AND lease_token=? AND status='processing'",
+							task.ID, task.ExecutionGeneration, task.LeaseToken).
+						Updates(map[string]any{
+							"status": "dead", "error_message": "document deleted by user", "finished_at": now,
+						})
+					if attemptResult.Error != nil {
+						return attemptResult.Error
+					}
+					if attemptResult.RowsAffected != 1 {
+						return errors.New("processing document task attempt is missing")
+					}
+				}
+				taskResult := tx.Model(&domain.AITask{}).
+					Where("id=? AND status=? AND execution_generation=? AND lease_token=?",
+						task.ID, task.Status, task.ExecutionGeneration, task.LeaseToken).
+					Updates(map[string]any{
+						"status": domain.TaskDead, "last_error": "document deleted by user",
+						"lease_token": "", "lease_until": nil, "updated_at": now,
+					})
+				if taskResult.Error != nil {
+					return taskResult.Error
+				}
+				if taskResult.RowsAffected != 1 {
+					return errors.New("document task state changed during deletion")
+				}
 			}
 		}
 		if err := tx.Exec("DELETE FROM document_chunks WHERE document_id=?", id).Error; err != nil {
@@ -344,15 +426,33 @@ func (s *Server) deleteDocument(c *gin.Context) {
 	ok(c, 200, gin.H{"deleted": id})
 }
 
+// ragQuery 处理 POST /api/v1/rag/query：混合检索 → 以 MySQL ready 文档复核证据 →
+// ChatModel 生成带 [Sn] 引用的答案并强制校验引用；各环节失败均有对应错误码。
 func (s *Server) ragQuery(c *gin.Context) {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxRAGRequestBytes))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			fail(c, http.StatusRequestEntityTooLarge, "VALIDATION_FAILED", "RAG request body exceeds 64 KiB", nil)
+			return
+		}
+		fail(c, 400, "VALIDATION_FAILED", "RAG request body could not be read", nil)
+		return
+	}
 	var input struct {
 		Question string `json:"question"`
 		TopK     int    `json:"top_k"`
 	}
-	if c.ShouldBindJSON(&input) != nil || strings.TrimSpace(input.Question) == "" {
+	if json.Unmarshal(body, &input) != nil || strings.TrimSpace(input.Question) == "" {
 		fail(c, 422, "VALIDATION_FAILED", "question is required", nil)
 		return
 	}
+	input.Question = strings.TrimSpace(input.Question)
+	if len([]rune(input.Question)) > maxRAGQuestionRunes {
+		fail(c, 422, "VALIDATION_FAILED", "question must not exceed 2000 characters", nil)
+		return
+	}
+	// TopK 越界时静默回落默认值：检索参数属于可调项，不当作客户端错误。
 	if input.TopK <= 0 || input.TopK > 20 {
 		input.TopK = 5
 	}
@@ -369,7 +469,9 @@ func (s *Server) ragQuery(c *gin.Context) {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "RAG dependencies are not configured", nil)
 		return
 	}
-	vectors, err := s.embedding.Embed(c, []string{input.Question})
+	requestCtx, cancel := context.WithTimeout(c.Request.Context(), ragRequestTimeout)
+	defer cancel()
+	vectors, err := s.embedding.Embed(requestCtx, []string{input.Question})
 	if err != nil {
 		failModelDependency(c, err)
 		return
@@ -378,7 +480,7 @@ func (s *Server) ragQuery(c *gin.Context) {
 		fail(c, 502, "AI_INVALID_RESPONSE", "embedding query returned an invalid vector count", nil)
 		return
 	}
-	hits, err := s.vectors.Hybrid(c, vectors[0], rag.Sparse(input.Question), input.TopK)
+	hits, err := s.vectors.Hybrid(requestCtx, vectors[0], rag.Sparse(input.Question), input.TopK)
 	if err != nil {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "Qdrant hybrid query failed", nil)
 		return
@@ -415,10 +517,16 @@ func (s *Server) ragQuery(c *gin.Context) {
 		fail(c, 500, "INTERNAL_ERROR", "could not prepare RAG evidence", nil)
 		return
 	}
-	response, err := s.chat.Generate(c, model.ChatRequest{
+	response, err := s.chat.Generate(requestCtx, model.ChatRequest{
 		Skill:  "rag-answer",
 		Prompt: `你是证据约束问答助手。只能根据输入 evidence 回答；每个事实后必须使用 [S1] 形式引用对应 source；禁止使用输入之外的事实。只返回 JSON：{"answer":"..."}。`,
 		Input:  modelInput,
+		ResponseSchema: json.RawMessage(`{
+			"type":"object",
+			"additionalProperties":false,
+			"required":["answer"],
+			"properties":{"answer":{"type":"string","minLength":1}}
+		}`),
 	})
 	if err != nil {
 		failModelDependency(c, err)
@@ -450,6 +558,7 @@ func (s *Server) ragQuery(c *gin.Context) {
 	})
 }
 
+// failModelDependency 把模型层错误映射为 HTTP 状态：可重试依赖故障 → 503，永久失败 → 502。
 func failModelDependency(c *gin.Context, err error) {
 	var dependencyErr *model.DependencyError
 	if errors.As(err, &dependencyErr) {
@@ -462,6 +571,8 @@ func failModelDependency(c *gin.Context, err error) {
 	}
 	fail(c, http.StatusBadGateway, "AI_INVALID_RESPONSE", "AI dependency returned an invalid response", nil)
 }
+
+// truncate 摘要截断：优先回退到最近的句子边界标点，找不到才硬截并加省略号。
 func truncate(v string, n int) string {
 	v = strings.Join(strings.Fields(v), " ")
 	r := []rune(v)
@@ -476,28 +587,29 @@ func truncate(v string, n int) string {
 	return strings.TrimSpace(string(r[:n])) + "…"
 }
 
+// evaluateRAG 处理 POST /api/v1/evaluations/rag：接收含真实 chunk id 的 JSONL 数据集，
+// 运行 Recall@K/NDCG 评估，并把指标与 Markdown 报告落库。
 func (s *Server) evaluateRAG(c *gin.Context) {
-	// 评估数据可由请求提供，也可使用内嵌固定集；结果连同检索配置持久化，便于跨版本比较。
-	if s.embedding == nil || s.vectors == nil {
-		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "retrieval dependencies are not configured", nil)
-		return
-	}
+	// 评估必须显式提供使用真实 chunk id 的 JSONL，避免把占位数据保存为可信基准。
 	body, readErr := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20))
 	if readErr != nil {
 		fail(c, 413, "VALIDATION_FAILED", "request body is too large or unreadable", readErr.Error())
 		return
 	}
-	var cases []evaluation.Case
-	var err error
 	if len(strings.TrimSpace(string(body))) == 0 || strings.TrimSpace(string(body)) == "{}" {
-		cases, err = evaluation.DefaultCases()
-	} else {
-		cases, err = evaluation.ReadJSONL(strings.NewReader(string(body)))
+		fail(c, 422, "VALIDATION_FAILED", "evaluation dataset with real chunk ids is required", nil)
+		return
 	}
+	cases, err := evaluation.ReadJSONL(strings.NewReader(string(body)))
 	if err != nil {
 		fail(c, 422, "VALIDATION_FAILED", "evaluation dataset must be valid JSONL", err.Error())
 		return
 	}
+	if s.embedding == nil || s.vectors == nil {
+		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "retrieval dependencies are not configured", nil)
+		return
+	}
+	// 按具体实现类型区分真实与 fake embedding，评估结果中记录所用实现的类型标识（非真实模型名）。
 	_, real := s.embedding.(*model.OpenAICompatible)
 	result, err := evaluation.Run(c, cases, s.embedding, s.vectors, 5, real)
 	if err != nil {
@@ -517,6 +629,8 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 	}
 	ok(c, 202, row)
 }
+
+// getEvaluation 处理 GET /api/v1/evaluations/rag/:id：返回一次评估的完整记录。
 func (s *Server) getEvaluation(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -529,6 +643,9 @@ func (s *Server) getEvaluation(c *gin.Context) {
 	}
 	ok(c, 200, row)
 }
+
+// evaluationMarkdown 处理 GET /api/v1/evaluations/rag/:id/report.md：输出评估报告；
+// 用 RowsAffected 区分“不存在”与“查询出错”。
 func (s *Server) evaluationMarkdown(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -546,6 +663,9 @@ func (s *Server) evaluationMarkdown(c *gin.Context) {
 	}
 	c.Data(200, "text/markdown; charset=utf-8", []byte(report))
 }
+
+// weekly 处理 GET /api/v1/analytics/weekly：近 7 天聚合（时长、分类、报告管线状态、
+// algorithm 趋势），全部直接查询 MySQL 单一事实源。
 func (s *Server) weekly(c *gin.Context) {
 	since := time.Now().UTC().AddDate(0, 0, -7)
 	var summary struct {
@@ -575,6 +695,7 @@ func (s *Server) weekly(c *gin.Context) {
 		fail(c, 500, "INTERNAL_ERROR", "weekly query failed", err.Error())
 		return
 	}
+	// MySQL 中 status='succeeded' 求值为 0/1，SUM 即计数；COALESCE 兜底空表为 0。
 	if err := s.store.DB.Raw(`SELECT
 		COALESCE(SUM(status='succeeded'),0) succeeded,
 		COALESCE(SUM(status IN ('pending','queued','processing','retry_wait')),0) pending,

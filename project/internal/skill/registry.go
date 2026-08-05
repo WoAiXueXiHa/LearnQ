@@ -34,9 +34,12 @@ type Registry struct {
 	model        model.ChatModel
 	inputSchema  *jsonschema.Schema
 	outputSchema *jsonschema.Schema
+	outputJSON   json.RawMessage
 	tools        map[string]ToolFunc
 }
 
+// ToolExecution 记录一次工具调用的完整现场（请求、结果、引用、耗时、错误），
+// 随任务写入 trace 供审计与问题排查。
 type ToolExecution struct {
 	Name      string          `json:"name"`
 	Request   json.RawMessage `json:"request"`
@@ -46,8 +49,10 @@ type ToolExecution struct {
 	Error     string          `json:"error,omitempty"`
 }
 
+// ToolFunc 是工具实现签名：入参为输入 JSON，返回结果与引用片段、错误。
 type ToolFunc func(context.Context, json.RawMessage) (json.RawMessage, json.RawMessage, error)
 
+// New 构建注册表并编译输入/输出 Schema；outputJSON 原文随后随请求发给模型作为格式约束。
 func New(chat model.ChatModel) *Registry {
 	// Skill 元数据集中注册，Prompt/Schema 则编译进二进制，部署时不会依赖外部文件漂移。
 	defs := []Definition{
@@ -63,11 +68,16 @@ func New(chat model.ChatModel) *Registry {
 	}
 	r.inputSchema = compileSchema("schemas/common-input.json")
 	r.outputSchema = compileSchema("schemas/common-output.json")
+	r.outputJSON, _ = assets.ReadFile("schemas/common-output.json")
 	return r
 }
 
+// RegisterTool 注册工具实现；运行时缺失的工具不会中断 Skill，
+// 而是以 unavailable 状态进入执行记录（见 RunDetailed）。
 func (r *Registry) RegisterTool(name string, tool ToolFunc) { r.tools[name] = tool }
 
+// compileSchema 编译内嵌 JSON Schema，失败即 panic：
+// Schema 属于构建期契约，启动期暴露错误优于运行期悄悄放过非法输出。
 func compileSchema(name string) *jsonschema.Schema {
 	body, err := assets.ReadFile(name)
 	if err != nil {
@@ -88,6 +98,7 @@ func compileSchema(name string) *jsonschema.Schema {
 	return schema
 }
 
+// List 按固定顺序返回全部 Skill 定义，并附加 multi-agent 手动实验项（不进异步报告主链）。
 func (r *Registry) List() []Definition {
 	order := []string{"daily-review", "algorithm-diagnosis", "interview-followup", "project-explanation", "weekly-plan"}
 	out := make([]Definition, 0, len(order)+1)
@@ -102,11 +113,13 @@ func (r *Registry) List() []Definition {
 	return out
 }
 
+// Get 按名称查询 Skill 定义，未注册时返回 false。
 func (r *Registry) Get(name string) (Definition, bool) {
 	def, ok := r.definitions[name]
 	return def, ok
 }
 
+// PromptHash 返回 prompt 文件内容的 SHA-256，用于 trace 中还原生成时的提示词版本。
 func (r *Registry) PromptHash(name string) (string, error) {
 	body, err := assets.ReadFile("prompts/" + name + ".md")
 	if err != nil {
@@ -116,11 +129,13 @@ func (r *Registry) PromptHash(name string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// Run 是 RunDetailed 的简化入口：只返回生成结果，丢弃工具执行明细。
 func (r *Registry) Run(ctx context.Context, name string, input json.RawMessage) (model.ChatResponse, error) {
 	response, _, err := r.RunDetailed(ctx, name, input)
 	return response, err
 }
 
+// RunDetailed 返回生成响应与工具执行记录；executions 供调用方写入 trace。
 func (r *Registry) RunDetailed(ctx context.Context, name string, input json.RawMessage) (model.ChatResponse, []ToolExecution, error) {
 	// 输入先过 JSON Schema，再执行白名单工具；模型输出再次过 Schema。
 	// 这把不可信模型限制在“生成结构化内容”，路由、权限和状态写入仍由 Go 控制。
@@ -168,9 +183,16 @@ func (r *Registry) RunDetailed(ctx context.Context, name string, input json.RawM
 	}
 	var enriched map[string]any
 	_ = json.Unmarshal(input, &enriched)
+	// 工具结果整体注入模型输入：模型只消费结果，不参与工具选择。
 	enriched["_tool_results"] = toolResults
 	modelInput, _ := json.Marshal(enriched)
-	response, err := r.model.Generate(ctx, model.ChatRequest{Skill: name, Prompt: string(prompt), Input: modelInput})
+	// append(nil, ...) 是防御性复制，避免请求体与注册表共享同一底层数组。
+	response, err := r.model.Generate(ctx, model.ChatRequest{
+		Skill:          name,
+		Prompt:         string(prompt) + "\n\n输出要求：只提炼与任务相关的事实；不得复制工具原始 JSON，不得输出 _tool_results 或其他内部字段名。",
+		Input:          modelInput,
+		ResponseSchema: append(json.RawMessage(nil), r.outputJSON...),
+	})
 	if err != nil {
 		return response, executions, err
 	}

@@ -47,6 +47,7 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 	}
 	chunks := rag.ChunkText(document.Content, 800, 120)
 	if len(chunks) == 0 {
+		// 空文档切不出块，直接以错误终止；否则会以零切片走完流程，把空文档错误标记为 ready。
 		return 0, fmt.Errorf("document produced no chunks")
 	}
 	if err := i.status(ctx, document.ID, "parsing", "embedding"); err != nil {
@@ -64,6 +65,8 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 		return 0, fmt.Errorf("embedding result count mismatch")
 	}
 	for _, vector := range dense {
+		// 向量维度必须与 Qdrant collection 一致，不一致说明 Embedding 配置漂移，
+		// 继续 Upsert 会污染整个检索空间。
 		if len(vector) != i.Dimension {
 			return 0, fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
 		}
@@ -71,6 +74,7 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 	if err := i.status(ctx, document.ID, "embedding", "indexing"); err != nil {
 		return 0, err
 	}
+	// EnsureCollection 确保 Qdrant collection 存在且维度一致，创建动作是幂等的。
 	if err := i.Vectors.EnsureCollection(ctx, i.Dimension); err != nil {
 		return 0, err
 	}
@@ -87,6 +91,8 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 		}}
 	}
 	if err := i.Store.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Assign + FirstOrCreate 按稳定 ID 实现 upsert：已存在则整体覆盖，
+		// 配合稳定 ID 保证重试幂等；整批切片在同一事务提交。
 		for index := range rows {
 			if err := tx.Where("id=?", rows[index].ID).Assign(rows[index]).FirstOrCreate(&rows[index]).Error; err != nil {
 				return err
@@ -115,6 +121,9 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 	return document.ID, nil
 }
 
+// status 以条件 UPDATE 推进文档状态机：仅当当前状态等于 from 时才更新为 to。
+// RowsAffected != 1 说明状态已被并发路径改动（删除请求、重复 Worker），
+// 此时返回错误让上层放弃本次索引，不做强制覆盖。
 func (i *Indexer) status(ctx context.Context, id uint64, from, to string) error {
 	result := i.Store.DB.WithContext(ctx).Exec("UPDATE documents SET status=?,updated_at=? WHERE id=? AND status=?", to, time.Now().UTC(), id, from)
 	if result.Error != nil {
@@ -128,6 +137,8 @@ func (i *Indexer) status(ctx context.Context, id uint64, from, to string) error 
 	return nil
 }
 
+// requireStatus 在向量写入后复查文档仍处于 indexing。若期间被删除或改态，
+// 索引结果不应保留，调用方据此触发 MySQL 与 Qdrant 的双向清理。
 func (i *Indexer) requireStatus(ctx context.Context, id uint64, expected string) error {
 	var current string
 	result := i.Store.DB.WithContext(ctx).Raw("SELECT status FROM documents WHERE id=?", id).Scan(&current)
@@ -140,15 +151,20 @@ func (i *Indexer) requireStatus(ctx context.Context, id uint64, expected string)
 	return nil
 }
 
+// stableID 由 document_id、chunk 序号与内容哈希派生：同一内容重试或重新索引
+// 得到相同 ID，使 MySQL 行与 Qdrant 向量点可以幂等覆盖，避免重复索引累积脏数据。
 func stableID(documentID uint64, chunkIndex int, contentHash string) string {
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%d:%d:%s", documentID, chunkIndex, contentHash)))
 	return hex.EncodeToString(sum[:])
 }
 
+// uuidFromHash 在 64 位十六进制哈希的固定位置插入连字符，拼成 Qdrant 要求的
+// UUID 形式，同时保持与 chunk ID 的确定性一一对应。
 func uuidFromHash(hash string) string {
 	return hash[0:8] + "-" + hash[8:12] + "-" + hash[12:16] + "-" + hash[16:20] + "-" + hash[20:32]
 }
 
+// truncate 按 rune（字符）而非字节截断，避免切断 UTF-8 多字节字符。
 func truncate(value string, limit int) string {
 	runes := []rune(value)
 	if len(runes) <= limit {

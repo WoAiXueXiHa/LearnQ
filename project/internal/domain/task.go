@@ -7,9 +7,9 @@ import (
 
 type TaskStatus string
 
+// 任务状态机把“已写数据库但未投递”“已进入队列”“已被 Worker 租用”分开表达，
+// 使崩溃恢复可以根据持久化状态精确补偿，而不是猜测任务是否执行过。
 const (
-	// 任务状态机把“已写数据库但未投递”“已进入队列”“已被 Worker 租用”分开表达，
-	// 使崩溃恢复可以根据持久化状态精确补偿，而不是猜测任务是否执行过。
 	TaskPending    TaskStatus = "pending"
 	TaskQueued     TaskStatus = "queued"
 	TaskProcessing TaskStatus = "processing"
@@ -18,6 +18,7 @@ const (
 	TaskDead       TaskStatus = "dead"
 )
 
+// transitions 是状态机的邻接表：值为该状态可达的目标状态集合，非法迁移在 Transition 中被拒绝。
 var transitions = map[TaskStatus]map[TaskStatus]bool{
 	TaskPending:    {TaskQueued: true},
 	TaskQueued:     {TaskProcessing: true},
@@ -42,14 +43,18 @@ func RetryDelay(attempt int) (time.Duration, bool) {
 }
 
 type AITask struct {
+	// AvailableAt 是任务最早可执行时间，Dispatcher 以它作为 Redis ready ZSet 的 score 实现延迟队列。
 	ID          uint64     `json:"id" gorm:"primaryKey"`
 	Kind        string     `json:"kind"`
 	Status      TaskStatus `json:"status"`
 	PayloadJSON string     `json:"-" gorm:"column:payload_json"`
 	AttemptNo   int        `json:"attempt_no"`
-	// ExecutionGeneration 在人工重试时递增，隔离同一任务的不同执行世代。
+	// 一个任务可能被人工重试多次，如果用 bool，第二次重试就无法区分是第一代还是第二代了
+	// int 递增，每次重试都有唯一的编号
 	ExecutionGeneration int `json:"execution_generation"`
 	// LeaseToken 标识一次具体领取；所有完成/失败写入都必须携带它作为 fencing token。
+	// 防止过期的 worker 覆盖有效结果
+	// json:"-" 告诉 JSON 序列化器跳过这个字段，API 返回的 JSON 里不会出现它
 	LeaseToken  string     `json:"-" gorm:"column:lease_token"`
 	LeaseUntil  *time.Time `json:"lease_until,omitempty"`
 	AvailableAt time.Time  `json:"available_at"`
@@ -58,6 +63,7 @@ type AITask struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
+// Transition 按状态机迁移内存中的任务状态；非法迁移返回错误且不改变原状态。
 func (t *AITask) Transition(to TaskStatus) error {
 	if !CanTransition(t.Status, to) {
 		return errors.New("invalid task state transition")
@@ -85,11 +91,11 @@ type StudyModule struct {
 
 type OutboxEvent struct {
 	// OutboxEvent 与业务对象同事务写入，把跨 MySQL/Redis 的原子性问题转化为可重放投递。
-	ID          uint64 `gorm:"primaryKey"`
-	AggregateID uint64
-	EventType   string
-	PayloadJSON string `gorm:"column:payload_json"`
-	PublishedAt *time.Time
+	ID          uint64     `gorm:"primaryKey"`
+	AggregateID uint64     // 对应的具体 task.ID
+	EventType   string     // 发生了什么事件
+	PayloadJSON string     `gorm:"column:payload_json"` // 事件携带的数据
+	PublishedAt *time.Time // nil 说明未确认发布，!nil 说明记录发布成功
 	CreatedAt   time.Time
 }
 
@@ -130,4 +136,25 @@ type DocumentChunk struct {
 	Content     string    `json:"content"`
 	ContentHash string    `json:"content_hash"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type Image struct {
+	ID                uint64    `json:"id" gorm:"primaryKey"`
+	StudyRecordID     *uint64   `json:"study_record_id,omitempty"`
+	OriginalFilename  string    `json:"original_filename"`
+	MediaType         string    `json:"media_type"`
+	SizeBytes         int64     `json:"size_bytes"`
+	Width             int       `json:"width"`
+	Height            int       `json:"height"`
+	ContentHash       string    `json:"-"`
+	StoragePath       string    `json:"-"`
+	Prompt            string    `json:"-"`
+	Status            string    `json:"status"`
+	DescriptionJSON   string    `json:"-" gorm:"column:description_json"`
+	DescriptionModel  string    `json:"-"`
+	DescriptionTaskID uint64    `json:"task_id"`
+	DerivedDocumentID *uint64   `json:"derived_document_id"`
+	LastError         string    `json:"last_error"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }

@@ -10,8 +10,16 @@ x-app-environment: &app-environment
   AI_EMBEDDING_API_KEY: ${AI_EMBEDDING_API_KEY:-ollama}
   AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
   EMBEDDING_DIM: ${EMBEDDING_DIM:-64}
+  AI_VISION_PROVIDER: ${AI_VISION_PROVIDER:-ollama}
+  AI_VISION_BASE_URL: ${AI_VISION_BASE_URL:-http://host.docker.internal:11434/v1}
+  AI_VISION_API_KEY: ${AI_VISION_API_KEY:-ollama}
+  AI_VISION_MODEL: ${AI_VISION_MODEL:-qwen3-vl:4b}
+  AI_VISION_CONTEXT_LENGTH: ${AI_VISION_CONTEXT_LENGTH:-8192}
+  TASK_TIMEOUT: ${TASK_TIMEOUT:-45s}
+  LEASE_DURATION: ${LEASE_DURATION:-60s}
   HTTP_ADDR: 0.0.0.0:8080
   REPORT_DIR: /app/data/reports
+  IMAGE_DIR: /app/data/images
 
 services:
   mysql:
@@ -56,6 +64,7 @@ services:
     environment: *app-environment
     extra_hosts: ["host.docker.internal:host-gateway"]
     ports: ["127.0.0.1:${LEARNQ_HTTP_PORT:-8080}:8080"]
+    volumes: [images:/app/data/images]
     depends_on:
       migration: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
@@ -64,7 +73,9 @@ services:
     build: {context: ., args: {TARGET: worker}}
     environment: *app-environment
     extra_hosts: ["host.docker.internal:host-gateway"]
-    volumes: [reports:/app/data/reports]
+    volumes:
+      - reports:/app/data/reports
+      - images:/app/data/images
     depends_on:
       migration: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
@@ -73,3 +84,4 @@ volumes:
   mysql-data:
   qdrant-data:
   reports:
+  images:

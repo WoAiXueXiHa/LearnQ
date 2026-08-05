@@ -12,9 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/domain"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/evaluation"
+	"github.com/WoAiXueXiHa/LeranQ/project/internal/imagestore"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/model"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/skill"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/store"
@@ -26,20 +28,38 @@ import (
 
 type Server struct {
 	// Server 通过 Option 注入可选外部能力；基础 CRUD 测试无需启动 Redis/Qdrant/真实模型。
-	store     *store.Store
-	skills    *skill.Registry
-	engine    *gin.Engine
-	recorder  trace.Recorder
-	chat      model.ChatModel
-	embedding model.EmbeddingModel
-	vectors   interface {
+	// vectors 抽象检索与文档删除两个能力，避免 api 直接依赖 rag 的具体实现类型。
+	store      *store.Store
+	skills     *skill.Registry
+	engine     *gin.Engine
+	recorder   trace.Recorder
+	chat       model.ChatModel
+	imageStore *imagestore.Store
+	embedding  model.EmbeddingModel
+	vectors    interface {
 		evaluation.Retriever
 		DeleteDocument(context.Context, uint64) error
 	}
-	redisCheck  func(context.Context) error
-	qdrantCheck func(context.Context) error
-	workerCheck func(context.Context) (bool, error)
+	redisCheck     func(context.Context) error
+	qdrantCheck    func(context.Context) error
+	workerCheck    func(context.Context) (bool, error)
+	aiMode         string
+	chatModel      string
+	visionModel    string
+	embeddingModel string
 }
+
+// 学习记录写入的硬性上限：请求体 1 MiB、标题 255 rune、摘要与模块内容各 32 KiB、
+// 模块数 50 个、时长不超过 24 小时，防止超限输入消耗过多内存与存储。
+const (
+	maxStudyRecordBody   = 1 << 20
+	maxStudyTitleRunes   = 255
+	maxStudySummaryBytes = 32 << 10
+	maxModuleCount       = 50
+	maxModuleCategory    = 64
+	maxModuleContent     = 32 << 10
+	maxDurationMinutes   = 24 * 60
+)
 
 type errBody struct {
 	Code      string `json:"code"`
@@ -48,6 +68,7 @@ type errBody struct {
 	Details   any    `json:"details,omitempty"`
 }
 
+// Option 以闭包方式注入 Server 的可选依赖，避免构造函数参数列表随能力增长而膨胀。
 type Option func(*Server)
 
 func WithRAG(chat model.ChatModel, embedding model.EmbeddingModel, vectors interface {
@@ -74,6 +95,20 @@ func WithWorkerCheck(check func(context.Context) (bool, error)) Option {
 	}
 }
 
+func WithImageStore(images *imagestore.Store) Option {
+	return func(server *Server) { server.imageStore = images }
+}
+
+func WithRuntimeInfo(mode, chatModel, visionModel, embeddingModel string) Option {
+	return func(server *Server) {
+		server.aiMode = mode
+		server.chatModel = chatModel
+		server.visionModel = visionModel
+		server.embeddingModel = embeddingModel
+	}
+}
+
+// New 组装 Server：开启 ReleaseMode，应用 Option 注入，挂载 Recovery 与 requestID 中间件后注册路由。
 func New(s *store.Store, skills *skill.Registry, options ...Option) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	server := &Server{store: s, skills: skills, engine: gin.New(), recorder: trace.Recorder{DB: s.DB}}
@@ -87,6 +122,7 @@ func New(s *store.Store, skills *skill.Registry, options ...Option) *Server {
 
 func (s *Server) Handler() http.Handler { return s.engine }
 
+// requestID 中间件：request id 写入 gin.Context 并回写 X-Request-ID 响应头，响应体中的 request_id 复用同一标识。
 func requestID() gin.HandlerFunc {
 	// 优先透传调用方 request id，便于跨服务串联日志；缺失时生成本地随机标识。
 	return func(c *gin.Context) {
@@ -102,13 +138,17 @@ func requestID() gin.HandlerFunc {
 	}
 }
 
+// ok 统一成功响应格式：{"data":…,"request_id":…}，保证所有接口响应结构一致。
 func ok(c *gin.Context, status int, data any) {
 	c.JSON(status, gin.H{"data": data, "request_id": c.GetString("request_id")})
 }
+
+// fail 统一错误响应格式并中止 handler 链（Abort），status/code/message 由调用方按语义指定。
 func fail(c *gin.Context, status int, code, message string, details any) {
 	c.AbortWithStatusJSON(status, gin.H{"error": errBody{Code: code, Message: message, RequestID: c.GetString("request_id"), Details: details}})
 }
 
+// routes 注册全部路由：Web 页面与静态资源、存活/就绪探针，以及 /api/v1 业务分组。
 func (s *Server) routes() {
 	r := s.engine
 	r.Any("/", gin.WrapH(web.Handler()))
@@ -136,6 +176,13 @@ func (s *Server) routes() {
 	v1.GET("/documents", s.listDocuments)
 	v1.GET("/documents/:id/status", s.documentStatus)
 	v1.DELETE("/documents/:id", s.deleteDocument)
+	v1.POST("/images", s.uploadImage)
+	v1.GET("/images", s.listImages)
+	v1.GET("/images/:id", s.getImage)
+	v1.GET("/images/:id/content", s.imageContent)
+	v1.POST("/images/:id/retry", s.retryImage)
+	v1.POST("/images/:id/index", s.addImageToKnowledgeBase)
+	v1.DELETE("/images/:id", s.deleteImage)
 	v1.POST("/rag/query", s.ragQuery)
 	v1.POST("/evaluations/rag", s.evaluateRAG)
 	v1.GET("/evaluations/rag/:id", s.getEvaluation)
@@ -143,6 +190,7 @@ func (s *Server) routes() {
 	v1.GET("/analytics/weekly", s.weekly)
 }
 
+// ready 是就绪探针：逐项探测 MySQL/Redis/Qdrant/Worker 心跳，任一不可用即返回 503 与明细。
 func (s *Server) ready(c *gin.Context) {
 	// live 只回答进程是否存活；ready 才检查接流量所需依赖和 Worker 心跳。
 	// 每项独立设置短超时，防止单个故障依赖拖住整个探针。
@@ -188,9 +236,17 @@ func (s *Server) ready(c *gin.Context) {
 			gin.H{"status": "not_ready", "dependencies": dependencies, "unavailable": unavailable})
 		return
 	}
-	ok(c, 200, gin.H{"status": "ready", "dependencies": dependencies})
+	ok(c, 200, gin.H{
+		"status":       "ready",
+		"dependencies": dependencies,
+		"runtime": gin.H{
+			"mode": s.aiMode, "chat_model": s.chatModel,
+			"vision_model": s.visionModel, "embedding_model": s.embeddingModel,
+		},
+	})
 }
 
+// parseID 解析路径参数 :id 为 uint64；失败时已写出 400 响应，调用方应直接 return。
 func parseID(c *gin.Context) (uint64, bool) {
 	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
 	if err != nil {
@@ -200,6 +256,7 @@ func parseID(c *gin.Context) (uint64, bool) {
 	return id, true
 }
 
+// lookupFailed 统一单条查询的错误处理：RecordNotFound → 404，其余数据库错误 → 500。
 func lookupFailed(c *gin.Context, err error, message string) bool {
 	if err == nil {
 		return false
@@ -212,9 +269,18 @@ func lookupFailed(c *gin.Context, err error, message string) bool {
 	return true
 }
 
+// createStudyRecord 处理 POST /api/v1/study-records：字段校验后在同一事务内写入
+// study_record、ai_task 与 outbox 事件（202 异步受理）；Idempotency-Key 与内容
+// 指纹构成两层去重，force_create 可显式绕过指纹复用。
 func (s *Server) createStudyRecord(c *gin.Context) {
-	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20))
+	// 用 MaxBytesReader 封顶请求体，ReadAll 超限时返回 *http.MaxBytesError 以区分 413 与其他读错。
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxStudyRecordBody))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			fail(c, http.StatusRequestEntityTooLarge, "VALIDATION_FAILED", "request body exceeds 1 MiB", nil)
+			return
+		}
 		fail(c, 400, "VALIDATION_FAILED", "invalid request body", nil)
 		return
 	}
@@ -228,15 +294,46 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 			Content  string `json:"content"`
 		} `json:"modules"`
 	}
-	if json.Unmarshal(body, &input) != nil || strings.TrimSpace(input.Title) == "" || input.DurationMinutes <= 0 || len(input.Modules) == 0 {
-		fail(c, 422, "VALIDATION_FAILED", "title, positive duration_minutes and modules are required", nil)
+	if json.Unmarshal(body, &input) != nil {
+		fail(c, 422, "VALIDATION_FAILED", "request body must be valid JSON", nil)
 		return
+	}
+	input.Title = strings.TrimSpace(input.Title)
+	input.Summary = strings.TrimSpace(input.Summary)
+	if input.Title == "" || utf8.RuneCountInString(input.Title) > maxStudyTitleRunes {
+		fail(c, 422, "VALIDATION_FAILED", "title is required and must not exceed 255 characters", nil)
+		return
+	}
+	if len([]byte(input.Summary)) > maxStudySummaryBytes {
+		fail(c, 422, "VALIDATION_FAILED", "summary must not exceed 32 KiB", nil)
+		return
+	}
+	if input.DurationMinutes <= 0 || input.DurationMinutes > maxDurationMinutes {
+		fail(c, 422, "VALIDATION_FAILED", "duration_minutes must be between 1 and 1440", nil)
+		return
+	}
+	if len(input.Modules) == 0 || len(input.Modules) > maxModuleCount {
+		fail(c, 422, "VALIDATION_FAILED", "modules must contain between 1 and 50 items", nil)
+		return
+	}
+	for i := range input.Modules {
+		input.Modules[i].Category = strings.TrimSpace(input.Modules[i].Category)
+		input.Modules[i].Content = strings.TrimSpace(input.Modules[i].Content)
+		if input.Modules[i].Category == "" || utf8.RuneCountInString(input.Modules[i].Category) > maxModuleCategory {
+			fail(c, 422, "VALIDATION_FAILED", "module category is required and must not exceed 64 characters", gin.H{"module_index": i})
+			return
+		}
+		if input.Modules[i].Content == "" || len([]byte(input.Modules[i].Content)) > maxModuleContent {
+			fail(c, 422, "VALIDATION_FAILED", "module content is required and must not exceed 32 KiB", gin.H{"module_index": i})
+			return
+		}
 	}
 	key := c.GetHeader("Idempotency-Key")
 	if len(key) > 128 {
 		fail(c, 422, "VALIDATION_FAILED", "Idempotency-Key exceeds 128 bytes", nil)
 		return
 	}
+	// 幂等作用域为“路由 + key”：不同接口即使复用同一 key 也不会互相污染记录。
 	scope := "POST:/api/v1/study-records:" + key
 	// 幂等键约束“同一个请求重放返回原响应”；request hash 不同则明确冲突，
 	// 避免调用方误复用 key 时静默接受另一份内容。
@@ -250,13 +347,15 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 		Summary         string               `json:"summary"`
 		DurationMinutes int                  `json:"duration_minutes"`
 		Modules         []domain.StudyModule `json:"modules"`
-	}{strings.TrimSpace(input.Title), strings.TrimSpace(input.Summary), input.DurationMinutes, modules})
+	}{input.Title, input.Summary, input.DurationMinutes, modules})
 	fingerprint := store.HashRequest(canonical)
 	var encoded []byte
 	var statusCode = http.StatusAccepted
 	var conflict bool
 	err = s.store.DB.WithContext(c).Transaction(func(tx *gorm.DB) error {
 		if key != "" {
+			// INSERT IGNORE 借助唯一键完成首次抢占：影响 1 行表示本请求持有该 key；
+			// 影响 0 行说明 key 已存在，随后读回已存记录决定是重放还是 409。
 			result := tx.Exec(`INSERT IGNORE INTO idempotency_keys(scope,request_hash,status_code,response_json,created_at)
 				VALUES(?,?,0,'{}',?)`, scope, hash, time.Now().UTC())
 			if result.Error != nil {
@@ -275,6 +374,7 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 					conflict = true
 					return nil
 				}
+				// key 已存在且请求已完成：直接重放缓存的首次响应，不再执行任何业务写入。
 				if saved.StatusCode != 0 {
 					statusCode, encoded = saved.StatusCode, []byte(saved.ResponseJSON)
 					return nil
@@ -302,14 +402,21 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 		if !deduplicated {
 			var createErr error
 			record, task, createErr = store.CreateStudyRecordTx(tx, store.CreateRecord{
-				Title: strings.TrimSpace(input.Title), Summary: strings.TrimSpace(input.Summary),
+				Title: input.Title, Summary: input.Summary,
 				DurationMinutes: input.DurationMinutes, ContentFingerprint: fingerprint, Modules: modules,
 			})
 			if createErr != nil {
 				return createErr
 			}
 		}
-		payload := gin.H{"data": gin.H{"study_record": record, "task_id": task.ID, "deduplicated": deduplicated}, "request_id": c.GetString("request_id")}
+		payload := gin.H{
+			"data": gin.H{
+				"study_record": record,
+				"task_id":      task.ID,
+				"deduplicated": deduplicated,
+			},
+			"request_id": c.GetString("request_id"),
+		}
 		encoded, _ = json.Marshal(payload)
 		if key != "" {
 			// 业务写入与幂等响应缓存同事务提交，不会出现“记住了响应但记录/任务不存在”。
@@ -326,9 +433,11 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 		fail(c, 409, "IDEMPOTENCY_CONFLICT", "key was used with a different request", nil)
 		return
 	}
+	// 新建与重放共用事务内序列化的同一响应体，保证相同 key 的响应字节级一致。
 	c.Data(statusCode, "application/json", encoded)
 }
 
+// getStudyRecord 处理 GET /api/v1/study-records/:id：预加载 modules 后返回单条记录。
 func (s *Server) getStudyRecord(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -340,6 +449,9 @@ func (s *Server) getStudyRecord(c *gin.Context) {
 	}
 	ok(c, 200, record)
 }
+
+// listStudyRecords 处理 GET /api/v1/study-records：倒序取最近 100 条，
+// 并反查每条记录最新的 study_report 任务以附带任务状态。
 func (s *Server) listStudyRecords(c *gin.Context) {
 	var records []domain.StudyRecord
 	if err := s.store.DB.Preload("Modules").Order("id DESC").Limit(100).Find(&records).Error; err != nil {
@@ -363,6 +475,7 @@ func (s *Server) listStudyRecords(c *gin.Context) {
 			return
 		}
 	}
+	// 任务按 id 升序遍历，map 覆盖后保留最新一次报告任务。
 	latest := make(map[uint64]domain.AITask, len(tasks))
 	for _, task := range tasks {
 		var payload struct {
@@ -383,6 +496,8 @@ func (s *Server) listStudyRecords(c *gin.Context) {
 	}
 	ok(c, 200, result)
 }
+
+// getTask 处理 GET /api/v1/tasks/:id：返回 ai_task 原始行（含状态与 lease 字段）。
 func (s *Server) getTask(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -394,6 +509,9 @@ func (s *Server) getTask(c *gin.Context) {
 	}
 	ok(c, 200, task)
 }
+
+// taskDetail 处理 GET /api/v1/tasks/:id/detail：按 payload 反查关联的记录/文档/图片，
+// 并聚合报告、复习任务与执行 trace，供前端详情页一次渲染。
 func (s *Server) taskDetail(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -406,6 +524,7 @@ func (s *Server) taskDetail(c *gin.Context) {
 	var payload struct {
 		StudyRecordID uint64 `json:"study_record_id"`
 		DocumentID    uint64 `json:"document_id"`
+		ImageID       uint64 `json:"image_id"`
 	}
 	if err := json.Unmarshal([]byte(task.PayloadJSON), &payload); err != nil {
 		fail(c, 500, "INTERNAL_ERROR", "task payload is invalid", nil)
@@ -430,6 +549,17 @@ func (s *Server) taskDetail(c *gin.Context) {
 			document = &value
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			fail(c, 500, "INTERNAL_ERROR", "could not load task document", nil)
+			return
+		}
+	}
+	var image *domain.Image
+	if payload.ImageID != 0 {
+		var value domain.Image
+		err := s.store.DB.First(&value, payload.ImageID).Error
+		if err == nil {
+			image = &value
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			fail(c, 500, "INTERNAL_ERROR", "could not load task image", nil)
 			return
 		}
 	}
@@ -459,8 +589,16 @@ func (s *Server) taskDetail(c *gin.Context) {
 	ok(c, 200, gin.H{
 		"task": task, "study_record": record, "report": report, "review_task": review,
 		"trace": traceData, "document_id": payload.DocumentID, "document": document,
+		"image": func() any {
+			if image == nil {
+				return nil
+			}
+			return imageView(*image)
+		}(),
 	})
 }
+
+// trace 处理 GET /api/v1/tasks/:id/trace：仅返回该任务的 attempts 与 agent 执行链。
 func (s *Server) trace(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -478,6 +616,7 @@ func (s *Server) trace(c *gin.Context) {
 	ok(c, 200, traceData)
 }
 
+// loadTrace 加载任务的全部执行历史：attempts、agent_runs 及各自的 steps/tool_calls。
 func (s *Server) loadTrace(id uint64) (gin.H, error) {
 	var attempts []domain.TaskAttempt
 	if err := s.store.DB.Where("task_id=?", id).Order("execution_generation,attempt_no").Find(&attempts).Error; err != nil {
@@ -489,6 +628,7 @@ func (s *Server) loadTrace(id uint64) (gin.H, error) {
 	}
 	runIDs := make([]uint64, 0, len(runs))
 	for _, run := range runs {
+		// GORM 把 BIGINT 扫入 map 时可能是 int64 或 uint64，两种解码都要收拢。
 		switch value := run["id"].(type) {
 		case uint64:
 			runIDs = append(runIDs, value)
@@ -507,6 +647,9 @@ func (s *Server) loadTrace(id uint64) (gin.H, error) {
 	}
 	return gin.H{"attempts": attempts, "agent_runs": runs, "agent_steps": steps, "tool_calls": tools}, nil
 }
+
+// retryTask 处理 POST /api/v1/tasks/:id/retry：仅允许 dead 任务，事务内 generation+1、
+// attempt_no 清零并写入 outbox 事件重新入队；document_index 重试要求文档处于 failed，事务内一并重置回 uploaded。
 func (s *Server) retryTask(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -548,6 +691,7 @@ func (s *Server) retryTask(c *gin.Context) {
 		if result.Error != nil {
 			return result.Error
 		}
+		// 影响 0 行说明任务已被并发操作移出 dead 状态：按普通冲突返回 409，而非服务端错误。
 		if result.RowsAffected != 1 {
 			return nil
 		}
@@ -579,6 +723,8 @@ func (s *Server) retryTask(c *gin.Context) {
 	}
 	ok(c, 202, gin.H{"task_id": id, "status": "pending"})
 }
+
+// getReport 处理 GET /api/v1/reports/:id：返回报告 JSON 记录。
 func (s *Server) getReport(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -590,6 +736,8 @@ func (s *Server) getReport(c *gin.Context) {
 	}
 	ok(c, 200, v)
 }
+
+// reportMarkdown 处理 GET /api/v1/reports/:id/report.md：以 text/markdown 直接输出报告原文。
 func (s *Server) reportMarkdown(c *gin.Context) {
 	id, valid := parseID(c)
 	if !valid {
@@ -601,4 +749,6 @@ func (s *Server) reportMarkdown(c *gin.Context) {
 	}
 	c.Data(200, "text/markdown; charset=utf-8", []byte(v.MarkdownContent))
 }
+
+// notFound 输出统一的 404 响应，供各查询路径复用。
 func notFound(c *gin.Context) { fail(c, 404, "NOT_FOUND", "resource not found", nil) }

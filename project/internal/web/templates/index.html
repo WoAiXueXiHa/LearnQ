@@ -5,21 +5,25 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{{.Title}}</title>
   <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/material.css">
 </head>
 <body>
 <header class="topbar">
   <div><h1>LearnQ</h1><p>把学习记录变成报告、复习与可检索知识</p></div>
-  <span id="health" class="badge">正在连接…</span>
+  <div class="runtime-status">
+    <span id="modelMode" class="badge" title="模型模式会在健康检查或首次 AI 任务后确认">模型模式：检测中</span>
+    <span id="health" class="badge">正在连接…</span>
+  </div>
 </header>
 <nav class="tabs" role="tablist" aria-label="功能模块">
   <button id="tab-records" class="active" role="tab" aria-selected="true" aria-controls="records" data-view="records">学习记录</button>
   <button id="tab-task" role="tab" aria-selected="false" aria-controls="task" data-view="task">任务与报告</button>
   <button id="tab-reviews" role="tab" aria-selected="false" aria-controls="reviews" data-view="reviews">复习计划</button>
   <button id="tab-skills" role="tab" aria-selected="false" aria-controls="skills" data-view="skills">AI Skill</button>
-  <button id="tab-knowledge" role="tab" aria-selected="false" aria-controls="knowledge" data-view="knowledge">知识库与 RAG</button>
+  <button id="tab-knowledge" role="tab" aria-selected="false" aria-controls="knowledge" data-view="knowledge">学习素材与 RAG</button>
 </nav>
 <main>
-  <div id="notice" class="notice" hidden></div>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
 
   <section id="records" role="tabpanel" aria-labelledby="tab-records">
     <div class="section-head"><div><h2>记录今天学了什么</h2><p>提交后会自动生成报告和复习计划。</p></div></div>
@@ -62,12 +66,32 @@
   </section>
 
   <section id="knowledge" role="tabpanel" aria-labelledby="tab-knowledge" hidden>
-    <div class="section-head"><div><h2>知识库与 RAG</h2><p>先上传文档并等待 ready，再基于可核验证据提问。</p></div></div>
-    <form id="uploadForm" class="card upload">
-      <input id="documentFile" name="file" type="file" accept=".md,.txt,.json" required>
-      <button type="submit">上传并建立索引</button>
-    </form>
-    <div class="section-head"><h3>文档</h3><button class="secondary" onclick="loadDocuments()">刷新</button></div>
+    <div class="section-head"><div><h2>学习素材与 RAG</h2><p>文档可以直接建立索引；图片先由视觉模型描述，再决定是否加入知识库。</p></div></div>
+    <div class="material-switch" role="tablist" aria-label="素材类型">
+      <button id="materialDocumentTab" class="secondary active" type="button" role="tab" aria-selected="true" aria-controls="documentUploadPanel">上传文档</button>
+      <button id="materialImageTab" class="secondary" type="button" role="tab" aria-selected="false" aria-controls="imageUploadPanel">分析图片</button>
+    </div>
+    <div id="documentUploadPanel" role="tabpanel" aria-labelledby="materialDocumentTab">
+      <form id="uploadForm" class="card upload">
+        <label class="file-field" for="documentFile"><span>选择 Markdown、TXT 或 JSON，最大 5 MiB</span><input id="documentFile" name="file" type="file" accept=".md,.txt,.json" required></label>
+        <button type="submit">上传并建立索引</button>
+      </form>
+    </div>
+    <div id="imageUploadPanel" role="tabpanel" aria-labelledby="materialImageTab" hidden>
+      <form id="imageUploadForm" class="card image-upload">
+        <label class="file-field" for="imageFile"><span>选择 PNG 或 JPEG，最大 5 MiB</span><input id="imageFile" name="file" type="file" accept="image/png,image/jpeg" required></label>
+        <div id="imagePreviewBox" class="image-preview" hidden>
+          <img id="imagePreview" alt="待分析图片预览">
+          <div><strong id="imagePreviewName"></strong><small id="imagePreviewMeta"></small></div>
+        </div>
+        <label for="imagePrompt">希望模型重点说明什么？（可选）</label>
+        <textarea id="imagePrompt" name="prompt" rows="3" maxlength="1000" placeholder="例如：解释这张架构图的数据流，并指出可能的失败点"></textarea>
+        <p class="privacy-hint">请勿上传包含密钥、身份证件或其他敏感信息的图片。</p>
+        <button type="submit">上传并分析</button>
+      </form>
+    </div>
+    <div class="section-head"><h3>素材</h3><button id="materialRefresh" class="secondary" type="button">刷新</button></div>
+    <div id="imageList" class="cards material-images"></div>
     <div id="documentList" class="cards"></div>
     <form id="ragForm" class="toolbar">
       <input id="question" placeholder="例如：LearnQ 如何避免旧 Worker 覆盖新结果？" required>

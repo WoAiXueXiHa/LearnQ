@@ -2,6 +2,8 @@ package rag
 
 import "math"
 
+// RecallAtK 计算前 K 个结果中相关块的占比：相关判定只看 relevant 值是否 >0，
+// 与等级无关；无相关标注时返回 0，k 超过结果数时按实际结果数截断。
 func RecallAtK(results []string, relevant map[string]int, k int) float64 {
 	// Recall@K 衡量相关块是否被找全，不关心它们在前 K 名中的具体顺序。
 	if len(relevant) == 0 {
@@ -12,6 +14,7 @@ func RecallAtK(results []string, relevant map[string]int, k int) float64 {
 	}
 	found := 0
 	for _, id := range results[:k] {
+		// 只要标注过即算命中（relevant 值 >0），等级高低不影响 Recall 结果。
 		if relevant[id] > 0 {
 			found++
 		}
@@ -19,16 +22,22 @@ func RecallAtK(results []string, relevant map[string]int, k int) float64 {
 	return float64(found) / float64(len(relevant))
 }
 
+// NDCGAtK 按排名位置折扣累加相关性得分，再除以理想排序的对应累加值，
+// 归一化到 [0,1]；理想分全为 0 时返回 0 避免除零。
 func NDCGAtK(results []string, relevant map[string]int, k int) float64 {
 	// NDCG 同时考虑相关性等级和排名位置，并用理想排序归一化到 [0,1]。
 	if k > len(results) {
 		k = len(results)
 	}
 	var dcg float64
+	// DCG 标准公式：等级越高增益越大（2^rel - 1），位置越靠后折扣越重
+	// （log2(i+2)，i 从 0 起，位置 1 对应分母 log2 2）。
 	for i, id := range results[:k] {
 		rel := relevant[id]
 		dcg += (math.Pow(2, float64(rel)) - 1) / math.Log2(float64(i+2))
 	}
+	// 理想排序与检索结果无关，只需把标注等级降序排列后按同一公式计算；
+	// 对等级值排序比按文档排序便宜得多。
 	ideal := make([]int, 0, len(relevant))
 	for _, rel := range relevant {
 		ideal = append(ideal, rel)
@@ -47,14 +56,17 @@ func NDCGAtK(results []string, relevant map[string]int, k int) float64 {
 	for i, rel := range ideal[:k] {
 		idcg += (math.Pow(2, float64(rel)) - 1) / math.Log2(float64(i+2))
 	}
+	// 所有标注等级均为 0 时理想分也是 0，直接返回 0 避免除零。
 	if idcg == 0 {
 		return 0
 	}
 	return dcg / idcg
 }
 
+// CitationCoverage 计算必须引用的块被检索候选集覆盖的比例；无标注引用时按满分 1 处理。
 func CitationCoverage(required, cited []string) float64 {
 	// 引用覆盖率关注标注证据是否进入候选集，与生成答案的语言质量解耦。
+	// 没有必须引用的标注时视为全覆盖，避免空集被记 0 分。
 	if len(required) == 0 {
 		return 1
 	}

@@ -1,1 +1,38 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"learnq://skill-input/v1","type":"object"}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "learnq://skill-input/v2",
+  "type": "object",
+  "minProperties": 1,
+  "properties": {
+    "title": {"type": "string", "maxLength": 255},
+    "topic": {"type": "string", "maxLength": 255},
+    "summary": {"type": "string", "maxLength": 32768},
+    "question": {"type": "string", "maxLength": 4000},
+    "duration_minutes": {"type": "integer", "minimum": 0, "maximum": 1440},
+    "modules": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "oneOf": [
+          {"type": "string", "maxLength": 64},
+          {
+            "type": "object",
+            "required": ["content"],
+            "properties": {
+              "category": {"type": "string", "maxLength": 64},
+              "content": {"type": "string", "minLength": 1, "maxLength": 32768}
+            },
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "request": {"type": "object"},
+    "agent_outputs": {"type": "object"},
+    "agent_errors": {"type": "object"}
+  },
+  "patternProperties": {
+    "^_": false
+  },
+  "additionalProperties": true
+}

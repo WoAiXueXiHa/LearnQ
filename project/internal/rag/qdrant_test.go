@@ -57,7 +57,7 @@ func TestEnsureCollectionRejectsDimensionDrift(t *testing.T) {
 		if r.Method == http.MethodPut {
 			return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 		}
-		body := `{"result":{"config":{"params":{"vectors":{"dense":{"size":1536}}}}}}`
+		body := `{"result":{"config":{"params":{"vectors":{"dense":{"size":1536,"distance":"Cosine"}},"sparse_vectors":{"sparse":{}}}}}}`
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})}
 	q := Qdrant{BaseURL: "http://qdrant.test", Collection: "learnq_chunks", Client: client}
@@ -72,12 +72,44 @@ func TestEnsureCollectionAcceptsMatchingExistingDimension(t *testing.T) {
 		if r.Method == http.MethodPut {
 			return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 		}
-		body := `{"result":{"config":{"params":{"vectors":{"dense":{"size":64}}}}}}`
+		body := `{"result":{"config":{"params":{"vectors":{"dense":{"size":64,"distance":"Cosine"}},"sparse_vectors":{"sparse":{}}}}}}`
 		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
 	})}
 	q := Qdrant{BaseURL: "http://qdrant.test", Collection: "learnq_chunks", Client: client}
 	if err := q.EnsureCollection(context.Background(), 64); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEnsureCollectionRejectsIncompatibleDistanceOrMissingSparseVector(t *testing.T) {
+	tests := []struct {
+		name, body, expected string
+	}{
+		{
+			name:     "distance",
+			body:     `{"result":{"config":{"params":{"vectors":{"dense":{"size":64,"distance":"Dot"}},"sparse_vectors":{"sparse":{}}}}}}`,
+			expected: "expected Cosine",
+		},
+		{
+			name:     "sparse",
+			body:     `{"result":{"config":{"params":{"vectors":{"dense":{"size":64,"distance":"Cosine"}},"sparse_vectors":{}}}}}`,
+			expected: "named sparse vector",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				if r.Method == http.MethodPut {
+					return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
+				}
+				return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(test.body))}, nil
+			})}
+			q := Qdrant{BaseURL: "http://qdrant.test", Collection: "learnq_chunks", Client: client}
+			err := q.EnsureCollection(context.Background(), 64)
+			if err == nil || !strings.Contains(err.Error(), test.expected) {
+				t.Fatalf("error=%v", err)
+			}
+		})
 	}
 }
 

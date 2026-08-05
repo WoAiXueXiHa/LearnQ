@@ -190,3 +190,41 @@ func TestThreeAttemptsUseRetryWaitThenDead(t *testing.T) {
 		}
 	}
 }
+
+func TestExpiredLeaseCanOnlyBeFailedByReaperPath(t *testing.T) {
+	s := database(t)
+	_, task, err := s.CreateStudyRecord(context.Background(), store.CreateRecord{
+		Title: "expired fence", DurationMinutes: 1,
+		Modules: []domain.StudyModule{{Category: "backend", Content: "lease"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DispatchOutbox(context.Background(), func(context.Context, uint64, time.Time) error { return nil }, 10); err != nil {
+		t.Fatal(err)
+	}
+	acquired, ok, err := s.Acquire(context.Background(), task.ID, "expired-token", time.Now().Add(-time.Second))
+	if err != nil || !ok {
+		t.Fatalf("acquire=%v err=%v", ok, err)
+	}
+	if _, _, err := s.Fail(context.Background(), acquired, "expired-token", errors.New("late worker")); err == nil {
+		t.Fatal("expired worker failure committed")
+	}
+	var processing domain.AITask
+	if err := s.DB.First(&processing, task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if processing.Status != domain.TaskProcessing {
+		t.Fatalf("status after late worker=%s", processing.Status)
+	}
+	if _, retry, err := s.FailExpired(context.Background(), acquired, "expired-token", context.DeadlineExceeded); err != nil || !retry {
+		t.Fatalf("reaper failure retry=%v err=%v", retry, err)
+	}
+	var recovered domain.AITask
+	if err := s.DB.First(&recovered, task.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Status != domain.TaskRetryWait {
+		t.Fatalf("reaper status=%s", recovered.Status)
+	}
+}

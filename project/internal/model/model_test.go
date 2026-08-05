@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -76,6 +77,18 @@ func TestOpenAICompatibleParsesUsageAndHonorsClientTimeout(t *testing.T) {
 		if request.URL.Path != "/chat/completions" {
 			t.Fatalf("path=%s", request.URL.Path)
 		}
+		var body struct {
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.Messages) != 2 || !strings.Contains(body.Messages[0].Content, `"required":["title","summary","sections"]`) {
+			t.Fatalf("response schema missing from system prompt: %#v", body.Messages)
+		}
 		return &http.Response{
 			StatusCode: 200,
 			Header:     make(http.Header),
@@ -85,7 +98,10 @@ func TestOpenAICompatibleParsesUsageAndHonorsClientTimeout(t *testing.T) {
 		}, nil
 	}), Timeout: time.Second}
 	model := OpenAICompatible{BaseURL: "http://ai.test", APIKey: "test", ChatModel: "chat", Client: client}
-	response, err := model.Generate(context.Background(), ChatRequest{Prompt: "p", Input: []byte(`{}`)})
+	response, err := model.Generate(context.Background(), ChatRequest{
+		Prompt: "p", Input: []byte(`{}`),
+		ResponseSchema: []byte(`{"type":"object","required":["title","summary","sections"]}`),
+	})
 	if err != nil || response.InputTokens != 12 || response.OutputTokens != 7 {
 		t.Fatalf("response=%#v err=%v", response, err)
 	}

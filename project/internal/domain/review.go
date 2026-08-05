@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+// ReviewInterval 把掌握度映射为复习间隔天数（1/2/4/7/14/30 天）；越界值返回错误。
 func ReviewInterval(mastery int) (time.Duration, error) {
 	// 掌握度由用户提交，系统只把它映射为复习间隔，不替用户判断是否已经掌握。
 	days := []int{1, 2, 4, 7, 14, 30}
@@ -14,6 +15,7 @@ func ReviewInterval(mastery int) (time.Duration, error) {
 	return time.Duration(days[mastery]) * 24 * time.Hour, nil
 }
 
+// ReviewTask 是一条间隔复习计划：报告成功后生成，按 DueAt 到期提醒，掌握度随复习更新。
 type ReviewTask struct {
 	ID          uint64     `json:"id" gorm:"primaryKey"`
 	ReportID    uint64     `json:"report_id"`
@@ -37,6 +39,7 @@ type ReviewEvent struct {
 	CreatedAt    time.Time
 }
 
+// Report 是报告产出的持久化结果：Markdown 正文与导出状态分离，导出失败仅记录状态、不影响任务结果。
 type Report struct {
 	ID              uint64    `json:"id" gorm:"primaryKey"`
 	TaskID          uint64    `json:"task_id"`

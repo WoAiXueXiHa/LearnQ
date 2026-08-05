@@ -10,7 +10,7 @@ RUN CGO_ENABLED=0 GOWORK=off go build -trimpath -o /out/app ./cmd/${TARGET}
 
 FROM alpine:3.22
 RUN adduser -D -u 10001 learnq \
-    && mkdir -p /app/data/reports \
+    && mkdir -p /app/data/reports /app/data/images \
     && chown -R learnq:learnq /app
 WORKDIR /app
 COPY --from=build /out/app /app/app

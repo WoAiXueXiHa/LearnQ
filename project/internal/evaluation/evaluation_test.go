@@ -44,3 +44,10 @@ func TestReadAndCompareThreeRetrievers(t *testing.T) {
 		t.Fatal("mode missing")
 	}
 }
+
+func TestReadJSONLRejectsPlaceholderChunkID(t *testing.T) {
+	_, err := ReadJSONL(strings.NewReader(`{"id":"e1","question":"q","relevant_chunks":[{"chunk_id":"replace-with-indexed-chunk-id","relevance":3}]}`))
+	if err == nil || !strings.Contains(err.Error(), "placeholder chunk_id") {
+		t.Fatalf("placeholder error=%v", err)
+	}
+}

@@ -11,10 +11,21 @@ curl() {
 
 COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-learnq_acceptance_$$}"
 LEARNQ_HTTP_PORT="${LEARNQ_HTTP_PORT:-18080}"
+AI_MODE=fake
 BASE_URL="http://127.0.0.1:${LEARNQ_HTTP_PORT}"
-export COMPOSE_PROJECT_NAME LEARNQ_HTTP_PORT
+export COMPOSE_PROJECT_NAME LEARNQ_HTTP_PORT AI_MODE
 docker compose up --build -d
-trap 'docker compose down -v' EXIT
+image_file=$(mktemp)
+cleanup() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    docker compose logs api worker || true
+  fi
+  rm -f "$image_file"
+  docker compose down -v
+  exit "$status"
+}
+trap cleanup EXIT
 attempt=0
 while :; do
   if curl -fsS "$BASE_URL/health/ready" >/dev/null; then
@@ -25,8 +36,10 @@ while :; do
   sleep 2
 done
 curl -fsS "$BASE_URL/health/ready" | jq -e '.data.dependencies.worker == "ok"' >/dev/null
-curl -fsS "$BASE_URL/" | grep -q 'id="recordForm"'
-curl -fsS "$BASE_URL/static/app.js" | grep -q 'taskPollFailures'
+home=$(curl -fsS "$BASE_URL/")
+case "$home" in *'id="recordForm"'*) ;; *) exit 1 ;; esac
+app_js=$(curl -fsS "$BASE_URL/static/app.js")
+case "$app_js" in *taskPollFailures*) ;; *) exit 1 ;; esac
 for scope in due upcoming all; do
   curl -fsS "$BASE_URL/api/v1/review-tasks?scope=$scope" |
     jq -e '.data | type == "array" and length == 0' >/dev/null
@@ -86,6 +99,40 @@ indexing_task_id=$(printf '%s' "$upload" | jq -r '.data.indexing_task_id')
 curl -fsS "$BASE_URL/api/v1/tasks/$indexing_task_id/detail" |
   jq -e '.data.task.kind == "document_index" and .data.document.status == "ready" and .data.report == null' >/dev/null
 
+printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' |
+  base64 -d >"$image_file"
+image_upload=$(curl -fsS -X POST "$BASE_URL/api/v1/images" \
+  -F "file=@$image_file;filename=acceptance.png;type=image/png" \
+  -F 'prompt=提取这张测试图片的学习重点')
+image_id=$(printf '%s' "$image_upload" | jq -r '.data.id')
+image_task_id=$(printf '%s' "$image_upload" | jq -r '.data.task_id')
+attempt=0
+while :; do
+  image_status=$(curl -fsS "$BASE_URL/api/v1/images/$image_id" | jq -r '.data.status')
+  [ "$image_status" = ready ] && break
+  [ "$image_status" != failed ] || exit 1
+  attempt=$((attempt+1))
+  [ "$attempt" -lt 60 ] || exit 1
+  sleep 1
+done
+curl -fsS "$BASE_URL/api/v1/tasks/$image_task_id/detail" |
+  jq -e '.data.task.kind == "image_describe" and .data.image.status == "ready" and .data.image.description.summary != ""' >/dev/null
+curl -fsS "$BASE_URL/api/v1/images/$image_id/content" -o /dev/null
+image_index=$(curl -fsS -X POST "$BASE_URL/api/v1/images/$image_id/index")
+image_document_id=$(printf '%s' "$image_index" | jq -r '.data.document_id')
+test "$image_document_id" -gt 0
+curl -fsS -X POST "$BASE_URL/api/v1/images/$image_id/index" |
+  jq -e --argjson document "$image_document_id" '.data.document_id == $document' >/dev/null
+attempt=0
+while :; do
+  image_document_status=$(curl -fsS "$BASE_URL/api/v1/documents/$image_document_id/status" | jq -r '.data.status')
+  [ "$image_document_status" = ready ] && break
+  [ "$image_document_status" != failed ] || exit 1
+  attempt=$((attempt+1))
+  [ "$attempt" -lt 60 ] || exit 1
+  sleep 1
+done
+
 rag=$(curl -fsS -X POST "$BASE_URL/api/v1/rag/query" \
   -H 'Content-Type: application/json' -d '{"question":"LearnQ 如何启动 Compose？","top_k":5}')
 printf '%s' "$rag" | jq -e '.data.answer | contains("[S1]")' >/dev/null
@@ -94,6 +141,12 @@ printf '{"id":"acceptance-rag","question":"LearnQ 如何启动 Compose？","rele
   curl -fsS -X POST "$BASE_URL/api/v1/evaluations/rag" \
     -H 'Content-Type: application/jsonl' --data-binary @- |
   jq -e '.data.status == "succeeded"' >/dev/null
+
+curl -fsS -X DELETE "$BASE_URL/api/v1/images/$image_id" |
+  jq -e --argjson image "$image_id" '.data.deleted == $image' >/dev/null
+[ "$(curl -sS -o /dev/null -w '%{http_code}' "$BASE_URL/api/v1/images/$image_id")" = 404 ]
+curl -fsS "$BASE_URL/api/v1/documents" |
+  jq -e --argjson document "$image_document_id" '[.data[].id] | index($document) == null' >/dev/null
 
 curl -fsS "$BASE_URL/api/v1/analytics/weekly" | jq -e '.data.fact_source == "mysql"' >/dev/null
 

@@ -36,6 +36,7 @@ func TestStaticJavaScriptContainsSafeMarkdownAndPollingRecovery(t *testing.T) {
 		"文档已就绪，请输入问题开始检索。",
 		"reportPreview", `!line.includes("_tool_results")`,
 		"Array.isArray(documents)",
+		"review_task: review",
 	} {
 		if rec.Code != 200 || !strings.Contains(body, expected) {
 			t.Fatalf("status=%d missing=%q", rec.Code, expected)

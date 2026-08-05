@@ -1,0 +1,37 @@
+.runtime-status{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+.material-switch{display:flex;gap:8px;margin:0 0 12px}
+.material-switch button.active{background:#155e75;color:#fff}
+.file-field{display:grid;gap:6px;flex:1;min-width:0;max-width:100%;font-weight:650}
+.file-field input[type=file]{display:block;width:100%;min-width:0;max-width:100%}
+.image-upload{display:grid;gap:12px;margin-bottom:18px}
+.image-upload>button{width:max-content}
+.privacy-hint{margin:0;color:#805800;font-size:13px}
+.image-preview{display:grid;grid-template-columns:minmax(120px,240px) 1fr;gap:14px;align-items:center;padding:12px;background:#f4f7fb;border-radius:10px}
+.image-preview img{display:block;width:100%;max-height:240px;object-fit:contain;border-radius:8px;background:#e7edf4}
+.image-preview div{display:grid;gap:4px}
+.image-preview small{color:#65758b}
+.material-images{margin-bottom:12px}
+.image-card{grid-column:1/-1}
+.image-card-layout{display:grid;grid-template-columns:minmax(140px,240px) 1fr;gap:16px;align-items:start}
+.image-thumb{display:block;width:100%;max-height:240px;object-fit:contain;border-radius:10px;background:#edf2f7}
+.image-description{margin-top:10px}
+.description-section h4{margin-bottom:4px}
+.description-section ul{margin-top:4px}
+.danger-outline{border-color:#c65a66!important;color:#9d2431!important}
+.citation-score{white-space:nowrap;flex:none;font-variant-numeric:tabular-nums}
+.retrieval-candidates>.cards{margin-top:12px}
+@media(max-width:700px){
+  .runtime-status{justify-content:flex-start}
+  .material-switch{display:grid;grid-template-columns:1fr 1fr}
+  .material-switch button{width:100%}
+  .image-upload>button{width:100%}
+  .image-preview,.image-card-layout{grid-template-columns:1fr}
+  .image-preview img,.image-thumb{max-height:280px}
+}
+@media(max-width:390px){
+  .runtime-status{width:100%}
+  .runtime-status .badge{max-width:100%;white-space:normal}
+  .material-switch{grid-template-columns:1fr}
+  .card{padding:14px}
+  .citation .card-title{gap:4px}
+}

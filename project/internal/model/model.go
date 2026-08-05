@@ -8,14 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 )
 
+// ChatRequest 是供应商无关的生成请求：Prompt 为系统提示词，Input 为用户输入，
+// ResponseSchema 约束输出 JSON 结构。
 type ChatRequest struct {
-	Prompt string
-	Skill  string
-	Input  json.RawMessage
+	Prompt         string
+	Skill          string
+	Input          json.RawMessage
+	ResponseSchema json.RawMessage
 }
 type ChatResponse struct {
 	Content      string
@@ -27,6 +31,8 @@ type ChatModel interface {
 	// 业务层只依赖最小接口，供应商协议、鉴权和错误分类留在适配器内部。
 	Generate(context.Context, ChatRequest) (ChatResponse, error)
 }
+
+// EmbeddingModel 批量向量化文本；Fake 用哈希伪向量，real 走 OpenAI 兼容接口。
 type EmbeddingModel interface {
 	Embed(context.Context, []string) ([][]float32, error)
 }
@@ -38,7 +44,10 @@ type Fake struct {
 	Failure   string
 }
 
+// Generate 按 Failure 注入故障、按 Skill 返回确定性 JSON 占位输出：
+// "temporary" 模拟可重试错误，"invalid_json" 返回非法 JSON 以测试输出 Schema 校验链路。
 func (f Fake) Generate(ctx context.Context, req ChatRequest) (ChatResponse, error) {
+	// Delay 模拟慢模型调用；select 让 ctx 取消（如任务超时）能立即中断等待。
 	if f.Delay > 0 {
 		select {
 		case <-time.After(f.Delay):
@@ -60,6 +69,7 @@ func (f Fake) Generate(ctx context.Context, req ChatRequest) (ChatResponse, erro
 				Content string `json:"content"`
 			} `json:"evidence"`
 		}
+		// RAG 回答必须携带可核验证据，缺失时拒绝生成而不是让模型编造引用。
 		if err := json.Unmarshal(req.Input, &input); err != nil || len(input.Evidence) == 0 {
 			return ChatResponse{}, errors.New("rag answer requires evidence")
 		}
@@ -110,6 +120,8 @@ func (f Fake) Generate(ctx context.Context, req ChatRequest) (ChatResponse, erro
 	return ChatResponse{Content: string(content), InputTokens: len([]rune(req.Prompt)) / 4, OutputTokens: len(content) / 4, Model: "learnq-fake-chat-v1"}, nil
 }
 
+// compactJSON 把输入压缩为单行摘要并截断到 limit 字符：合法 JSON 经重新序列化
+// 压成单行，超长内容截断后补省略号。
 func compactJSON(raw json.RawMessage, limit int) string {
 	value := strings.TrimSpace(string(raw))
 	if value == "" {
@@ -127,52 +139,74 @@ func compactJSON(raw json.RawMessage, limit int) string {
 	return value
 }
 
+// summarizeFakeInput 从输入 JSON 提取主题与可读事实列表供 Fake 报告引用；
+// 兼容 {request:{...}} 包裹结构与顶层平铺两种形态。
 func summarizeFakeInput(raw json.RawMessage) (string, string) {
-	var input struct {
-		Title           string `json:"title"`
-		Topic           string `json:"topic"`
-		Summary         string `json:"summary"`
-		Question        string `json:"question"`
-		DurationMinutes int    `json:"duration_minutes"`
-		Modules         []struct {
-			Category string `json:"category"`
-			Content  string `json:"content"`
-		} `json:"modules"`
-	}
+	var input map[string]any
 	if json.Unmarshal(raw, &input) != nil {
-		return compactJSON(raw, 240), "本次学习主题"
+		return "输入无法解析。", "本次学习主题"
 	}
-	topic := strings.TrimSpace(input.Title)
+	if request, ok := input["request"].(map[string]any); ok {
+		for _, key := range []string{"title", "topic", "summary", "question", "duration_minutes", "modules"} {
+			if _, exists := input[key]; !exists {
+				input[key] = request[key]
+			}
+		}
+	}
+	text := func(key string) string {
+		value, _ := input[key].(string)
+		return strings.TrimSpace(value)
+	}
+	topic := text("title")
 	if topic == "" {
-		topic = strings.TrimSpace(input.Topic)
+		topic = text("topic")
 	}
 	if topic == "" {
 		topic = "本次学习主题"
 	}
 	lines := []string{"- 主题：" + topic}
-	if value := strings.TrimSpace(input.Summary); value != "" {
+	if value := text("summary"); value != "" {
 		lines = append(lines, "- 摘要："+value)
 	}
-	if value := strings.TrimSpace(input.Question); value != "" {
+	if value := text("question"); value != "" {
 		lines = append(lines, "- 问题："+value)
 	}
-	if input.DurationMinutes > 0 {
-		lines = append(lines, fmt.Sprintf("- 投入：%d 分钟", input.DurationMinutes))
+	if value, ok := input["duration_minutes"].(float64); ok && value > 0 {
+		lines = append(lines, fmt.Sprintf("- 投入：%d 分钟", int(value)))
 	}
-	for _, module := range input.Modules {
-		content := strings.TrimSpace(module.Content)
-		if content == "" {
-			continue
+	if modules, ok := input["modules"].([]any); ok {
+		for _, item := range modules {
+			switch module := item.(type) {
+			case string:
+				if value := strings.TrimSpace(module); value != "" {
+					lines = append(lines, "- 模块："+value)
+				}
+			case map[string]any:
+				content, _ := module["content"].(string)
+				category, _ := module["category"].(string)
+				content, category = strings.TrimSpace(content), strings.TrimSpace(category)
+				if content != "" {
+					if category == "" {
+						category = "未分类"
+					}
+					lines = append(lines, fmt.Sprintf("- 模块（%s）：%s", category, content))
+				}
+			}
 		}
-		category := strings.TrimSpace(module.Category)
-		if category == "" {
-			category = "未分类"
+	}
+	if outputs, ok := input["agent_outputs"].(map[string]any); ok && len(outputs) > 0 {
+		names := make([]string, 0, len(outputs))
+		for name := range outputs {
+			names = append(names, name)
 		}
-		lines = append(lines, fmt.Sprintf("- 模块（%s）：%s", category, content))
+		sort.Strings(names)
+		lines = append(lines, "- 已汇总 Agent："+strings.Join(names, "、"))
 	}
 	return strings.Join(lines, "\n"), topic
 }
 
+// Embed 生成确定性伪向量：token 经哈希散列到固定维度并带上符号累加，最后 L2 归一化。
+// 不访问网络，仅用于 fake 模式跑通向量索引与检索链路。
 func (f Fake) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	dim := f.Dimension
 	if dim <= 0 {
@@ -185,6 +219,8 @@ func (f Fake) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 			return nil, ctx.Err()
 		default:
 		}
+		// token 经哈希均匀散列到 dim 个维度；哈希第 5 字节决定符号，
+		// 使不同 token 可在同一维度正负相抵、保留更多区分信息。
 		v := make([]float32, dim)
 		for _, token := range strings.Fields(strings.ToLower(text)) {
 			sum := sha256.Sum256([]byte(token))
@@ -199,6 +235,7 @@ func (f Fake) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 		for _, x := range v {
 			norm += float64(x * x)
 		}
+		// 全零向量（空文本）跳过归一化，避免除零。
 		if norm > 0 {
 			norm = math.Sqrt(norm)
 			for j := range v {
@@ -210,6 +247,8 @@ func (f Fake) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	return out, nil
 }
 
+// MarkdownFromJSON 把 Skill 输出的结构化 JSON 渲染为 Markdown 报告；
+// 必填字段缺失即报错，拒绝把半成品写盘。
 func MarkdownFromJSON(raw string) (string, error) {
 	var v struct {
 		Title    string `json:"title"`

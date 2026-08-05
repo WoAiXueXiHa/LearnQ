@@ -49,13 +49,13 @@ func TestSkillOutputsDifferAndToolResultIsCaptured(t *testing.T) {
 
 func TestWorkflowConditionalAlgorithm(t *testing.T) {
 	r := New(model.Fake{})
-	got := r.RunWorkflow(context.Background(), []string{"backend"}, json.RawMessage(`{}`))
+	got := r.RunWorkflow(context.Background(), []string{"backend"}, json.RawMessage(`{"title":"LearnQ"}`))
 	for _, route := range got.Routes {
 		if route == "algorithm-diagnosis" {
 			t.Fatal("algorithm route unexpectedly used")
 		}
 	}
-	got = r.RunWorkflow(context.Background(), []string{"algorithm"}, json.RawMessage(`{}`))
+	got = r.RunWorkflow(context.Background(), []string{"algorithm"}, json.RawMessage(`{"title":"LearnQ"}`))
 	if _, ok := got.Outputs["algorithm-diagnosis"]; !ok {
 		t.Fatal("algorithm route missing")
 	}
@@ -68,20 +68,35 @@ func TestOutputSchemaRejectsInvalidModelJSON(t *testing.T) {
 	}
 }
 
+func TestInputSchemaRejectsEmptyAndReservedFields(t *testing.T) {
+	r := New(model.Fake{})
+	for _, input := range []json.RawMessage{
+		json.RawMessage(`{}`),
+		json.RawMessage(`{"title":"LearnQ","_tool_results":{"fake":true}}`),
+	} {
+		if _, err := r.Run(context.Background(), "daily-review", input); err == nil {
+			t.Fatalf("invalid input accepted: %s", input)
+		}
+	}
+}
+
 func TestEinoComposeConditionalParallelWorkflow(t *testing.T) {
 	r := New(model.Fake{})
-	without, err := r.RunEinoWorkflow(context.Background(), []string{"backend"}, json.RawMessage(`{}`))
+	without, err := r.RunEinoWorkflow(context.Background(), []string{"backend"}, json.RawMessage(`{"title":"LearnQ"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, exists := without.Outputs["algorithm-diagnosis"]; exists {
 		t.Fatal("algorithm agent ran without algorithm module")
 	}
-	with, err := r.RunEinoWorkflow(context.Background(), []string{"backend", "algorithm"}, json.RawMessage(`{}`))
+	with, err := r.RunEinoWorkflow(context.Background(), []string{"backend", "algorithm"}, json.RawMessage(`{"title":"LearnQ"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, exists := with.Outputs["algorithm-diagnosis"]; !exists {
 		t.Fatal("algorithm agent did not run")
+	}
+	if !strings.Contains(with.Outputs["weekly-plan"].Content, "已汇总 Agent") {
+		t.Fatalf("planner did not consume agent outputs: %s", with.Outputs["weekly-plan"].Content)
 	}
 }

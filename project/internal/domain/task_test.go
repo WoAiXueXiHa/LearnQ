@@ -14,6 +14,47 @@ func TestTaskTransitions(t *testing.T) {
 	}
 }
 
+func TestTransitionAcceptsLegalTransition(t *testing.T) {
+	task := AITask{Status: TaskPending}
+	if err := task.Transition(TaskQueued); err != nil {
+		t.Fatalf("Transition failed: %v", err)
+	}
+	if task.Status != TaskQueued {
+		t.Fatalf("status=%s, want=%s", task.Status, TaskQueued)
+	}
+}
+
+func TestTransitionRejectsIllegalTransitionWithoutMutation(t *testing.T) {
+	task := AITask{Status: TaskPending}
+	if err := task.Transition(TaskSucceeded); err == nil {
+		t.Fatal("illegal transition accepted")
+	}
+	if task.Status != TaskPending {
+		t.Fatalf("status=%s, want=%s", task.Status, TaskPending)
+	}
+}
+
+func TestTransitionDoesNotRequeueSucceededTask(t *testing.T) {
+	task := AITask{Status: TaskSucceeded}
+	if err := task.Transition(TaskQueued); err == nil {
+		t.Fatal("succeeded task was requeued")
+	}
+	if task.Status != TaskSucceeded {
+		t.Fatalf("status=%s, want=%s", task.Status, TaskSucceeded)
+	}
+}
+
+func TestTransitionRejectsUnknownStateWithoutMutation(t *testing.T) {
+	unknown := TaskStatus("mystery")
+	task := AITask{Status: unknown}
+	if err := task.Transition(TaskQueued); err == nil {
+		t.Fatal("unknown task state was accepted")
+	}
+	if task.Status != unknown {
+		t.Fatalf("status=%s, want=%s", task.Status, unknown)
+	}
+}
+
 func TestRetryDelay(t *testing.T) {
 	cases := []struct {
 		attempt int

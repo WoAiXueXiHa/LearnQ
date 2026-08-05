@@ -8,6 +8,8 @@ import (
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/model"
 )
 
+// WorkflowResult 汇总一次工作流的全部产出：路由顺序、各 Agent 输出、
+// 工具执行记录与错误；整体随 API 响应返回，trace 则按成功路由单独落库。
 type WorkflowResult struct {
 	Routes  []string                      `json:"routes"`
 	Outputs map[string]model.ChatResponse `json:"outputs"`
@@ -30,6 +32,7 @@ func (r *Registry) RunWorkflow(ctx context.Context, modules []string, input json
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for _, route := range routes {
+		// 显式复制循环变量：goroutine 稍后执行时捕获的是本次迭代的局部副本，避免路由错乱。
 		route := route
 		wg.Add(1)
 		go func() {
@@ -38,6 +41,7 @@ func (r *Registry) RunWorkflow(ctx context.Context, modules []string, input json
 			mu.Lock()
 			// 多个 Agent 共享 result，锁仅覆盖结果归并，不包住慢速模型调用。
 			defer mu.Unlock()
+			// 单个 Agent 失败仅记入 Errors，不中断其余并行 Agent。
 			if err != nil {
 				result.Errors[route] = err.Error()
 			} else {
@@ -46,6 +50,7 @@ func (r *Registry) RunWorkflow(ctx context.Context, modules []string, input json
 			}
 		}()
 	}
+	// 汇聚节点在全部 Agent 收尾后串行运行，保证其看到完整输出。
 	wg.Wait()
 	planner, tools, err := r.RunDetailed(ctx, "weekly-plan", input)
 	result.Routes = append(result.Routes, "weekly-plan")

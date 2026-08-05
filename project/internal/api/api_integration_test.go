@@ -7,6 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +23,7 @@ import (
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/bootstrap"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/config"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/domain"
+	"github.com/WoAiXueXiHa/LeranQ/project/internal/imagestore"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/migrate"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/model"
 	"github.com/WoAiXueXiHa/LeranQ/project/internal/skill"
@@ -46,12 +50,15 @@ func setup(t *testing.T) fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		for _, table := range []string{"rag_evaluations", "document_chunks", "documents", "agent_steps", "tool_calls", "agent_runs", "review_events", "review_tasks", "reports", "task_attempts", "outbox_events", "ai_tasks", "study_modules", "study_records", "idempotency_keys"} {
+		for _, table := range []string{"rag_evaluations", "document_chunks", "images", "documents", "agent_steps", "tool_calls", "agent_runs", "review_events", "review_tasks", "reports", "task_attempts", "outbox_events", "ai_tasks", "study_modules", "study_records", "idempotency_keys"} {
 			db.Exec("DELETE FROM " + table)
 		}
 	})
 	s := store.New(db)
-	return fixture{handler: api.New(s, skill.New(model.Fake{})).Handler(), store: s}
+	return fixture{
+		handler: api.New(s, skill.New(model.Fake{}), api.WithImageStore(imagestore.New(t.TempDir()))).Handler(),
+		store:   s,
+	}
 }
 
 func request(t *testing.T, f fixture, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -103,6 +110,62 @@ func TestStudyRecordIdempotencyEnvelopeAndTaskQuery(t *testing.T) {
 	invalid := request(t, f, http.MethodPost, "/api/v1/study-records", `{}`, map[string]string{"Content-Type": "application/json"})
 	if invalid.Code != 422 || !strings.Contains(invalid.Body.String(), `"code":"VALIDATION_FAILED"`) {
 		t.Fatalf("invalid status=%d body=%s", invalid.Code, invalid.Body)
+	}
+}
+
+func TestImageUploadListContentAndDelete(t *testing.T) {
+	f := setup(t)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "note.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	picture := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	picture.Set(0, 0, color.RGBA{R: 20, G: 90, B: 140, A: 255})
+	if err := png.Encode(part, picture); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("prompt", "提取学习重点"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/images", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	f.handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("upload=%d %s", recorder.Code, recorder.Body)
+	}
+	var envelope struct {
+		Data struct {
+			ID     uint64 `json:"id"`
+			TaskID uint64 `json:"task_id"`
+			Status string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &envelope); err != nil ||
+		envelope.Data.ID == 0 || envelope.Data.TaskID == 0 || envelope.Data.Status != "uploaded" {
+		t.Fatalf("upload envelope=%#v err=%v", envelope, err)
+	}
+	id := strconvFormat(envelope.Data.ID)
+	list := request(t, f, http.MethodGet, "/api/v1/images", "", nil)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"note.png"`) {
+		t.Fatalf("list=%d %s", list.Code, list.Body)
+	}
+	content := request(t, f, http.MethodGet, "/api/v1/images/"+id+"/content", "", nil)
+	if content.Code != http.StatusOK || content.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("content=%d type=%s", content.Code, content.Header().Get("Content-Type"))
+	}
+	deleted := request(t, f, http.MethodDelete, "/api/v1/images/"+id, "", nil)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete=%d %s", deleted.Code, deleted.Body)
+	}
+	missing := request(t, f, http.MethodGet, "/api/v1/images/"+id, "", nil)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing=%d %s", missing.Code, missing.Body)
 	}
 }
 
@@ -271,6 +334,9 @@ func TestDocumentValidationAndRAGNoEvidence(t *testing.T) {
 	if detail.Code != 200 || !strings.Contains(detail.Body.String(), `"kind":"document_index"`) || !strings.Contains(detail.Body.String(), `"document":`) {
 		t.Fatalf("document detail=%d %s", detail.Code, detail.Body)
 	}
+	if err := f.store.DispatchOutbox(context.Background(), func(context.Context, uint64, time.Time) error { return nil }, 10); err != nil {
+		t.Fatal(err)
+	}
 	deleted := request(t, f, http.MethodDelete, "/api/v1/documents/"+strconvFormat(document.ID), "", nil)
 	if deleted.Code != 200 {
 		t.Fatalf("delete document=%d %s", deleted.Code, deleted.Body)
@@ -278,6 +344,35 @@ func TestDocumentValidationAndRAGNoEvidence(t *testing.T) {
 	var canceled domain.AITask
 	if err := f.store.DB.First(&canceled, document.IndexingTaskID).Error; err != nil || canceled.Status != domain.TaskDead || canceled.LastError != "document deleted by user" {
 		t.Fatalf("canceled task=%#v err=%v", canceled, err)
+	}
+
+	processingDocument, processingTask, err := f.store.CreateDocument(context.Background(), domain.Document{
+		Filename: "processing.md", MediaType: "md", ContentHash: "processing", Content: "# processing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.DispatchOutbox(context.Background(), func(context.Context, uint64, time.Time) error { return nil }, 10); err != nil {
+		t.Fatal(err)
+	}
+	acquired, ok, err := f.store.Acquire(context.Background(), processingTask.ID, "delete-token", time.Now().Add(time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("acquire=%v err=%v", ok, err)
+	}
+	if err := f.store.DB.Model(&domain.Document{}).Where("id=?", processingDocument.ID).Update("status", "indexing").Error; err != nil {
+		t.Fatal(err)
+	}
+	deleted = request(t, f, http.MethodDelete, "/api/v1/documents/"+strconvFormat(processingDocument.ID), "", nil)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete processing document=%d %s", deleted.Code, deleted.Body)
+	}
+	var attempt domain.TaskAttempt
+	if err := f.store.DB.Where("task_id=? AND execution_generation=? AND lease_token=?",
+		acquired.ID, acquired.ExecutionGeneration, "delete-token").First(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.Status != "dead" || attempt.FinishedAt == nil || attempt.ErrorMessage != "document deleted by user" {
+		t.Fatalf("attempt=%#v", attempt)
 	}
 }
 
