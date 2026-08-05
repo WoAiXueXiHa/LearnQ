@@ -99,21 +99,21 @@ Reaper 从 MySQL 扫描过期任务并推进重试或终止；Reconciler 根据�
 ```text
 .
 ├── .github/workflows/       # 仓库级 CI
-├── demo/                    # 与主应用隔离的原理示例
-├── project/
-│   ├── cmd/                 # migrate、api、worker 入口
-│   ├── internal/
-│   │   ├── api/             # HTTP API 与读模型
-│   │   ├── store/           # MySQL 事务与任务状态
-│   │   ├── queue/           # Redis 队列与 Lua
-│   │   ├── worker/          # 异步任务执行
-│   │   ├── recovery/        # Reaper 与 Reconciler
-│   │   ├── skill/           # Skill 与 Eino 工作流
-│   │   ├── indexer/         # 文档切块和索引
-│   │   ├── rag/             # 混合检索与评估
-│   │   └── web/             # 嵌入式前端
-│   ├── scripts/             # 验收和手工测试
-│   └── README.md            # 启动、配置、接口与排障手册
+├── cmd/                     # migrate、api、worker 入口
+├── internal/
+│   ├── api/                 # HTTP API 与读模型
+│   ├── store/               # MySQL 事务与任务状态
+│   ├── queue/               # Redis 队列与 Lua
+│   ├── worker/              # 异步任务执行
+│   ├── recovery/            # Reaper 与 Reconciler
+│   ├── skill/               # Skill 与 Eino 工作流
+│   ├── indexer/             # 文档切块和索引
+│   ├── rag/                 # 混合检索与评估
+│   └── web/                 # 嵌入式前端
+├── scripts/                 # 验收和手工测试
+├── RUNBOOK.md               # 启动、配置、接口与排障手册
+├── compose.yaml
+├── go.mod
 └── README.md
 ```
 
@@ -125,4 +125,4 @@ Reaper 从 MySQL 扫描过期任务并推进重试或终止；Reconciler 根据�
 - Fake 模式可离线演示完整业务链路；真实模型密钥只从环境变量读取。
 - 保持 API、Worker 和嵌入式前端的清晰边界，不为展示复杂度而拆分微服务。
 
-启动、配置、API 和验收操作见 [project/README.md](project/README.md)。
+启动、配置、API 和验收操作见 [RUNBOOK.md](RUNBOOK.md)。

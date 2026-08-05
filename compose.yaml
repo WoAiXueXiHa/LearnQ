@@ -1,0 +1,87 @@
+x-app-environment: &app-environment
+  MYSQL_DSN: learnq:learnq@tcp(mysql:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true&timeout=5s&readTimeout=10s&writeTimeout=10s
+  REDIS_ADDR: redis:6379
+  QDRANT_URL: http://qdrant:6333
+  AI_MODE: ${AI_MODE:-fake}
+  AI_CHAT_BASE_URL: ${AI_CHAT_BASE_URL:-https://api.deepseek.com}
+  AI_CHAT_API_KEY: ${AI_CHAT_API_KEY:-}
+  AI_CHAT_MODEL: ${AI_CHAT_MODEL:-deepseek-v4-pro}
+  AI_EMBEDDING_BASE_URL: ${AI_EMBEDDING_BASE_URL:-http://host.docker.internal:11434/v1}
+  AI_EMBEDDING_API_KEY: ${AI_EMBEDDING_API_KEY:-ollama}
+  AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-qwen3-embedding:0.6b}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+  AI_VISION_PROVIDER: ${AI_VISION_PROVIDER:-ollama}
+  AI_VISION_BASE_URL: ${AI_VISION_BASE_URL:-http://host.docker.internal:11434/v1}
+  AI_VISION_API_KEY: ${AI_VISION_API_KEY:-ollama}
+  AI_VISION_MODEL: ${AI_VISION_MODEL:-qwen3-vl:4b}
+  AI_VISION_CONTEXT_LENGTH: ${AI_VISION_CONTEXT_LENGTH:-8192}
+  TASK_TIMEOUT: ${TASK_TIMEOUT:-45s}
+  LEASE_DURATION: ${LEASE_DURATION:-60s}
+  HTTP_ADDR: 0.0.0.0:8080
+  REPORT_DIR: /app/data/reports
+  IMAGE_DIR: /app/data/images
+
+services:
+  mysql:
+    image: mysql:8.4.10
+    environment:
+      MYSQL_DATABASE: learnq
+      MYSQL_USER: learnq
+      MYSQL_PASSWORD: learnq
+      MYSQL_ROOT_PASSWORD: local-root-only
+    healthcheck:
+      # 127.0.0.1 forces TCP. "localhost" may report the temporary init
+      # server healthy through its socket before port 3306 is listening.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-plocal-root-only"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes: [mysql-data:/var/lib/mysql]
+  redis:
+    image: redis:7.2.14-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    healthcheck:
+      # The official image has bash but intentionally ships without wget/curl.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    volumes: [qdrant-data:/qdrant/storage]
+  migration:
+    build: {context: ., args: {TARGET: migrate}}
+    environment:
+      MYSQL_DSN: learnq:learnq@tcp(mysql:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true&timeout=5s&readTimeout=10s&writeTimeout=10s
+    depends_on:
+      mysql: {condition: service_healthy}
+  api:
+    build: {context: ., args: {TARGET: api}}
+    environment: *app-environment
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:${LEARNQ_HTTP_PORT:-8080}:8080"]
+    volumes: [images:/app/data/images]
+    depends_on:
+      migration: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+  worker:
+    build: {context: ., args: {TARGET: worker}}
+    environment: *app-environment
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    volumes:
+      - reports:/app/data/reports
+      - images:/app/data/images
+    depends_on:
+      migration: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+volumes:
+  mysql-data:
+  qdrant-data:
+  reports:
+  images:

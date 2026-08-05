@@ -10,17 +10,17 @@
 !.env.example
 
 # Go build and test output
-/project/bin/
-/project/build/
-/project/dist/
-/project/coverage/
-/project/coverage.out
-/project/*.test
-/project/*.out
+/bin/
+/build/
+/dist/
+/coverage/
+/coverage.out
+/*.test
+/*.out
 
 # Runtime data
-/project/data/reports/
-/project/tmp/
+/data/reports/
+/tmp/
 
 # Logs
 *.log
