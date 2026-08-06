@@ -1,4 +1,4 @@
-module github.com/WoAiXueXiHa/LeranQ
+module github.com/WoAiXueXiHa/LearnQ
 
 go 1.25.0
 
