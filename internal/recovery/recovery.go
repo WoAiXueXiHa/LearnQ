@@ -6,9 +6,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
-	"github.com/WoAiXueXiHa/LeranQ/internal/queue"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 	"gorm.io/gorm"
 )
 

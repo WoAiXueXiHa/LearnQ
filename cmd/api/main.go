@@ -9,15 +9,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/agenttool"
-	"github.com/WoAiXueXiHa/LeranQ/internal/api"
-	"github.com/WoAiXueXiHa/LeranQ/internal/bootstrap"
-	"github.com/WoAiXueXiHa/LeranQ/internal/config"
-	"github.com/WoAiXueXiHa/LeranQ/internal/imagestore"
-	"github.com/WoAiXueXiHa/LeranQ/internal/queue"
-	"github.com/WoAiXueXiHa/LeranQ/internal/rag"
-	"github.com/WoAiXueXiHa/LeranQ/internal/skill"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/agenttool"
+	"github.com/WoAiXueXiHa/LearnQ/internal/api"
+	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
+	"github.com/WoAiXueXiHa/LearnQ/internal/config"
+	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
+	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
+	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
+	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 )
 
 // main 是 API 进程入口：加载并校验配置，装配 DB/Redis/Qdrant/模型/队列等依赖，

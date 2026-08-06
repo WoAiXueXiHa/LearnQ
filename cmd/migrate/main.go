@@ -3,9 +3,9 @@ package main
 import (
 	"log"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/bootstrap"
-	"github.com/WoAiXueXiHa/LeranQ/internal/config"
-	"github.com/WoAiXueXiHa/LeranQ/internal/migrate"
+	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
+	"github.com/WoAiXueXiHa/LearnQ/internal/config"
+	"github.com/WoAiXueXiHa/LearnQ/internal/migrate"
 )
 
 // main 是迁移入口：连接 MySQL 后执行全部待应用的 SQL 迁移，任一失败即 log.Fatal

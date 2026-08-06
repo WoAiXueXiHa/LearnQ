@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/rag"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 	"gorm.io/gorm"
 )
 

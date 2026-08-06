@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/skill"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
 	"gorm.io/gorm"
 )
 

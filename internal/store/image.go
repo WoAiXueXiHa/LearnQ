@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )

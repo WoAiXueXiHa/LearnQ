@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/rag"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
 )
 
 // Judgment 是一条人工相关性标注：ChunkID 指向某块，Relevance 为相关等级

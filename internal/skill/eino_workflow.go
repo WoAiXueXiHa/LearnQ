@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 	"github.com/cloudwego/eino/compose"
 )
 

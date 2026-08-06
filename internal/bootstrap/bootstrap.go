@@ -3,8 +3,8 @@ package bootstrap
 import (
 	"net/http"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/config"
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/config"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 	"github.com/go-redis/redis/v8"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"

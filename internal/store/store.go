@@ -10,7 +10,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
 	"gorm.io/gorm"
 )
 

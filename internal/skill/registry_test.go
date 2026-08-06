@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 )
 
 func TestRegistry(t *testing.T) {

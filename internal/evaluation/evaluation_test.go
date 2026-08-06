@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/rag"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
 )
 
 type fakeRetriever struct{}

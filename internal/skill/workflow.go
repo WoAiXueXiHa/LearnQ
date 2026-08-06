@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 )
 
 // WorkflowResult 汇总一次工作流的全部产出：路由顺序、各 Agent 输出、

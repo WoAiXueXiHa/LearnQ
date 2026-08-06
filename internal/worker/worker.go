@@ -12,14 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
-	"github.com/WoAiXueXiHa/LeranQ/internal/imagestore"
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/queue"
-	"github.com/WoAiXueXiHa/LeranQ/internal/report"
-	"github.com/WoAiXueXiHa/LeranQ/internal/skill"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
-	"github.com/WoAiXueXiHa/LeranQ/internal/trace"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
+	"github.com/WoAiXueXiHa/LearnQ/internal/report"
+	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/trace"
 )
 
 type Pool struct {

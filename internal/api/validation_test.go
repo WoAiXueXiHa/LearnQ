@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/api"
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/skill"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/api"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 )
 
 func validationHandler() http.Handler {

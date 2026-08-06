@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 

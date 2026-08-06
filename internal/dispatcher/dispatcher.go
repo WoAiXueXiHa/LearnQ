@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/queue"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 )
 
 // Run 启动 Outbox → Redis 的搬运循环，直到 ctx 取消。

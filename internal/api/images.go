@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+
 	// 两个 blank import 注册 image/jpeg 与 image/png 解码器，image.DecodeConfig 才有能力识别这两种格式。
 	_ "image/jpeg"
 	_ "image/png"
@@ -19,9 +20,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
-	"github.com/WoAiXueXiHa/LeranQ/internal/imagestore"
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
