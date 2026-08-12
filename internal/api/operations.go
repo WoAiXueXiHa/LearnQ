@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"regexp"
@@ -31,8 +30,11 @@ const (
 	maxMultipartBodyBytes = maxDocumentBytes + (1 << 20)
 	maxRAGRequestBytes    = 64 << 10
 	maxRAGQuestionRunes   = 2000
+	skillRequestTimeout   = 80 * time.Second
 	ragRequestTimeout     = 80 * time.Second
 )
+
+var citationPattern = regexp.MustCompile(`\[S([0-9]+)\]`)
 
 // dueReviews 是 GET /api/v1/review-tasks 的 due 快捷入口：固定 scope=due 后复用 reviewTasks。
 func (s *Server) dueReviews(c *gin.Context) {
@@ -177,6 +179,9 @@ func (s *Server) runSkill(c *gin.Context) {
 		return
 	}
 	started := time.Now()
+	requestCtx, cancel := context.WithTimeout(c.Request.Context(), skillRequestTimeout)
+	defer cancel()
+	workflowID := c.GetString("request_id")
 	if c.Param("name") == "multi-agent" {
 		// 多 Agent 每条成功路由单独落 trace，局部失败仍保留其他节点的可观察结果。
 		var workflowInput struct {
@@ -184,16 +189,24 @@ func (s *Server) runSkill(c *gin.Context) {
 		}
 		// 解析失败仅影响 modules 裁剪，忽略错误并退回默认路由集合。
 		_ = json.Unmarshal(body, &workflowInput)
-		result, runErr := s.skills.RunEinoWorkflow(c, workflowInput.Modules, body)
+		result, runErr := s.skills.RunEinoWorkflow(requestCtx, workflowInput.Modules, body)
 		runIDs := make(map[string]uint64, len(result.Routes))
 		for _, route := range result.Routes {
-			response, exists := result.Outputs[route]
+			response := result.Outputs[route]
+			definition, exists := s.skills.Get(route)
 			if !exists {
 				continue
 			}
-			definition, _ := s.skills.Get(route)
 			hash, _ := s.skills.PromptHash(route)
-			runID, recordErr := s.recorder.Record(c.Request.Context(), 0, definition, hash, string(body), response, time.Since(started), result.Tools[route], nil)
+			var routeErr error
+			if message := result.Errors[route]; message != "" {
+				routeErr = errors.New(message)
+			}
+			latency := result.Latencies[route]
+			if latency <= 0 {
+				latency = time.Since(started)
+			}
+			runID, recordErr := s.recorder.Record(context.Background(), 0, workflowID, definition, hash, string(body), response, latency, result.Tools[route], routeErr)
 			if recordErr != nil {
 				fail(c, 500, "INTERNAL_ERROR", "workflow trace could not be persisted", nil)
 				return
@@ -212,7 +225,7 @@ func (s *Server) runSkill(c *gin.Context) {
 		ok(c, 200, gin.H{"workflow": result, "agent_run_ids": runIDs})
 		return
 	}
-	output, executions, err := s.skills.RunDetailed(c, c.Param("name"), body)
+	output, executions, err := s.skills.RunDetailed(requestCtx, c.Param("name"), body)
 	if err != nil {
 		var dependencyErr *model.DependencyError
 		if errors.As(err, &dependencyErr) {
@@ -224,7 +237,7 @@ func (s *Server) runSkill(c *gin.Context) {
 	}
 	definition, _ := s.skills.Get(c.Param("name"))
 	hash, _ := s.skills.PromptHash(c.Param("name"))
-	runID, recordErr := s.recorder.Record(c.Request.Context(), 0, definition, hash, string(body), output, time.Since(started), executions, nil)
+	runID, recordErr := s.recorder.Record(context.Background(), 0, workflowID, definition, hash, string(body), output, time.Since(started), executions, nil)
 	if recordErr != nil {
 		fail(c, 500, "INTERNAL_ERROR", "trace could not be persisted", nil)
 		return
@@ -456,63 +469,35 @@ func (s *Server) ragQuery(c *gin.Context) {
 	if input.TopK <= 0 || input.TopK > 20 {
 		input.TopK = 5
 	}
-	var readyCount int64
-	if err := s.store.DB.Model(&domain.Document{}).Where("status='ready'").Count(&readyCount).Error; err != nil {
-		fail(c, 500, "INTERNAL_ERROR", "could not check ready documents", nil)
-		return
-	}
-	if readyCount == 0 {
-		fail(c, 404, "RAG_NO_EVIDENCE", "no ready document supports this question", nil)
-		return
-	}
-	if s.chat == nil || s.embedding == nil || s.vectors == nil {
+	if s.chat == nil || s.evidence == nil {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "RAG dependencies are not configured", nil)
 		return
 	}
 	requestCtx, cancel := context.WithTimeout(c.Request.Context(), ragRequestTimeout)
 	defer cancel()
-	vectors, err := s.embedding.Embed(requestCtx, []string{input.Question})
+	evidenceRows, err := s.evidence.Search(requestCtx, input.Question, input.TopK)
 	if err != nil {
-		failModelDependency(c, err)
-		return
-	}
-	if len(vectors) != 1 {
-		fail(c, 502, "AI_INVALID_RESPONSE", "embedding query returned an invalid vector count", nil)
-		return
-	}
-	hits, err := s.vectors.Hybrid(requestCtx, vectors[0], rag.Sparse(input.Question), input.TopK)
-	if err != nil {
-		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "Qdrant hybrid query failed", nil)
-		return
-	}
-	citations := make([]gin.H, 0, len(hits))
-	evidence := make([]map[string]any, 0, len(hits))
-	for _, hit := range hits {
-		// 不直接信任 Qdrant payload：回 MySQL 读取原文并确认文档仍为 ready，
-		// 以数据库状态封住索引/删除过程中的跨存储短暂不一致。
-		chunkID, _ := hit.Payload["chunk_id"].(string)
-		var chunk domain.DocumentChunk
-		result := s.store.DB.Table("document_chunks dc").Select("dc.*").Joins("JOIN documents d ON d.id=dc.document_id").Where("dc.id=? AND d.status='ready'", chunkID).Take(&chunk)
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			continue
+		var dependencyErr *model.DependencyError
+		if errors.As(err, &dependencyErr) {
+			failModelDependency(c, err)
+		} else {
+			fail(c, 503, "DEPENDENCY_UNAVAILABLE", "RAG retrieval failed", nil)
 		}
-		if result.Error != nil {
-			fail(c, 500, "INTERNAL_ERROR", "could not load retrieval evidence", nil)
-			return
-		}
-		rank := len(citations) + 1
-		source := fmt.Sprintf("S%d", rank)
-		citations = append(citations, gin.H{"source": source, "document_id": chunk.DocumentID, "chunk_id": chunk.ID, "title": chunk.Title, "start_line": chunk.StartLine, "end_line": chunk.EndLine, "summary": truncate(chunk.Content, 160), "rank": rank, "score": hit.Score})
-		evidence = append(evidence, map[string]any{
-			"source": source, "title": chunk.Title, "start_line": chunk.StartLine,
-			"end_line": chunk.EndLine, "content": chunk.Content,
-		})
+		return
 	}
-	if len(citations) == 0 {
+	if len(evidenceRows) == 0 {
 		fail(c, 404, "RAG_NO_EVIDENCE", "retrieval returned no valid ready-document evidence", nil)
 		return
 	}
-	modelInput, err := json.Marshal(gin.H{"question": input.Question, "evidence": evidence})
+	citations := make([]gin.H, 0, len(evidenceRows))
+	for rank, evidence := range evidenceRows {
+		citations = append(citations, gin.H{
+			"source": evidence.Source, "document_id": evidence.DocumentID, "chunk_id": evidence.ChunkID,
+			"title": evidence.Title, "start_line": evidence.StartLine, "end_line": evidence.EndLine,
+			"summary": truncate(evidence.Content, 160), "rank": rank + 1, "score": evidence.Score,
+		})
+	}
+	modelInput, err := json.Marshal(gin.H{"question": input.Question, "evidence": evidenceRows})
 	if err != nil {
 		fail(c, 500, "INTERNAL_ERROR", "could not prepare RAG evidence", nil)
 		return
@@ -539,23 +524,30 @@ func (s *Server) ragQuery(c *gin.Context) {
 		fail(c, 502, "AI_INVALID_RESPONSE", "model returned an invalid RAG answer", nil)
 		return
 	}
-	references := regexp.MustCompile(`\[S([0-9]+)\]`).FindAllStringSubmatch(generated.Answer, -1)
-	// 模型输出视为不可信数据：必须至少引用一条证据，且每个 [Sn] 都要落在本次候选范围内。
-	if len(references) == 0 {
-		fail(c, 502, "AI_INVALID_RESPONSE", "model answer contains no evidence citation", nil)
+	// 模型输出视为不可信数据：只保证引用编号存在且落在本次候选范围内，
+	// 不把格式校验误称为事实蕴含或语义正确性验证。
+	if err := validateCitationReferences(generated.Answer, len(citations)); err != nil {
+		fail(c, 502, "AI_INVALID_RESPONSE", err.Error(), nil)
 		return
-	}
-	for _, reference := range references {
-		index, _ := strconv.Atoi(reference[1])
-		if index < 1 || index > len(citations) {
-			fail(c, 502, "AI_INVALID_RESPONSE", "model answer contains an unknown evidence citation", nil)
-			return
-		}
 	}
 	ok(c, 200, gin.H{
 		"answer": generated.Answer, "citations": citations,
 		"retriever": "qdrant dense+sparse+rrf", "model": response.Model,
 	})
+}
+
+func validateCitationReferences(answer string, citationCount int) error {
+	references := citationPattern.FindAllStringSubmatch(answer, -1)
+	if len(references) == 0 {
+		return errors.New("model answer contains no evidence citation")
+	}
+	for _, reference := range references {
+		index, err := strconv.Atoi(reference[1])
+		if err != nil || index < 1 || index > citationCount {
+			return errors.New("model answer contains an unknown evidence citation")
+		}
+	}
+	return nil
 }
 
 // failModelDependency 把模型层错误映射为 HTTP 状态：可重试依赖故障 → 503，永久失败 → 502。
@@ -609,20 +601,23 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "retrieval dependencies are not configured", nil)
 		return
 	}
-	// 按具体实现类型区分真实与 fake embedding，评估结果中记录所用实现的类型标识（非真实模型名）。
-	_, real := s.embedding.(*model.OpenAICompatible)
-	result, err := evaluation.Run(c, cases, s.embedding, s.vectors, 5, real)
+	// 评估模式来自运行配置，而不是具体 Go 实现类型，避免替换真实 Provider 后被误标为 fake。
+	real := s.aiMode == "real"
+	result, err := evaluation.Run(c.Request.Context(), cases, s.embedding, s.vectors, 5, real)
 	if err != nil {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "evaluation retrieval failed", err.Error())
 		return
 	}
 	metrics, _ := json.Marshal(result.Retrievers)
 	report := evaluation.Markdown(result)
-	modelName := "learnq-fake-embedding-v1"
-	if real {
-		modelName = "openai-compatible"
+	datasetSum := sha256.Sum256(body)
+	configJSON, _ := json.Marshal(map[string]any{"dense_limit": 20, "sparse_limit": 20, "fusion": "rrf", "evaluation": "retrieval_only"})
+	row := map[string]any{
+		"mode": result.Mode, "dataset_version": hex.EncodeToString(datasetSum[:]),
+		"embedding_model": s.embeddingModel, "collection_name": s.ragCollection,
+		"top_k": result.TopK, "config_json": string(configJSON), "metrics_json": string(metrics),
+		"report_markdown": report, "status": "succeeded", "created_at": time.Now().UTC(),
 	}
-	row := map[string]any{"mode": result.Mode, "dataset_version": "v1", "embedding_model": modelName, "collection_name": "learnq_chunks", "top_k": result.TopK, "config_json": `{"dense_limit":20,"sparse_limit":20,"fusion":"rrf"}`, "metrics_json": string(metrics), "report_markdown": report, "status": "succeeded", "created_at": time.Now().UTC()}
 	if err := s.store.DB.Table("rag_evaluations").Create(row).Error; err != nil {
 		fail(c, 500, "INTERNAL_ERROR", "evaluation result could not be saved", nil)
 		return

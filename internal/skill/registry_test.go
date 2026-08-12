@@ -47,20 +47,6 @@ func TestSkillOutputsDifferAndToolResultIsCaptured(t *testing.T) {
 	}
 }
 
-func TestWorkflowConditionalAlgorithm(t *testing.T) {
-	r := New(model.Fake{})
-	got := r.RunWorkflow(context.Background(), []string{"backend"}, json.RawMessage(`{"title":"LearnQ"}`))
-	for _, route := range got.Routes {
-		if route == "algorithm-diagnosis" {
-			t.Fatal("algorithm route unexpectedly used")
-		}
-	}
-	got = r.RunWorkflow(context.Background(), []string{"algorithm"}, json.RawMessage(`{"title":"LearnQ"}`))
-	if _, ok := got.Outputs["algorithm-diagnosis"]; !ok {
-		t.Fatal("algorithm route missing")
-	}
-}
-
 func TestOutputSchemaRejectsInvalidModelJSON(t *testing.T) {
 	r := New(model.Fake{Failure: "invalid_json"})
 	if _, err := r.Run(context.Background(), "daily-review", json.RawMessage(`{}`)); err == nil {

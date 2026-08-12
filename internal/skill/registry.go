@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/cloudwego/eino/compose"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -30,12 +32,15 @@ type Definition struct {
 
 type Registry struct {
 	// AllowedTools 是每个 Skill 的显式能力白名单；模型只消费工具结果，不自行选择任意函数。
-	definitions  map[string]Definition
-	model        model.ChatModel
-	inputSchema  *jsonschema.Schema
-	outputSchema *jsonschema.Schema
-	outputJSON   json.RawMessage
-	tools        map[string]ToolFunc
+	definitions   map[string]Definition
+	model         model.ChatModel
+	inputSchema   *jsonschema.Schema
+	outputSchema  *jsonschema.Schema
+	outputJSON    json.RawMessage
+	tools         map[string]ToolFunc
+	einoMu        sync.Mutex
+	einoRunnables map[string]compose.Runnable[einoInput, WorkflowResult]
+	einoErrors    map[string]error
 }
 
 // ToolExecution 记录一次工具调用的完整现场（请求、结果、引用、耗时、错误），
@@ -62,7 +67,11 @@ func New(chat model.ChatModel) *Registry {
 		{"project-explanation", "1.0.0", "组织项目讲解", "v1", "v1", "Interview", []string{"rag_query"}},
 		{"weekly-plan", "1.0.0", "解释 SQL 周统计并组织计划", "v1", "v1", "Planner", []string{"weekly_stats"}},
 	}
-	r := &Registry{definitions: make(map[string]Definition), model: chat, tools: make(map[string]ToolFunc)}
+	r := &Registry{
+		definitions: make(map[string]Definition), model: chat, tools: make(map[string]ToolFunc),
+		einoRunnables: make(map[string]compose.Runnable[einoInput, WorkflowResult]),
+		einoErrors:    make(map[string]error),
+	}
 	for _, def := range defs {
 		r.definitions[def.Name] = def
 	}

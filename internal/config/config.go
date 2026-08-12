@@ -84,8 +84,18 @@ func Load() Config {
 	}
 }
 
-// 在进程启动阶段集中失败，避免任务领取后才发现密钥或 URL 配置不可用。
-func (c Config) Validate() error {
+// Validate 保留完整校验语义，兼容需要同时运行所有 AI 能力的调用方。
+func (c Config) Validate() error { return c.validate(true) }
+
+// ValidateAPI 校验 API 进程实际需要的配置。Vision 只由 Worker 使用，
+// 因此视觉服务故障或未配置不应阻止核心 API 启动。
+func (c Config) ValidateAPI() error { return c.validate(false) }
+
+// ValidateWorker 校验 Worker 承载的完整 AI 能力。
+func (c Config) ValidateWorker() error { return c.validate(true) }
+
+// validate 在进程启动阶段集中失败，避免任务领取后才发现密钥或 URL 配置不可用。
+func (c Config) validate(requireVision bool) error {
 	// 不区分模型，所有模式可用
 	if c.EmbeddingDim <= 0 {
 		return fmt.Errorf("EMBEDDING_DIM must be a positive integer")
@@ -106,16 +116,19 @@ func (c Config) Validate() error {
 	case "real":
 		missing := make([]string, 0, 9)
 		// 减少 if 重复代码，以后新加入字段只需要在 map 里加一行就行
-		for key, value := range map[string]string{
+		required := map[string]string{
 			"AI_CHAT_BASE_URL":      c.AIChatBaseURL,
 			"AI_CHAT_API_KEY":       c.AIChatAPIKey,
 			"AI_CHAT_MODEL":         c.AIChatModel,
 			"AI_EMBEDDING_BASE_URL": c.AIEmbeddingBaseURL,
 			"AI_EMBEDDING_API_KEY":  c.AIEmbeddingAPIKey,
 			"AI_EMBEDDING_MODEL":    c.AIEmbeddingModel,
-			"AI_VISION_BASE_URL":    c.AIVisionBaseURL,
-			"AI_VISION_MODEL":       c.AIVisionModel,
-		} {
+		}
+		if requireVision {
+			required["AI_VISION_BASE_URL"] = c.AIVisionBaseURL
+			required["AI_VISION_MODEL"] = c.AIVisionModel
+		}
+		for key, value := range required {
 			if strings.TrimSpace(value) == "" {
 				missing = append(missing, key)
 			}
@@ -123,24 +136,29 @@ func (c Config) Validate() error {
 		if len(missing) > 0 {
 			return fmt.Errorf("real AI mode requires %s", strings.Join(missing, ", "))
 		}
-		// 视觉配置按 provider 分叉校验：ollama 原生接口依赖上下文长度，openai 兼容接口依赖 API key。
-		// 注意 AIVisionAPIKey 在 ollama 分支有 "ollama" 默认值，因此只对 openai 分支强制检查。
-		if c.AIVisionProvider != "ollama" && c.AIVisionProvider != "openai" {
-			return fmt.Errorf("AI_VISION_PROVIDER must be ollama or openai")
-		}
-		if c.AIVisionProvider == "ollama" && c.AIVisionContext <= 0 {
-			return fmt.Errorf("AI_VISION_CONTEXT_LENGTH must be a positive integer")
-		}
-		if c.AIVisionProvider == "openai" && strings.TrimSpace(c.AIVisionAPIKey) == "" {
-			return fmt.Errorf("real AI mode with openai vision requires AI_VISION_API_KEY")
+		if requireVision {
+			// 视觉配置按 provider 分叉校验：ollama 原生接口依赖上下文长度，openai 兼容接口依赖 API key。
+			// 注意 AIVisionAPIKey 在 ollama 分支有 "ollama" 默认值，因此只对 openai 分支强制检查。
+			if c.AIVisionProvider != "ollama" && c.AIVisionProvider != "openai" {
+				return fmt.Errorf("AI_VISION_PROVIDER must be ollama or openai")
+			}
+			if c.AIVisionProvider == "ollama" && c.AIVisionContext <= 0 {
+				return fmt.Errorf("AI_VISION_CONTEXT_LENGTH must be a positive integer")
+			}
+			if c.AIVisionProvider == "openai" && strings.TrimSpace(c.AIVisionAPIKey) == "" {
+				return fmt.Errorf("real AI mode with openai vision requires AI_VISION_API_KEY")
+			}
 		}
 		// url.Parse 对无协议前缀的字符串很宽容（如 "localhost:11434" 会被解析为 scheme=localhost、无 host），
 		// 必须显式要求 http(s) 且带主机名，否则下游会以非预期根地址发起请求。
-		for key, value := range map[string]string{
+		urls := map[string]string{
 			"AI_CHAT_BASE_URL":      c.AIChatBaseURL,
 			"AI_EMBEDDING_BASE_URL": c.AIEmbeddingBaseURL,
-			"AI_VISION_BASE_URL":    c.AIVisionBaseURL,
-		} {
+		}
+		if requireVision {
+			urls["AI_VISION_BASE_URL"] = c.AIVisionBaseURL
+		}
+		for key, value := range urls {
 			parsed, err := url.Parse(value)
 			if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 				return fmt.Errorf("%s must be an absolute http(s) URL", key)

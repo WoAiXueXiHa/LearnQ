@@ -32,11 +32,11 @@ type Case struct {
 	Difficulty     string     `json:"difficulty"`
 }
 
-// Scores 汇总单个检索器的一组指标，均为所有用例的平均值。
+// Scores 汇总单个检索器的一组检索指标，均为所有用例的平均值。
 type Scores struct {
-	RecallAtK        float64 `json:"recall_at_k"`
-	NDCG             float64 `json:"ndcg"`
-	CitationCoverage float64 `json:"citation_coverage"`
+	RecallAtK         float64 `json:"recall_at_k"`
+	NDCG              float64 `json:"ndcg"`
+	RetrievalCoverage float64 `json:"retrieval_coverage"`
 }
 
 // Report 是一次评估运行的整体结果：Mode 区分 pipeline_test 与 retrieval_benchmark，
@@ -116,7 +116,7 @@ func Run(ctx context.Context, cases []Case, embedding model.EmbeddingModel, retr
 		if groups["hybrid-rrf"], err = retriever.Hybrid(ctx, vectors[0], sparse, topK); err != nil {
 			return report, err
 		}
-		// relevant 带等级供 Recall/NDCG 使用，required 是纯 ID 列表供引用覆盖率使用。
+		// relevant 带等级供 Recall/NDCG 使用，required 是纯 ID 列表供检索覆盖率使用。
 		relevant := map[string]int{}
 		required := make([]string, len(item.RelevantChunks))
 		for index, judgment := range item.RelevantChunks {
@@ -127,14 +127,14 @@ func Run(ctx context.Context, cases []Case, embedding model.EmbeddingModel, retr
 			ids := hitIDs(hits)
 			sums[name].recall += rag.RecallAtK(ids, relevant, topK)
 			sums[name].ndcg += rag.NDCGAtK(ids, relevant, topK)
-			sums[name].coverage += rag.CitationCoverage(required, ids)
+			sums[name].coverage += rag.RetrievalCoverage(required, ids)
 		}
 	}
 	// 用例数大于 0 才落均值，空数据集保留空得分映射而不是除零。
 	if len(cases) > 0 {
 		for name, value := range sums {
 			n := float64(len(cases))
-			report.Retrievers[name] = Scores{RecallAtK: value.recall / n, NDCG: value.ndcg / n, CitationCoverage: value.coverage / n}
+			report.Retrievers[name] = Scores{RecallAtK: value.recall / n, NDCG: value.ndcg / n, RetrievalCoverage: value.coverage / n}
 		}
 	}
 	report.Runtime = time.Since(started)
@@ -157,10 +157,10 @@ func hitIDs(hits []rag.Hit) []string {
 func Markdown(report Report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# RAG 离线评估\n\n模式：%s\n\n数据集：%d 条；Top K：%d；运行时间：%s\n\n", report.Mode, report.DatasetSize, report.TopK, report.Runtime)
-	b.WriteString("| retriever | Recall@K | NDCG | 引用覆盖率 |\n|---|---:|---:|---:|\n")
+	b.WriteString("| retriever | Recall@K | NDCG | 检索覆盖率 |\n|---|---:|---:|---:|\n")
 	for _, name := range []string{"dense-only", "sparse-only", "hybrid-rrf"} {
 		score := report.Retrievers[name]
-		fmt.Fprintf(&b, "| %s | %.4f | %.4f | %.4f |\n", name, score.RecallAtK, score.NDCG, score.CitationCoverage)
+		fmt.Fprintf(&b, "| %s | %.4f | %.4f | %.4f |\n", name, score.RecallAtK, score.NDCG, score.RetrievalCoverage)
 	}
 	return b.String()
 }

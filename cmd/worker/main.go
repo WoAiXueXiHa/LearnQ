@@ -23,14 +23,14 @@ import (
 	"github.com/WoAiXueXiHa/LearnQ/internal/worker"
 )
 
-// main 是 Worker 进程入口：加载校验配置，预检 MySQL/Redis/Qdrant，启动心跳、
+// main 是 Worker 进程入口：加载校验配置，预检 MySQL/Redis，启动心跳、
 // Dispatcher、Reaper/Reconciler 与 Worker Pool 四个后台循环；收到 SIGINT/SIGTERM 后
 // 停止领取新任务，在 SHUTDOWN_GRACE 宽限期内等已领取任务落库，逾期直接退出，遗留任务由下次启动的 Reaper 接管。
 func main() {
 	// Worker 同时承载 Outbox 投递、故障恢复和任务执行；MySQL 始终是状态真相源，
 	// Redis 仅保存可从数据库重建的就绪/处理中索引。
 	cfg := config.Load()
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateWorker(); err != nil {
 		slog.Error("config", "error", err)
 		os.Exit(1)
 	}
@@ -100,16 +100,9 @@ func main() {
 	chat, embedding := bootstrap.Models(cfg)
 	// 该客户端同时用于集合校验与文档索引写入，超时固定 10 秒，与任务执行超时相互独立。
 	vectors := rag.Qdrant{BaseURL: cfg.QdrantURL, Collection: cfg.RAGCollection, Client: &http.Client{Timeout: 10 * time.Second}}
-	collectionCtx, collectionCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	// 启动时校验向量维度，尽早暴露“模型维度与既有集合不一致”，避免索引到一半才失败。
-	if err := vectors.EnsureCollection(collectionCtx, cfg.EmbeddingDim); err != nil {
-		collectionCancel()
-		logger.Error("qdrant collection", "error", err)
-		os.Exit(1)
-	}
-	collectionCancel()
 	registry := skill.New(chat)
-	tools := agenttool.Service{DB: db, Embedding: embedding, Vectors: vectors}
+	evidence := &rag.EvidenceService{DB: db, Embedding: embedding, Vectors: vectors}
+	tools := agenttool.Service{DB: db, Evidence: evidence}
 	registry.RegisterTool("weekly_stats", tools.WeeklyStats)
 	registry.RegisterTool("rag_query", tools.RAGQuery)
 	// 通过 With* 选项装配 Pool：WithTiming 注入任务超时与租约，WithVision/WithSkills/WithIndexer

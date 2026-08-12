@@ -19,15 +19,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/api"
-	"github.com/WoAiXueXiHa/LeranQ/internal/bootstrap"
-	"github.com/WoAiXueXiHa/LeranQ/internal/config"
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
-	"github.com/WoAiXueXiHa/LeranQ/internal/imagestore"
-	"github.com/WoAiXueXiHa/LeranQ/internal/migrate"
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/skill"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/api"
+	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
+	"github.com/WoAiXueXiHa/LearnQ/internal/config"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
+	"github.com/WoAiXueXiHa/LearnQ/internal/migrate"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 )
 
 type fixture struct {
@@ -301,8 +301,8 @@ func TestDocumentValidationAndRAGNoEvidence(t *testing.T) {
 		t.Fatalf("empty document list must be an array: status=%d body=%s", list.Code, list.Body)
 	}
 	noEvidence := request(t, f, http.MethodPost, "/api/v1/rag/query", `{"question":"不存在的证据"}`, map[string]string{"Content-Type": "application/json"})
-	if noEvidence.Code != http.StatusNotFound || !strings.Contains(noEvidence.Body.String(), "RAG_NO_EVIDENCE") {
-		t.Fatalf("no evidence=%d %s", noEvidence.Code, noEvidence.Body)
+	if noEvidence.Code != http.StatusServiceUnavailable || !strings.Contains(noEvidence.Body.String(), "DEPENDENCY_UNAVAILABLE") {
+		t.Fatalf("rag dependency=%d %s", noEvidence.Code, noEvidence.Body)
 	}
 	for _, item := range []struct {
 		name, content string

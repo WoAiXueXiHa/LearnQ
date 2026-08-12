@@ -34,7 +34,7 @@ func TestMetrics(t *testing.T) {
 	if got := NDCGAtK([]string{"a", "b"}, rel, 2); got < .99 {
 		t.Fatalf("ndcg=%v", got)
 	}
-	if got := CitationCoverage([]string{"a", "b"}, []string{"a"}); got != .5 {
+	if got := RetrievalCoverage([]string{"a", "b"}, []string{"a"}); got != .5 {
 		t.Fatalf("coverage=%v", got)
 	}
 }

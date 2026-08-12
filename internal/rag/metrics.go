@@ -63,15 +63,15 @@ func NDCGAtK(results []string, relevant map[string]int, k int) float64 {
 	return dcg / idcg
 }
 
-// CitationCoverage 计算必须引用的块被检索候选集覆盖的比例；无标注引用时按满分 1 处理。
-func CitationCoverage(required, cited []string) float64 {
-	// 引用覆盖率关注标注证据是否进入候选集，与生成答案的语言质量解耦。
+// RetrievalCoverage 计算标注块被检索候选集覆盖的比例；它不评价生成答案的引用质量。
+func RetrievalCoverage(required, retrieved []string) float64 {
+	// 检索覆盖率关注标注证据是否进入候选集，与生成答案的语言质量解耦。
 	// 没有必须引用的标注时视为全覆盖，避免空集被记 0 分。
 	if len(required) == 0 {
 		return 1
 	}
 	set := map[string]bool{}
-	for _, id := range cited {
+	for _, id := range retrieved {
 		set[id] = true
 	}
 	found := 0

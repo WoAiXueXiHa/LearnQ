@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/bootstrap"
-	"github.com/WoAiXueXiHa/LeranQ/internal/config"
-	"github.com/WoAiXueXiHa/LeranQ/internal/migrate"
-	"github.com/WoAiXueXiHa/LeranQ/internal/model"
-	"github.com/WoAiXueXiHa/LeranQ/internal/skill"
-	"github.com/WoAiXueXiHa/LeranQ/internal/trace"
+	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
+	"github.com/WoAiXueXiHa/LearnQ/internal/config"
+	"github.com/WoAiXueXiHa/LearnQ/internal/migrate"
+	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
+	"github.com/WoAiXueXiHa/LearnQ/internal/trace"
 )
 
 func TestRecorderHonorsCanceledContext(t *testing.T) {
@@ -38,7 +38,7 @@ func TestRecorderHonorsCanceledContext(t *testing.T) {
 	definition, _ := skill.New(model.Fake{}).Get("daily-review")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = (trace.Recorder{DB: db}).Record(ctx, 0, definition, "hash", `{}`,
+	_, err = (trace.Recorder{DB: db}).Record(ctx, 0, "integration", definition, "hash", `{}`,
 		model.ChatResponse{Content: `{}`, Model: "fake"}, time.Millisecond, nil, nil)
 	if err == nil {
 		t.Fatal("canceled trace context was ignored")

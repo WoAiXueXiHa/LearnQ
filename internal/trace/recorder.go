@@ -12,7 +12,7 @@ import (
 
 type Recorder struct{ DB *gorm.DB }
 
-func (r Recorder) Record(ctx context.Context, taskID uint64, definition skill.Definition, promptHash, input string, response model.ChatResponse, latency time.Duration, executions []skill.ToolExecution, runErr error) (uint64, error) {
+func (r Recorder) Record(ctx context.Context, taskID uint64, workflowID string, definition skill.Definition, promptHash, input string, response model.ChatResponse, latency time.Duration, executions []skill.ToolExecution, runErr error) (uint64, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	// trace 是旁路数据，5s 独立超时避免它拖累主任务的结果持久化。
@@ -23,7 +23,7 @@ func (r Recorder) Record(ctx context.Context, taskID uint64, definition skill.De
 		reason = runErr.Error()
 	}
 	run := map[string]any{
-		"task_id": taskID, "skill_name": definition.Name, "skill_version": definition.Version,
+		"task_id": taskID, "workflow_id": workflowID, "skill_name": definition.Name, "skill_version": definition.Version,
 		"prompt_version": definition.PromptVersion, "prompt_hash": promptHash, "schema_version": definition.SchemaVersion,
 		"model_name": response.Model, "input_summary": truncate(input, 500), "output_json": response.Content,
 		"input_tokens": response.InputTokens, "output_tokens": response.OutputTokens, "latency_ms": latency.Milliseconds(),

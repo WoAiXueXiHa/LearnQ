@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/bootstrap"
-	"github.com/WoAiXueXiHa/LeranQ/internal/config"
-	"github.com/WoAiXueXiHa/LeranQ/internal/domain"
-	"github.com/WoAiXueXiHa/LeranQ/internal/migrate"
-	"github.com/WoAiXueXiHa/LeranQ/internal/queue"
-	"github.com/WoAiXueXiHa/LeranQ/internal/recovery"
-	"github.com/WoAiXueXiHa/LeranQ/internal/store"
+	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
+	"github.com/WoAiXueXiHa/LearnQ/internal/config"
+	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
+	"github.com/WoAiXueXiHa/LearnQ/internal/migrate"
+	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
+	"github.com/WoAiXueXiHa/LearnQ/internal/recovery"
+	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 	"github.com/go-redis/redis/v8"
 )
 

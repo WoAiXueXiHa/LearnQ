@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/WoAiXueXiHa/LeranQ/internal/queue"
+	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
 	"github.com/go-redis/redis/v8"
 )
 

@@ -188,7 +188,7 @@ func (p *Pool) claimAndRun(parent context.Context) {
 			var runErr error
 			response, executions, runErr = p.skills.RunDetailed(ctx, "daily-review", input)
 			err = runErr
-			if _, traceErr := p.trace.Record(context.Background(), task.ID, definition, hash, string(input), response, time.Since(started), executions, runErr); traceErr != nil {
+			if _, traceErr := p.trace.Record(context.Background(), task.ID, fmt.Sprintf("task:%d", task.ID), definition, hash, string(input), response, time.Since(started), executions, runErr); traceErr != nil {
 				p.log.Error("trace persist failed", "task_id", task.ID, "error", traceErr)
 			}
 		}

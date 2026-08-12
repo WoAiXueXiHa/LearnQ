@@ -18,6 +18,7 @@ import (
 	"github.com/WoAiXueXiHa/LearnQ/internal/evaluation"
 	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
 	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
 	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
 	"github.com/WoAiXueXiHa/LearnQ/internal/store"
 	"github.com/WoAiXueXiHa/LearnQ/internal/trace"
@@ -36,6 +37,7 @@ type Server struct {
 	chat       model.ChatModel
 	imageStore *imagestore.Store
 	embedding  model.EmbeddingModel
+	evidence   *rag.EvidenceService
 	vectors    interface {
 		evaluation.Retriever
 		DeleteDocument(context.Context, uint64) error
@@ -47,6 +49,7 @@ type Server struct {
 	chatModel      string
 	visionModel    string
 	embeddingModel string
+	ragCollection  string
 }
 
 // 学习记录写入的硬性上限：请求体 1 MiB、标题 255 rune、摘要与模块内容各 32 KiB、
@@ -79,7 +82,12 @@ func WithRAG(chat model.ChatModel, embedding model.EmbeddingModel, vectors inter
 		server.chat = chat
 		server.embedding = embedding
 		server.vectors = vectors
+		server.evidence = &rag.EvidenceService{DB: server.store.DB, Embedding: embedding, Vectors: vectors}
 	}
+}
+
+func WithEvidence(evidence *rag.EvidenceService) Option {
+	return func(server *Server) { server.evidence = evidence }
 }
 
 func WithHealthChecks(redisCheck, qdrantCheck func(context.Context) error) Option {
@@ -108,10 +116,15 @@ func WithRuntimeInfo(mode, chatModel, visionModel, embeddingModel string) Option
 	}
 }
 
+func WithRAGMetadata(collection string) Option {
+	return func(server *Server) { server.ragCollection = collection }
+}
+
 // New 组装 Server：开启 ReleaseMode，应用 Option 注入，挂载 Recovery 与 requestID 中间件后注册路由。
 func New(s *store.Store, skills *skill.Registry, options ...Option) *Server {
 	gin.SetMode(gin.ReleaseMode)
 	server := &Server{store: s, skills: skills, engine: gin.New(), recorder: trace.Recorder{DB: s.DB}}
+	server.engine.ContextWithFallback = true
 	for _, option := range options {
 		option(server)
 	}
@@ -190,14 +203,15 @@ func (s *Server) routes() {
 	v1.GET("/analytics/weekly", s.weekly)
 }
 
-// ready 是就绪探针：逐项探测 MySQL/Redis/Qdrant/Worker 心跳，任一不可用即返回 503 与明细。
+// ready 是就绪探针：MySQL、Redis 和 Worker 是核心链路依赖；Qdrant 作为 RAG 可选能力单独报告状态。
 func (s *Server) ready(c *gin.Context) {
 	// live 只回答进程是否存活；ready 才检查接流量所需依赖和 Worker 心跳。
 	// 每项独立设置短超时，防止单个故障依赖拖住整个探针。
 	dependencies := gin.H{"mysql": "ok", "redis": "not_configured", "qdrant": "not_configured", "worker": "not_configured"}
 	unavailable := make([]string, 0, 4)
 	sqlDB, err := s.store.DB.DB()
-	mysqlCtx, mysqlCancel := context.WithTimeout(c, 2*time.Second)
+	requestCtx := c.Request.Context()
+	mysqlCtx, mysqlCancel := context.WithTimeout(requestCtx, 2*time.Second)
 	if err != nil || sqlDB.PingContext(mysqlCtx) != nil {
 		dependencies["mysql"] = "unavailable"
 		unavailable = append(unavailable, "mysql")
@@ -205,7 +219,7 @@ func (s *Server) ready(c *gin.Context) {
 	mysqlCancel()
 	if s.redisCheck != nil {
 		dependencies["redis"] = "ok"
-		checkCtx, cancel := context.WithTimeout(c, 2*time.Second)
+		checkCtx, cancel := context.WithTimeout(requestCtx, 2*time.Second)
 		if err := s.redisCheck(checkCtx); err != nil {
 			dependencies["redis"] = "unavailable"
 			unavailable = append(unavailable, "redis")
@@ -214,16 +228,15 @@ func (s *Server) ready(c *gin.Context) {
 	}
 	if s.qdrantCheck != nil {
 		dependencies["qdrant"] = "ok"
-		checkCtx, cancel := context.WithTimeout(c, 2*time.Second)
+		checkCtx, cancel := context.WithTimeout(requestCtx, 2*time.Second)
 		if err := s.qdrantCheck(checkCtx); err != nil {
 			dependencies["qdrant"] = "unavailable"
-			unavailable = append(unavailable, "qdrant")
 		}
 		cancel()
 	}
 	if s.workerCheck != nil {
 		dependencies["worker"] = "ok"
-		checkCtx, cancel := context.WithTimeout(c, 2*time.Second)
+		checkCtx, cancel := context.WithTimeout(requestCtx, 2*time.Second)
 		alive, err := s.workerCheck(checkCtx)
 		cancel()
 		if err != nil || !alive {
@@ -242,6 +255,7 @@ func (s *Server) ready(c *gin.Context) {
 		"runtime": gin.H{
 			"mode": s.aiMode, "chat_model": s.chatModel,
 			"vision_model": s.visionModel, "embedding_model": s.embeddingModel,
+			"rag_collection": s.ragCollection,
 		},
 	})
 }

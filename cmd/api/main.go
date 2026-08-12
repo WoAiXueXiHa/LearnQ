@@ -27,7 +27,7 @@ func main() {
 	// API 进程只负责同步请求、查询与依赖探活，不在请求协程中执行耗时 AI 任务。
 	// 学习报告和文档索引统一写入任务表，由独立 Worker 消费，避免模型延迟拖垮 HTTP 服务。
 	cfg := config.Load()
-	if err := cfg.Validate(); err != nil {
+	if err := cfg.ValidateAPI(); err != nil {
 		slog.Error("config", "error", err)
 		os.Exit(1)
 	}
@@ -49,7 +49,8 @@ func main() {
 	defer redisClient.Close()
 	taskQueue := queue.New(redisClient)
 	registry := skill.New(chat)
-	tools := agenttool.Service{DB: db, Embedding: embedding, Vectors: vectors}
+	evidence := &rag.EvidenceService{DB: db, Embedding: embedding, Vectors: vectors}
+	tools := agenttool.Service{DB: db, Evidence: evidence}
 	registry.RegisterTool("weekly_stats", tools.WeeklyStats)
 	registry.RegisterTool("rag_query", tools.RAGQuery)
 	runtimeChatModel, runtimeVisionModel, runtimeEmbeddingModel :=
@@ -62,9 +63,10 @@ func main() {
 		runtimeEmbeddingModel = "learnq-fake-embedding-v1"
 	}
 	// 组装 API Handler，注入数据库、模型、向量库、队列和工具函数
-	handler := api.New(store.New(db), registry, api.WithRAG(chat, embedding, vectors),
+	handler := api.New(store.New(db), registry, api.WithRAG(chat, embedding, vectors), api.WithEvidence(evidence),
 		api.WithImageStore(imagestore.New(cfg.ImageDir)),
 		api.WithRuntimeInfo(cfg.AIMode, runtimeChatModel, runtimeVisionModel, runtimeEmbeddingModel),
+		api.WithRAGMetadata(cfg.RAGCollection),
 		// 依赖探活：Redis ping 与 Qdrant Ready 都通过才认为就绪。
 		api.WithHealthChecks(func(ctx context.Context) error {
 			return redisClient.Ping(ctx).Err()

@@ -42,6 +42,13 @@ func TestValidateAIMode(t *testing.T) {
 	if err := real.Validate(); err != nil {
 		t.Fatal(err)
 	}
+	apiOnly := real
+	apiOnly.AIVisionBaseURL = ""
+	apiOnly.AIVisionModel = ""
+	apiOnly.AIVisionProvider = ""
+	if err := apiOnly.ValidateAPI(); err != nil {
+		t.Fatalf("API validation should not require vision: %v", err)
+	}
 	real.AIEmbeddingBaseURL = "not-a-url"
 	if err := real.Validate(); err == nil || !strings.Contains(err.Error(), "AI_EMBEDDING_BASE_URL") {
 		t.Fatalf("invalid URL accepted err=%v", err)
