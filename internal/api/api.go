@@ -17,6 +17,7 @@ import (
 	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
 	"github.com/WoAiXueXiHa/LearnQ/internal/evaluation"
 	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
+	appmetrics "github.com/WoAiXueXiHa/LearnQ/internal/metrics"
 	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
 	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
@@ -45,6 +46,8 @@ type Server struct {
 	redisCheck     func(context.Context) error
 	qdrantCheck    func(context.Context) error
 	workerCheck    func(context.Context) (bool, error)
+	queueDepth     func(context.Context) (int64, int64, error)
+	metrics        *appmetrics.Recorder
 	aiMode         string
 	chatModel      string
 	visionModel    string
@@ -103,6 +106,13 @@ func WithWorkerCheck(check func(context.Context) (bool, error)) Option {
 	}
 }
 
+func WithOperationalMetrics(recorder *appmetrics.Recorder, queueDepth func(context.Context) (int64, int64, error)) Option {
+	return func(server *Server) {
+		server.metrics = recorder
+		server.queueDepth = queueDepth
+	}
+}
+
 func WithImageStore(images *imagestore.Store) Option {
 	return func(server *Server) { server.imageStore = images }
 }
@@ -128,7 +138,7 @@ func New(s *store.Store, skills *skill.Registry, options ...Option) *Server {
 	for _, option := range options {
 		option(server)
 	}
-	server.engine.Use(gin.Recovery(), requestID())
+	server.engine.Use(gin.Recovery(), requestID(), metricMiddleware(server.metrics))
 	server.routes()
 	return server
 }
@@ -137,18 +147,36 @@ func (s *Server) Handler() http.Handler { return s.engine }
 
 // requestID 中间件：request id 写入 gin.Context 并回写 X-Request-ID 响应头，响应体中的 request_id 复用同一标识。
 func requestID() gin.HandlerFunc {
-	// 优先透传调用方 request id，便于跨服务串联日志；缺失时生成本地随机标识。
+	// workflow_id 列上限为 64；只透传可安全用于日志和数据库关联的 ASCII 标识。
 	return func(c *gin.Context) {
-		id := c.GetHeader("X-Request-ID")
-		if id == "" {
+		id := strings.TrimSpace(c.GetHeader("X-Request-ID"))
+		if !validRequestID(id) {
 			var raw [12]byte
-			_, _ = rand.Read(raw[:])
-			id = hex.EncodeToString(raw[:])
+			if _, err := rand.Read(raw[:]); err == nil {
+				id = hex.EncodeToString(raw[:])
+			} else {
+				id = strconv.FormatInt(time.Now().UTC().UnixNano(), 36)
+			}
 		}
 		c.Set("request_id", id)
 		c.Header("X-Request-ID", id)
 		c.Next()
 	}
+}
+
+func validRequestID(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == ':' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // ok 统一成功响应格式：{"data":…,"request_id":…}，保证所有接口响应结构一致。
@@ -168,6 +196,7 @@ func (s *Server) routes() {
 	r.GET("/static/*filepath", gin.WrapH(web.Handler()))
 	r.GET("/health/live", func(c *gin.Context) { ok(c, 200, gin.H{"status": "live"}) })
 	r.GET("/health/ready", s.ready)
+	r.GET("/metrics", s.prometheusMetrics)
 	v1 := r.Group("/api/v1")
 	v1.POST("/study-records", s.createStudyRecord)
 	v1.GET("/study-records", s.listStudyRecords)
@@ -188,6 +217,7 @@ func (s *Server) routes() {
 	v1.POST("/documents", s.uploadDocument)
 	v1.GET("/documents", s.listDocuments)
 	v1.GET("/documents/:id/status", s.documentStatus)
+	v1.POST("/documents/:id/reindex", s.reindexDocument)
 	v1.DELETE("/documents/:id", s.deleteDocument)
 	v1.POST("/images", s.uploadImage)
 	v1.GET("/images", s.listImages)

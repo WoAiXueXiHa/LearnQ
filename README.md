@@ -11,9 +11,9 @@ LearnQ 是一个面向个人学习复盘的本地 AI 应用。用户提交一次
 - 学习记录：记录主题、摘要、学习时长和模块内容，支持幂等提交与重复记录识别。
 - AI 报告：通过异步任务生成结构化学习报告，并自动建立后续复习任务。
 - 延迟复习：查询到期和即将到期的任务，提交掌握程度或将复习延后一天。
-- 文档与 RAG：异步切分和索引 Markdown、TXT、JSON 文档，使用 dense、sparse 与 RRF 融合检索返回可核验引用。
+- 文档与 RAG：异步切分和索引 Markdown、TXT、JSON 文档，支持单文档重建、批量重建与 Qdrant 蓝绿切换，使用 dense、sparse 与 RRF 融合检索返回可核验引用。
 - Skill 工作台：运行版本化 Skill 和 Eino Compose Multi-Agent 实验，保存 Agent、Tool、耗时和 token 轨迹。
-- 运行状态：展示任务时间线、失败原因、报告、引用和依赖健康状态。
+- 运行状态：展示任务时间线、失败原因、报告、引用和依赖健康状态，并通过 /metrics 暴露队列、Outbox、租约、恢复、模型耗时和 token 指标。
 
 ## 系统架构
 
@@ -77,11 +77,17 @@ Redis Lua 脚本原子完成任务领取，lease token 隔离过期 Worker，gen
 
 ### Reaper 与 Reconciler
 
-Reaper 从 MySQL 扫描过期任务并推进重试或终止；Reconciler 根据事实状态补回 Redis 中缺失的任务并清理幽灵 processing 项，覆盖进程崩溃和瞬时依赖故障。
+Reaper 从 MySQL 分批扫描过期任务并推进重试或终止；Reconciler 使用持久游标分页补回 Redis 中缺失的任务并清理幽灵 processing 项，避免数据增长后每轮全量扫描，覆盖进程崩溃和瞬时依赖故障。
 
 ### 可核验的 AI 与 RAG
 
 系统保存 Skill、Agent、Tool 和任务尝试轨迹。RAG 同时使用语义向量与词法稀疏向量，回答必须引用本次召回到的来源；离线评估提供 Recall@K、NDCG 和引用覆盖率。
+
+### 可重建索引与轻量可观测性
+
+每个文档保存 index_version，单文档重建会创建新的 document_index 任务，旧任务和 attempt 保留用于审计。普通批量重建复用同一可靠队列；Embedding 升级还可先在新 Qdrant collection 中重算当前持久化 chunks，全部成功后一次性切换 alias，失败时旧索引继续服务。
+
+/metrics 直接输出 Prometheus 文本，覆盖任务状态、队列深度、未投递 Outbox、最老等待时间、过期租约、恢复动作、fencing 拒绝、HTTP/RAG/模型错误、模型耗时和 token。它是本地项目的轻量观测面，不包含告警平台或分布式 tracing 基础设施。
 
 ## 技术栈
 
@@ -99,7 +105,7 @@ Reaper 从 MySQL 扫描过期任务并推进重试或终止；Reconciler 根据�
 ```text
 .
 ├── .github/workflows/       # 仓库级 CI
-├── cmd/                     # migrate、api、worker 入口
+├── cmd/                     # migrate、api、worker、reindex 入口
 ├── internal/
 │   ├── api/                 # HTTP API 与读模型
 │   ├── store/               # MySQL 事务与任务状态

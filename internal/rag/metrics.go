@@ -5,21 +5,31 @@ import "math"
 // RecallAtK 计算前 K 个结果中相关块的占比：相关判定只看 relevant 值是否 >0，
 // 与等级无关；无相关标注时返回 0，k 超过结果数时按实际结果数截断。
 func RecallAtK(results []string, relevant map[string]int, k int) float64 {
-	// Recall@K 衡量相关块是否被找全，不关心它们在前 K 名中的具体顺序。
-	if len(relevant) == 0 {
+	// 分母只计算 relevance>0 的真实相关块；0 级 judgment 是显式负样本。
+	relevantCount := 0
+	for _, relevance := range relevant {
+		if relevance > 0 {
+			relevantCount++
+		}
+	}
+	if relevantCount == 0 || k <= 0 {
 		return 0
 	}
 	if k > len(results) {
 		k = len(results)
 	}
 	found := 0
+	seen := make(map[string]struct{}, k)
 	for _, id := range results[:k] {
-		// 只要标注过即算命中（relevant 值 >0），等级高低不影响 Recall 结果。
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
 		if relevant[id] > 0 {
 			found++
 		}
 	}
-	return float64(found) / float64(len(relevant))
+	return float64(found) / float64(relevantCount)
 }
 
 // NDCGAtK 按排名位置折扣累加相关性得分，再除以理想排序的对应累加值，

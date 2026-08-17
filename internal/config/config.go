@@ -109,6 +109,9 @@ func (c Config) validate(requireVision bool) error {
 	if c.TaskTimeout <= 0 || c.LeaseDuration <= c.TaskTimeout {
 		return fmt.Errorf("LEASE_DURATION must be greater than TASK_TIMEOUT")
 	}
+	if c.ShutdownGrace <= 0 {
+		return fmt.Errorf("SHUTDOWN_GRACE must be greater than zero")
+	}
 	// 按照模型分支
 	switch c.AIMode {
 	case "fake":
@@ -192,9 +195,7 @@ func envInt(key string, fallback int) int {
 	return value
 }
 
-// envDuration 与 envInt 同策略：解析失败返回 0。TASK_TIMEOUT/LEASE_DURATION 的非法值
-// 会被 Validate 的 "LEASE_DURATION 必须大于 TASK_TIMEOUT" 检查拦住；SHUTDOWN_GRACE 无对应校验，
-// 非法值会静默退化为 0（停机时立即退出，不等待在途任务）。
+// envDuration 与 envInt 同策略：解析失败返回 0，再由 Config 校验拒绝非法值。
 func envDuration(key string, fallback time.Duration) time.Duration {
 	raw := os.Getenv(key)
 	if raw == "" {

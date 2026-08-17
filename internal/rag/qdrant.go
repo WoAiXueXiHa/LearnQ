@@ -97,6 +97,51 @@ func (q Qdrant) DeleteDocument(ctx context.Context, documentID uint64) error {
 	})
 }
 
+// AliasTarget returns the collection currently addressed by alias.
+func (q Qdrant) AliasTarget(ctx context.Context, alias string) (string, bool, error) {
+	var output struct {
+		Result struct {
+			Aliases []struct {
+				AliasName      string `json:"alias_name"`
+				CollectionName string `json:"collection_name"`
+			} `json:"aliases"`
+		} `json:"result"`
+	}
+	if err := q.request(ctx, http.MethodGet, "/aliases", nil, &output); err != nil {
+		return "", false, err
+	}
+	for _, item := range output.Result.Aliases {
+		if item.AliasName == alias {
+			return item.CollectionName, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// SwitchAlias atomically redirects alias to q.Collection. The target collection
+// must already be fully built and validated by the caller.
+func (q Qdrant) SwitchAlias(ctx context.Context, alias string) error {
+	alias = strings.TrimSpace(alias)
+	if alias == "" || alias == q.Collection {
+		return fmt.Errorf("alias must be non-empty and differ from target collection")
+	}
+	current, exists, err := q.AliasTarget(ctx, alias)
+	if err != nil {
+		return err
+	}
+	if exists && current == q.Collection {
+		return nil
+	}
+	actions := make([]any, 0, 2)
+	if exists {
+		actions = append(actions, map[string]any{"delete_alias": map[string]any{"alias_name": alias}})
+	}
+	actions = append(actions, map[string]any{"create_alias": map[string]any{
+		"collection_name": q.Collection, "alias_name": alias,
+	}})
+	return q.post(ctx, "/collections/aliases", map[string]any{"actions": actions})
+}
+
 // Ready 探测 Qdrant 的就绪状态，供启动阶段的依赖检查使用。
 func (q Qdrant) Ready(ctx context.Context) error {
 	return q.request(ctx, http.MethodGet, "/readyz", nil, nil)

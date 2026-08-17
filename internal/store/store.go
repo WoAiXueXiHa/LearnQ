@@ -12,6 +12,7 @@ import (
 
 	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // Store 封装 *gorm.DB，所有 MySQL 读写都通过它执行；字段导出供需要直接操作 DB 的调用方使用。
@@ -99,39 +100,69 @@ func CreateStudyRecordTx(tx *gorm.DB, input CreateRecord) (domain.StudyRecord, d
 // Redis ZADD 本身幂等；若进程在 Redis 成功后、MySQL 提交前崩溃，未发布事件会被再次投递，
 // 因而这里选择“至少一次投递 + 幂等入队”，而不是追求跨存储的伪原子事务。
 func (s *Store) DispatchOutbox(ctx context.Context, enqueue func(context.Context, uint64, time.Time) error, limit int) error {
-	// 投递和保存是两个不同的动作，投递自己新开一个事务
-	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var events []domain.OutboxEvent
-		// 按 id 升序取最旧的未发布事件；SKIP LOCKED 让多个 Dispatcher 并发分摊而互不阻塞。
-		if err := tx.Raw(`SELECT * FROM outbox_events WHERE published_at IS NULL ORDER BY id LIMIT ? FOR UPDATE SKIP LOCKED`, limit).Scan(&events).Error; err != nil {
+	if limit <= 0 {
+		return nil
+	}
+	// 每条事件使用独立短事务：Redis 调用期间只锁一条 Outbox，而不是让一条失败事件
+	// 回滚整批 50 条。多个 Dispatcher 仍通过 SKIP LOCKED 并行分摊。
+	for dispatched := 0; dispatched < limit; dispatched++ {
+		handled, err := s.dispatchOneOutbox(ctx, enqueue)
+		if err != nil {
 			return err
 		}
-		for _, event := range events {
-			var task domain.AITask
-			if err := tx.First(&task, event.AggregateID).Error; err != nil {
-				return err
-			}
-			// 入队失败则整个事务回滚，事件保持未发布状态留待下一轮投递。
-			if err := enqueue(ctx, task.ID, task.AvailableAt); err != nil {
-				return err
-			}
-			now := time.Now().UTC()
-			// 条件更新：仅当任务仍处于 pending/retry_wait 时才置 queued；若已被并发投递，
-			// RowsAffected 为 0，整个事务回滚让事件留待重试。
-			result := tx.Exec(`UPDATE ai_tasks SET status='queued', updated_at=? WHERE id=? AND status IN ('pending','retry_wait')`, now, task.ID)
-			if result.Error != nil {
-				return result.Error
-			}
-			if result.RowsAffected != 1 {
-				return errors.New("task state changed while dispatching")
-			}
-			// published_at 仅在仍为空时写入，同一事件只标记一次发布。
-			if err := tx.Exec(`UPDATE outbox_events SET published_at=? WHERE id=? AND published_at IS NULL`, now, event.ID).Error; err != nil {
-				return err
-			}
+		if !handled {
+			return nil
 		}
-		return nil
+	}
+	return nil
+}
+
+// dispatchOneOutbox 处理最老的一条未发布事件。终态或已删除任务被视为“已消费但无需入队”，
+// 防止删除发生在首次投递之前时形成永久阻塞后续事件的 poison event。
+func (s *Store) dispatchOneOutbox(ctx context.Context, enqueue func(context.Context, uint64, time.Time) error) (bool, error) {
+	handled := false
+	err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var event domain.OutboxEvent
+		result := tx.Raw(`SELECT * FROM outbox_events WHERE published_at IS NULL ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&event)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return nil
+		}
+		handled = true
+
+		var task domain.AITask
+		taskResult := tx.First(&task, event.AggregateID)
+		if errors.Is(taskResult.Error, gorm.ErrRecordNotFound) {
+			return markOutboxHandled(tx, event.ID, "aggregate task no longer exists")
+		}
+		if taskResult.Error != nil {
+			return taskResult.Error
+		}
+		if task.Status != domain.TaskPending && task.Status != domain.TaskRetryWait {
+			return markOutboxHandled(tx, event.ID, "task is already "+string(task.Status))
+		}
+
+		if err := enqueue(ctx, task.ID, task.AvailableAt); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		update := tx.Exec(`UPDATE ai_tasks SET status='queued', updated_at=? WHERE id=? AND status IN ('pending','retry_wait')`, now, task.ID)
+		if update.Error != nil {
+			return update.Error
+		}
+		if update.RowsAffected != 1 {
+			return errors.New("task state changed while dispatching")
+		}
+		return tx.Exec(`UPDATE outbox_events SET published_at=?, dispatch_error='' WHERE id=? AND published_at IS NULL`, now, event.ID).Error
 	})
+	return handled, err
+}
+
+func markOutboxHandled(tx *gorm.DB, eventID uint64, reason string) error {
+	return tx.Exec(`UPDATE outbox_events SET published_at=?, dispatch_error=? WHERE id=? AND published_at IS NULL`,
+		time.Now().UTC(), reason, eventID).Error
 }
 
 // Acquire 是领取的最终确权：queued → processing 并记录租约与 Attempt；返回的 bool 表示本次是否确权成功。
@@ -323,8 +354,62 @@ func (s *Store) CreateDocument(ctx context.Context, document domain.Document) (d
 	return document, task, err
 }
 
+// ReindexDocument 为已有文档创建新一代索引任务。旧任务与 Attempt 保留作审计，
+// 文档在重建期间离开 ready 集合，RAG 不会读取到新旧索引混合结果。
+func (s *Store) ReindexDocument(ctx context.Context, documentID uint64) (domain.Document, domain.AITask, error) {
+	var document domain.Document
+	var task domain.AITask
+	err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&document, documentID).Error; err != nil {
+			return err
+		}
+		if document.Status == "deleting" {
+			return errors.New("deleting document cannot be reindexed")
+		}
+		if document.IndexingTaskID != 0 {
+			var current domain.AITask
+			if err := tx.First(&current, document.IndexingTaskID).Error; err != nil {
+				return err
+			}
+			if current.Status != domain.TaskSucceeded && current.Status != domain.TaskDead {
+				return errors.New("document already has an active indexing task")
+			}
+		}
+		now := time.Now().UTC()
+		payload, _ := json.Marshal(map[string]any{"document_id": document.ID})
+		task = domain.AITask{
+			Kind: "document_index", Status: domain.TaskPending, PayloadJSON: string(payload),
+			ExecutionGeneration: 1, AvailableAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := tx.Create(&task).Error; err != nil {
+			return err
+		}
+		result := tx.Model(&domain.Document{}).Where("id=? AND status<>'deleting'", document.ID).
+			Updates(map[string]any{
+				"status": "uploaded", "index_version": "", "indexing_task_id": task.ID,
+				"error_message": "", "updated_at": now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return errors.New("document state changed before reindex")
+		}
+		document.Status = "uploaded"
+		document.IndexVersion = ""
+		document.IndexingTaskID = task.ID
+		document.ErrorMessage = ""
+		document.UpdatedAt = now
+		return tx.Create(&domain.OutboxEvent{
+			AggregateID: task.ID, EventType: "document.reindex",
+			PayloadJSON: string(payload), CreatedAt: now,
+		}).Error
+	})
+	return document, task, err
+}
+
 // CompleteDocumentIndex 提交文档索引成功结果：校验租约后在同一事务内置任务 succeeded 与文档 ready。
-func (s *Store) CompleteDocumentIndex(ctx context.Context, task domain.AITask, token string, documentID uint64) error {
+func (s *Store) CompleteDocumentIndex(ctx context.Context, task domain.AITask, token string, documentID uint64, indexVersion string) error {
 	// 任务成功与文档 ready 必须原子提交，否则检索端可能读取到尚未完整落库的切片。
 	now := time.Now().UTC()
 	return s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -338,8 +423,8 @@ func (s *Store) CompleteDocumentIndex(ctx context.Context, task domain.AITask, t
 			return errors.New("task lease lost")
 		}
 		// 文档必须处于 indexing 才能置 ready；删除等并发操作会改变状态使本更新落空并回滚。
-		documentResult := tx.Exec(`UPDATE documents SET status='ready',error_message='',updated_at=?
-			WHERE id=? AND indexing_task_id=? AND status='indexing'`, now, documentID, task.ID)
+		documentResult := tx.Exec(`UPDATE documents SET status='ready',index_version=?,error_message='',updated_at=?
+			WHERE id=? AND indexing_task_id=? AND status='indexing'`, indexVersion, now, documentID, task.ID)
 		if documentResult.Error != nil {
 			return documentResult.Error
 		}

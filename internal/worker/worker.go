@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
 	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
+	appmetrics "github.com/WoAiXueXiHa/LearnQ/internal/metrics"
 	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
 	"github.com/WoAiXueXiHa/LearnQ/internal/report"
@@ -38,9 +40,11 @@ type Pool struct {
 	wg          sync.WaitGroup
 	indexer     interface {
 		Process(context.Context, domain.AITask) (uint64, error)
+		IndexVersion() string
 	}
-	skills *skill.Registry
-	trace  trace.Recorder
+	skills  *skill.Registry
+	trace   trace.Recorder
+	metrics *appmetrics.Recorder
 }
 
 // New 以默认参数（4 并发、45s 超时、60s 租约）构造 Worker Pool。
@@ -53,6 +57,7 @@ func New(s *store.Store, q *queue.Redis, m model.ChatModel, reportDir string, lo
 // 细节，测试中可替换为内存实现。
 func (p *Pool) WithIndexer(indexer interface {
 	Process(context.Context, domain.AITask) (uint64, error)
+	IndexVersion() string
 }) *Pool {
 	p.indexer = indexer
 	return p
@@ -83,6 +88,11 @@ func (p *Pool) WithTiming(timeout, lease time.Duration) *Pool {
 func (p *Pool) WithSkills(registry *skill.Registry) *Pool {
 	p.skills = registry
 	p.trace = trace.Recorder{DB: p.store.DB}
+	return p
+}
+
+func (p *Pool) WithMetrics(recorder *appmetrics.Recorder) *Pool {
+	p.metrics = recorder
 	return p
 }
 
@@ -134,6 +144,8 @@ func (p *Pool) claimAndRun(parent context.Context) {
 		_ = p.queue.Ack(parent, id, token)
 		return
 	}
+	started := time.Now()
+	p.recordTaskStarted(parent, task.Kind)
 	defer func() {
 		// panic 被转换为普通失败，既保住 Worker 进程，也让任务进入统一重试/死信流程。
 		if r := recover(); r != nil {
@@ -155,17 +167,18 @@ func (p *Pool) claimAndRun(parent context.Context) {
 		}
 		if err == nil {
 			persistCtx, persistCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			err = p.store.CompleteDocumentIndex(persistCtx, task, token, documentID)
+			err = p.store.CompleteDocumentIndex(persistCtx, task, token, documentID, p.indexer.IndexVersion())
 			persistCancel()
 		}
 		if err != nil {
 			p.failAndAck(task, token, err)
 			return
 		}
+		p.recordTaskSucceeded(task.Kind, started)
 		p.ack(id, token)
 		return
 	case "image_describe":
-		p.processImage(ctx, task, token)
+		p.processImage(ctx, task, token, started)
 		return
 	case "study_report":
 		// Continue with the report workflow below.
@@ -173,6 +186,7 @@ func (p *Pool) claimAndRun(parent context.Context) {
 		p.failAndAck(task, token, model.Permanent(fmt.Errorf("unsupported task kind %q", task.Kind)))
 		return
 	}
+	modelStarted := time.Now()
 	var response model.ChatResponse
 	if p.skills != nil {
 		// Skill 模式记录 prompt/schema/model/tool 调用，保证报告结果可追溯；
@@ -195,6 +209,7 @@ func (p *Pool) claimAndRun(parent context.Context) {
 	} else {
 		response, err = p.model.Generate(ctx, model.ChatRequest{Prompt: task.PayloadJSON, Skill: "daily-review", Input: []byte(task.PayloadJSON)})
 	}
+	p.recordModel("chat", response.InputTokens, response.OutputTokens, time.Since(modelStarted), err)
 	var markdown string
 	if err == nil {
 		markdown, err = model.MarkdownFromJSON(response.Content)
@@ -218,13 +233,14 @@ func (p *Pool) claimAndRun(parent context.Context) {
 	} else {
 		p.store.DB.Model(&saved).Update("export_status", "succeeded")
 	}
+	p.recordTaskSucceeded(task.Kind, started)
 	p.ack(id, token)
 }
 
 // processImage 处理 image_describe 任务：读取图片行与文件内容 → 视觉模型描述 →
 // 持久化描述 JSON。文件读取失败属永久错误（重试也读不到同一文件）；模型调用失败
 // 按 retryable 分类决定进入 retry_wait 还是 dead。
-func (p *Pool) processImage(ctx context.Context, task domain.AITask, token string) {
+func (p *Pool) processImage(ctx context.Context, task domain.AITask, token string, started time.Time) {
 	if p.vision == nil || p.imageStore == nil {
 		p.failAndAck(task, token, model.Permanent(errors.New("image description dependencies are not configured")))
 		return
@@ -239,9 +255,11 @@ func (p *Pool) processImage(ctx context.Context, task domain.AITask, token strin
 		p.failAndAck(task, token, model.Permanent(fmt.Errorf("read image: %w", err)))
 		return
 	}
+	modelStarted := time.Now()
 	response, err := p.vision.Describe(ctx, model.VisionRequest{
 		Image: body, MediaType: imageRow.MediaType, Prompt: imageRow.Prompt,
 	})
+	p.recordModel("vision", response.InputTokens, response.OutputTokens, time.Since(modelStarted), err)
 	if err != nil {
 		p.failAndAck(task, token, err)
 		return
@@ -258,6 +276,7 @@ func (p *Pool) processImage(ctx context.Context, task domain.AITask, token strin
 		p.failAndAck(task, token, err)
 		return
 	}
+	p.recordTaskSucceeded(task.Kind, started)
 	p.ack(task.ID, token)
 }
 
@@ -283,12 +302,23 @@ func (p *Pool) failAndAck(task domain.AITask, token string, cause error) {
 		}
 	}
 	if failErr != nil {
+		if p.metrics != nil && strings.Contains(failErr.Error(), "task lease lost") {
+			metricCtx, metricCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			p.metrics.Inc(metricCtx, "fencing_rejections_total")
+			metricCancel()
+		}
 		// 状态未持久化时不能 ACK，否则会丢失仍需恢复的任务；交给租约超时后的 Reaper 处理。
 		p.log.Error("task failure could not be persisted", "task_id", task.ID,
 			"execution_generation", task.ExecutionGeneration, "error", cause, "persist_error", failErr)
 		return
 	}
 	p.log.Error("task failed", "task_id", task.ID, "execution_generation", task.ExecutionGeneration, "error", cause)
+	if p.metrics != nil {
+		metricCtx, metricCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		p.metrics.Inc(metricCtx, "task_failed_total")
+		p.metrics.Inc(metricCtx, "task_"+metricTaskKind(task.Kind)+"_failed_total")
+		metricCancel()
+	}
 	// 先提交 MySQL 的失败/重试状态，再清理 Redis processing 项。
 	p.ack(task.ID, token)
 }
@@ -338,4 +368,49 @@ func randomToken() string {
 		return time.Now().UTC().Format("20060102150405.000000000")
 	}
 	return hex.EncodeToString(value[:])
+}
+
+func (p *Pool) recordTaskStarted(_ context.Context, kind string) {
+	if p.metrics == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	p.metrics.Inc(ctx, "task_started_total")
+	p.metrics.Inc(ctx, "task_"+metricTaskKind(kind)+"_started_total")
+}
+
+func (p *Pool) recordTaskSucceeded(kind string, started time.Time) {
+	if p.metrics == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	p.metrics.Inc(ctx, "task_succeeded_total")
+	p.metrics.Inc(ctx, "task_"+metricTaskKind(kind)+"_succeeded_total")
+	p.metrics.Observe(ctx, "task_"+metricTaskKind(kind)+"_latency", time.Since(started))
+}
+
+func metricTaskKind(kind string) string {
+	switch kind {
+	case "study_report", "document_index", "image_describe":
+		return kind
+	default:
+		return "unknown"
+	}
+}
+
+func (p *Pool) recordModel(kind string, inputTokens, outputTokens int, latency time.Duration, callErr error) {
+	if p.metrics == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	p.metrics.Inc(ctx, "model_"+kind+"_requests_total")
+	p.metrics.Add(ctx, "model_"+kind+"_input_tokens_total", int64(inputTokens))
+	p.metrics.Add(ctx, "model_"+kind+"_output_tokens_total", int64(outputTokens))
+	p.metrics.Observe(ctx, "model_"+kind+"_latency", latency)
+	if callErr != nil {
+		p.metrics.Inc(ctx, "model_"+kind+"_errors_total")
+	}
 }

@@ -15,6 +15,7 @@ const (
 	ProcessingKey      = "learnq:tasks:processing"
 	LeaseTokenKey      = "learnq:tasks:lease_tokens"
 	WorkerHeartbeatKey = "learnq:worker:heartbeat"
+	RecoveryCursorKey  = "learnq:recovery:cursors"
 )
 
 // ackScript：仅当 Redis 中登记的 token 与提交者一致时删除 processing 项；
@@ -111,9 +112,32 @@ func (q *Redis) Cleanup(ctx context.Context, id uint64) error {
 	return err
 }
 
-// Processing 列出 processing ZSet 中的全部任务 ID，供 Reconciler 对账扫描使用。
-func (q *Redis) Processing(ctx context.Context) ([]string, error) {
-	return q.client.ZRange(ctx, ProcessingKey, 0, -1).Result()
+// ScanZSet 每次最多扫描 count 个成员，cursor 由调用方保存到下一轮，避免全量拉取。
+func (q *Redis) ScanZSet(ctx context.Context, key string, cursor uint64, count int64) ([]string, uint64, error) {
+	values, next, err := q.client.ZScan(ctx, key, cursor, "*", count).Result()
+	if err != nil {
+		return nil, 0, err
+	}
+	members := make([]string, 0, len(values)/2)
+	for index := 0; index+1 < len(values); index += 2 {
+		members = append(members, values[index])
+	}
+	return members, next, nil
+}
+
+func (q *Redis) RecoveryCursor(ctx context.Context, name string) (uint64, error) {
+	value, err := q.client.HGet(ctx, RecoveryCursorKey, name).Result()
+	if err == redis.Nil {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(value, 10, 64)
+}
+
+func (q *Redis) SetRecoveryCursor(ctx context.Context, name string, cursor uint64) error {
+	return q.client.HSet(ctx, RecoveryCursorKey, name, strconv.FormatUint(cursor, 10)).Err()
 }
 
 // Heartbeat 定期写入带 TTL 的心跳键；Worker 停止后心跳过期，WorkerAlive 即判 Worker 死亡。

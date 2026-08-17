@@ -112,6 +112,7 @@ Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接
 | `AI_VISION_CONTEXT_LENGTH` | `8192` | Ollama Vision 上下文；长截图不应低于该值 |
 | `TASK_TIMEOUT` | `45s` | 单次任务执行超时；Real 视觉模式建议按机器性能调大 |
 | `LEASE_DURATION` | `60s` | Worker 租约，必须严格大于 `TASK_TIMEOUT` |
+| `SHUTDOWN_GRACE` | `70s` | Worker 停机等待时间，必须大于 0，通常应覆盖租约时长 |
 | `REPORT_DIR` | `data/reports` | Markdown 报告导出目录 |
 | `LEARNQ_HTTP_PORT` | `8080` | Compose 对宿主机暴露的端口 |
 
@@ -127,6 +128,7 @@ Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接
 |---|---|---|
 | `GET` | `/health/live` | 进程存活检查 |
 | `GET` | `/health/ready` | MySQL、Redis、Qdrant、Worker 就绪检查 |
+| `GET` | `/metrics` | Prometheus 文本指标 |
 | `POST` | `/api/v1/study-records` | 创建学习记录和异步报告任务 |
 | `GET` | `/api/v1/study-records` | 查询最近学习记录 |
 | `GET` | `/api/v1/tasks/:id/detail` | 查询任务、报告、复习和 Trace |
@@ -137,7 +139,8 @@ Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接
 | `GET` | `/api/v1/skills` | 查询 Skill Registry |
 | `POST` | `/api/v1/skills/:name/runs` | 手动运行 Skill |
 | `POST` | `/api/v1/documents` | 上传 UTF-8 Markdown、TXT 或 JSON 文档 |
-| `GET` | `/api/v1/documents` | 查询文档及索引状态 |
+| `GET` | `/api/v1/documents` | 查询文档及索引状态与 index_version |
+| `POST` | `/api/v1/documents/:id/reindex` | 为文档创建新的可靠重建任务 |
 | `DELETE` | `/api/v1/documents/:id` | 删除文档和向量索引 |
 | `POST` | `/api/v1/images` | 上传 PNG/JPEG 并创建异步视觉理解任务 |
 | `GET` | `/api/v1/images` | 查询图片及分析状态 |
@@ -193,6 +196,37 @@ curl -fsS "http://127.0.0.1:8080/api/v1/images/$image_id" | jq
 curl -fsS -X POST "http://127.0.0.1:8080/api/v1/images/$image_id/index" | jq
 ```
 
+## 索引重建与指标
+
+单文档重建会创建新的异步任务，旧任务和执行尝试仍可查询：
+
+~~~bash
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/documents/1/reindex | jq
+~~~
+
+本地直接运行进程、并已配置同一套 MySQL 环境变量时，可批量把 ready/failed 文档送入可靠队列：
+
+~~~bash
+GOWORK=off go run ./cmd/reindex --all --limit 1000
+~~~
+
+仅升级 Embedding、持久化 chunks 未变化时，可进行蓝绿重建。运行中的 API 和 Worker 必须把 RAG_COLLECTION 配置为稳定 alias（例如 learnq_live），shadow collection 必须是新的物理集合名：
+
+~~~bash
+GOWORK=off go run ./cmd/reindex --all --limit 1000 \
+  --shadow-collection learnq_chunks_v2 --alias learnq_live
+~~~
+
+命令只选择 ready 文档，复用 MySQL 已持久化 chunks 写入新 collection；任一文档失败都不会切换 alias。全部成功后，Qdrant 在一个 alias 更新请求中删除旧指向并创建新指向。若切块算法或 chunk ID 规则变化，请使用普通单文档/批量重建，不要使用 shadow 模式。
+
+指标可直接抓取：
+
+~~~bash
+curl -fsS http://127.0.0.1:8080/metrics
+~~~
+
+重点关注 learnq_outbox_oldest_wait_seconds、learnq_expired_leases、learnq_queue_ready、learnq_fencing_rejections_total、learnq_reconciler_errors_total、learnq_model_chat_latency_sum_ms/count 和模型 token 累计值。计数器保存在 Redis，Redis 丢失不会影响业务事实，只会重新累计指标。
+
 ## 验证
 
 代码质量与单元测试：
@@ -231,7 +265,7 @@ make acceptance
 - 学习记录、异步报告、复习计划与幂等
 - Skill、Multi-Agent 和执行轨迹
 - 图片上传、异步视觉描述、状态查询和幂等加入知识库
-- 文档索引、RAG 引用和离线评估
+- 文档索引、单文档重建、index_version、RAG 引用、运行指标和离线评估
 - 周统计与 Worker 停启恢复
 
 脚本退出时会清理自己的容器和数据卷，不影响默认 LearnQ 环境。自动测试始终使用 Fake 或 Mock 模型，不会产生付费 API 调用。
@@ -249,7 +283,7 @@ make acceptance
 | 图片提示 context exhausted | 保持 `AI_VISION_PROVIDER=ollama`，并将 `AI_VISION_CONTEXT_LENGTH` 设为至少 `8192` |
 | 图片分析完成但知识库没有内容 | 图片默认不会自动入库；在页面点击“加入知识库”或调用 `/images/:id/index` |
 | Qdrant 提示维度不一致 | 恢复原维度；仅在可丢弃本地索引时才清理并重建数据卷 |
-| Qdrant 数据卷丢失或集合为空 | `/health/ready` 只代表服务可用；当前版本需要重新上传文档，不会自动重建历史向量 |
+| Qdrant 数据卷丢失或集合为空 | `/health/ready` 只代表服务可用；使用单文档重建接口或 `cmd/reindex --all` 从 MySQL 恢复向量 |
 | 文档无法索引 | 确认文件为 UTF-8 的 Markdown、TXT 或 JSON，且不超过 5 MiB |
 | RAG 按钮不可用 | 至少等待一个文档状态变为“可查询” |
 | 需要重新开始演示 | 先确认本地数据无保留价值，再运行 `make reset-data` 并重新启动 |

@@ -348,6 +348,26 @@ func (s *Server) documentStatus(c *gin.Context) {
 }
 
 // listDocuments 处理 GET /api/v1/documents：按 id 倒序返回最近 100 个文档。
+// reindexDocument 为 ready/failed 文档创建新的可靠异步索引任务；已有活动任务时返回 409。
+func (s *Server) reindexDocument(c *gin.Context) {
+	id, valid := parseID(c)
+	if !valid {
+		return
+	}
+	document, task, err := s.store.ReindexDocument(c.Request.Context(), id)
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		notFound(c)
+		return
+	}
+	if err != nil {
+		fail(c, 409, "DOCUMENT_NOT_REINDEXABLE", err.Error(), nil)
+		return
+	}
+	ok(c, http.StatusAccepted, gin.H{
+		"document_id": document.ID, "indexing_task_id": task.ID, "status": document.Status,
+	})
+}
+
 func (s *Server) listDocuments(c *gin.Context) {
 	documents := make([]domain.Document, 0)
 	if err := s.store.DB.Order("id DESC").Limit(100).Find(&documents).Error; err != nil {
@@ -502,6 +522,7 @@ func (s *Server) ragQuery(c *gin.Context) {
 		fail(c, 500, "INTERNAL_ERROR", "could not prepare RAG evidence", nil)
 		return
 	}
+	modelStarted := time.Now()
 	response, err := s.chat.Generate(requestCtx, model.ChatRequest{
 		Skill:  "rag-answer",
 		Prompt: `你是证据约束问答助手。只能根据输入 evidence 回答；每个事实后必须使用 [S1] 形式引用对应 source；禁止使用输入之外的事实。只返回 JSON：{"answer":"..."}。`,
@@ -513,6 +534,17 @@ func (s *Server) ragQuery(c *gin.Context) {
 			"properties":{"answer":{"type":"string","minLength":1}}
 		}`),
 	})
+	if s.metrics != nil {
+		metricCtx, metricCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		s.metrics.Inc(metricCtx, "model_chat_requests_total")
+		s.metrics.Add(metricCtx, "model_chat_input_tokens_total", int64(response.InputTokens))
+		s.metrics.Add(metricCtx, "model_chat_output_tokens_total", int64(response.OutputTokens))
+		s.metrics.Observe(metricCtx, "model_chat_latency", time.Since(modelStarted))
+		if err != nil {
+			s.metrics.Inc(metricCtx, "model_chat_errors_total")
+		}
+		metricCancel()
+	}
 	if err != nil {
 		failModelDependency(c, err)
 		return
@@ -529,6 +561,12 @@ func (s *Server) ragQuery(c *gin.Context) {
 	if err := validateCitationReferences(generated.Answer, len(citations)); err != nil {
 		fail(c, 502, "AI_INVALID_RESPONSE", err.Error(), nil)
 		return
+	}
+	if s.metrics != nil {
+		metricCtx, metricCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		s.metrics.Inc(metricCtx, "rag_answers_total")
+		s.metrics.Add(metricCtx, "rag_citations_total", int64(len(citations)))
+		metricCancel()
 	}
 	ok(c, 200, gin.H{
 		"answer": generated.Answer, "citations": citations,

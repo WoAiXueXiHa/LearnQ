@@ -12,6 +12,7 @@ func validFakeConfig() Config {
 		EmbeddingDim:  64,
 		TaskTimeout:   45 * time.Second,
 		LeaseDuration: 60 * time.Second,
+		ShutdownGrace: 70 * time.Second,
 	}
 }
 
@@ -114,5 +115,15 @@ func TestLoadUsesQwenEmbeddingDimensionByDefault(t *testing.T) {
 	t.Setenv("EMBEDDING_DIM", "")
 	if got := Load().EmbeddingDim; got != 1024 {
 		t.Fatalf("EmbeddingDim=%d, want 1024 for qwen3-embedding:0.6b", got)
+	}
+}
+
+func TestValidateShutdownGrace(t *testing.T) {
+	for _, value := range []time.Duration{0, -time.Second} {
+		cfg := validFakeConfig()
+		cfg.ShutdownGrace = value
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "SHUTDOWN_GRACE") {
+			t.Fatalf("ShutdownGrace=%s accepted, err=%v", value, err)
+		}
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/WoAiXueXiHa/LearnQ/internal/dispatcher"
 	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
 	"github.com/WoAiXueXiHa/LearnQ/internal/indexer"
+	appmetrics "github.com/WoAiXueXiHa/LearnQ/internal/metrics"
 	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
 	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
 	"github.com/WoAiXueXiHa/LearnQ/internal/recovery"
@@ -51,6 +53,7 @@ func main() {
 	pingCancel()
 	s := store.New(db)
 	q := queue.New(redisClient)
+	metricRecorder := &appmetrics.Recorder{Client: redisClient}
 	// JSON 结构化日志输出到 stdout，容器场景直接采集，不写本地文件。
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	// SIGINT/SIGTERM 经 NotifyContext 统一转为 ctx 取消，下方所有后台循环共用这一个信号源。
@@ -88,11 +91,21 @@ func main() {
 				return
 			case <-ticker.C:
 				// 同一周期内先 Reap 后 Reconcile，串行执行，避免两个恢复循环并发操作同一批任务。
-				if err := recovery.Reap(ctx, s, q); err != nil {
+				reapStats, err := recovery.ReapWithStats(ctx, s, q)
+				if err != nil {
 					logger.Error("reaper", "error", err)
+					metricRecorder.Inc(ctx, "reaper_errors_total")
+				} else {
+					metricRecorder.Add(ctx, "reaper_expired_repaired_total", int64(reapStats.ExpiredReaped))
 				}
-				if err := recovery.Reconcile(ctx, s, q); err != nil {
+				reconcileStats, err := recovery.ReconcileWithStats(ctx, s, q)
+				if err != nil {
 					logger.Error("reconciler", "error", err)
+					metricRecorder.Inc(ctx, "reconciler_errors_total")
+				} else {
+					metricRecorder.Add(ctx, "reconciler_queued_enqueued_total", int64(reconcileStats.QueuedEnqueued))
+					metricRecorder.Add(ctx, "reconciler_ready_cleaned_total", int64(reconcileStats.ReadyCleaned))
+					metricRecorder.Add(ctx, "reconciler_processing_cleaned_total", int64(reconcileStats.ProcessingCleaned))
 				}
 			}
 		}
@@ -109,11 +122,14 @@ func main() {
 	// 分别支撑 image_describe、study_report、document_index 三类任务的执行。
 	pool := worker.New(s, q, chat, cfg.ReportDir, logger)
 	pool.WithTiming(cfg.TaskTimeout, cfg.LeaseDuration)
+	pool.WithMetrics(metricRecorder)
 	pool.WithVision(bootstrap.Vision(cfg), imagestore.New(cfg.ImageDir))
 	pool.WithSkills(registry)
 	pool.WithIndexer(&indexer.Indexer{
 		Store: s, Embedding: embedding, Dimension: cfg.EmbeddingDim,
 		Vectors: vectors,
+		Version: fmt.Sprintf("collection=%s;embedding=%s;dim=%d;chunk=800;overlap=120",
+			cfg.RAGCollection, cfg.AIEmbeddingModel, cfg.EmbeddingDim),
 	})
 	pool.Run(ctx)
 	// Run 启动固定数量 goroutine 的领取循环后返回，主 goroutine 在此等待取消信号。

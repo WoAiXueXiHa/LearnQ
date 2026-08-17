@@ -27,6 +27,66 @@ type Indexer struct {
 	Embedding model.EmbeddingModel
 	Vectors   VectorStore
 	Dimension int
+	Version   string
+}
+
+func (i *Indexer) IndexVersion() string {
+	if i.Version != "" {
+		return i.Version
+	}
+	return fmt.Sprintf("chunk-v1-dim-%d", i.Dimension)
+}
+
+// ShadowDocument rebuilds vectors for a ready document into an independent
+// collection without changing MySQL document or task state. It intentionally
+// reuses persisted chunks, so the old collection remains compatible until an
+// alias is switched after every document succeeds.
+func (i *Indexer) ShadowDocument(ctx context.Context, documentID uint64) error {
+	var document domain.Document
+	if err := i.Store.DB.WithContext(ctx).First(&document, documentID).Error; err != nil {
+		return err
+	}
+	if document.Status != "ready" {
+		return fmt.Errorf("shadow rebuild requires ready document %d", documentID)
+	}
+	var chunks []domain.DocumentChunk
+	if err := i.Store.DB.WithContext(ctx).Where("document_id=?", documentID).
+		Order("chunk_index,id").Find(&chunks).Error; err != nil {
+		return err
+	}
+	if len(chunks) == 0 {
+		return fmt.Errorf("ready document %d has no persisted chunks", documentID)
+	}
+	texts := make([]string, len(chunks))
+	for index := range chunks {
+		texts[index] = chunks[index].Content
+	}
+	dense, err := i.Embedding.Embed(ctx, texts)
+	if err != nil {
+		return err
+	}
+	if len(dense) != len(chunks) {
+		return fmt.Errorf("embedding result count mismatch")
+	}
+	for _, vector := range dense {
+		if len(vector) != i.Dimension {
+			return fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
+		}
+	}
+	if err := i.Vectors.EnsureCollection(ctx, i.Dimension); err != nil {
+		return err
+	}
+	if err := i.Vectors.DeleteDocument(ctx, documentID); err != nil {
+		return err
+	}
+	points := make([]rag.Point, len(chunks))
+	for index, chunk := range chunks {
+		points[index] = rag.Point{ID: uuidFromHash(chunk.ID), Dense: dense[index], Sparse: rag.Sparse(chunk.Content), Payload: map[string]any{
+			"document_id": documentID, "chunk_id": chunk.ID, "title": chunk.Title,
+			"start_line": chunk.StartLine, "end_line": chunk.EndLine, "summary": truncate(chunk.Content, 240),
+		}}
+	}
+	return i.Vectors.Upsert(ctx, points)
 }
 
 func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, error) {
@@ -78,6 +138,10 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 	if err := i.Vectors.EnsureCollection(ctx, i.Dimension); err != nil {
 		return 0, err
 	}
+	// 重建前删除整篇文档的旧点。文档此时不是 ready，在线检索不会暴露清理窗口。
+	if err := i.Vectors.DeleteDocument(ctx, document.ID); err != nil {
+		return 0, err
+	}
 	rows := make([]domain.DocumentChunk, len(chunks))
 	points := make([]rag.Point, len(chunks))
 	now := time.Now().UTC()
@@ -91,8 +155,10 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 		}}
 	}
 	if err := i.Store.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// Assign + FirstOrCreate 按稳定 ID 实现 upsert：已存在则整体覆盖，
-		// 配合稳定 ID 保证重试幂等；整批切片在同一事务提交。
+		// 先清理旧切片，允许切块算法升级后 chunk 数量和稳定 ID 发生变化。
+		if err := tx.Where("document_id=?", document.ID).Delete(&domain.DocumentChunk{}).Error; err != nil {
+			return err
+		}
 		for index := range rows {
 			if err := tx.Where("id=?", rows[index].ID).Assign(rows[index]).FirstOrCreate(&rows[index]).Error; err != nil {
 				return err

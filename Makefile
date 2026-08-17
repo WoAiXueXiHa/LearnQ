@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check vet test test-integration up down reset-data acceptance manual-test eval-rag
+.PHONY: fmt fmt-check vet test race test-integration up down reset-data acceptance manual-test eval-rag reindex
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -type f)
@@ -8,6 +8,9 @@ vet:
 	GOWORK=off go vet ./...
 test:
 	GOWORK=off go test ./...
+race:
+	GOWORK=off go test -race ./...
+
 test-integration:
 	GOWORK=off go test -p 1 -tags=integration ./...
 up:
@@ -22,3 +25,5 @@ manual-test:
 	./scripts/manual-test.sh
 eval-rag:
 	curl -fsS -X POST http://127.0.0.1:8080/api/v1/evaluations/rag -H 'Content-Type: application/json' -d '{}'
+reindex:
+	GOWORK=off go run ./cmd/reindex --all

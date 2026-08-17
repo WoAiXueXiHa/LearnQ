@@ -45,3 +45,10 @@ func TestRRF(t *testing.T) {
 		t.Fatalf("got %#v", got)
 	}
 }
+
+func TestRecallIgnoresNegativeJudgmentsAndDuplicateHits(t *testing.T) {
+	relevant := map[string]int{"positive": 3, "negative": 0}
+	if got := RecallAtK([]string{"positive", "positive", "negative"}, relevant, 3); got != 1 {
+		t.Fatalf("recall=%v, want 1", got)
+	}
+}

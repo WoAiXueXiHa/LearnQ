@@ -51,3 +51,16 @@ func TestReadJSONLRejectsPlaceholderChunkID(t *testing.T) {
 		t.Fatalf("placeholder error=%v", err)
 	}
 }
+
+func TestReadJSONLRejectsInvalidJudgments(t *testing.T) {
+	tests := []string{
+		`{"id":"negative","question":"q","relevant_chunks":[{"chunk_id":"a","relevance":-1}]}`,
+		`{"id":"duplicate","question":"q","relevant_chunks":[{"chunk_id":"a","relevance":1},{"chunk_id":"a","relevance":2}]}`,
+		`{"id":"no-positive","question":"q","relevant_chunks":[{"chunk_id":"a","relevance":0}]}`,
+	}
+	for _, input := range tests {
+		if _, err := ReadJSONL(strings.NewReader(input)); err == nil {
+			t.Fatalf("invalid judgments accepted: %s", input)
+		}
+	}
+}

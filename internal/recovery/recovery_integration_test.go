@@ -156,3 +156,55 @@ func TestReaperResetsExpiredDocumentForRetry(t *testing.T) {
 		t.Fatalf("task=%s document=%s error=%q", currentTask.Status, currentDocument.Status, currentDocument.ErrorMessage)
 	}
 }
+
+func TestReconcilerPagesQueuedTasks(t *testing.T) {
+	cfg := config.Load()
+	cfg.MySQLDSN = os.Getenv("LEARNQ_TEST_MYSQL_DSN")
+	addr := os.Getenv("LEARNQ_TEST_REDIS_ADDR")
+	if cfg.MySQLDSN == "" || addr == "" {
+		t.Skip("integration dependencies are required")
+	}
+	db, err := bootstrap.MySQL(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrate.Run(db); err != nil {
+		t.Fatal(err)
+	}
+	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	t.Cleanup(func() {
+		rdb.FlushDB(context.Background())
+		rdb.Close()
+		db.Exec("DELETE FROM ai_tasks")
+	})
+	if err := rdb.FlushDB(context.Background()).Err(); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tasks := make([]domain.AITask, 250)
+	for index := range tasks {
+		tasks[index] = domain.AITask{
+			Kind: "study_report", Status: domain.TaskQueued, PayloadJSON: "{}",
+			ExecutionGeneration: 1, AvailableAt: now, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+	if err := db.CreateInBatches(&tasks, 50).Error; err != nil {
+		t.Fatal(err)
+	}
+	q := queue.New(rdb)
+	s := store.New(db)
+	first, err := recovery.ReconcileWithStats(context.Background(), s, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := recovery.ReconcileWithStats(context.Background(), s, q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.QueuedEnqueued != 200 || second.QueuedEnqueued != 50 {
+		t.Fatalf("page counts first=%d second=%d", first.QueuedEnqueued, second.QueuedEnqueued)
+	}
+	if count := rdb.ZCard(context.Background(), queue.ReadyKey).Val(); count != 250 {
+		t.Fatalf("ready count=%d", count)
+	}
+}

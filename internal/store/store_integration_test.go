@@ -228,3 +228,87 @@ func TestExpiredLeaseCanOnlyBeFailedByReaperPath(t *testing.T) {
 		t.Fatalf("reaper status=%s", recovered.Status)
 	}
 }
+
+func TestOutboxSkipsTerminalTaskWithoutBlockingLaterEvents(t *testing.T) {
+	s := database(t)
+	_, terminal, err := s.CreateStudyRecord(context.Background(), store.CreateRecord{
+		Title: "terminal", DurationMinutes: 1,
+		Modules: []domain.StudyModule{{Category: "backend", Content: "deleted before dispatch"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pending, err := s.CreateStudyRecord(context.Background(), store.CreateRecord{
+		Title: "pending", DurationMinutes: 1,
+		Modules: []domain.StudyModule{{Category: "backend", Content: "must still dispatch"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Model(&domain.AITask{}).Where("id=?", terminal.ID).
+		Updates(map[string]any{"status": domain.TaskDead, "last_error": "deleted"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var enqueued []uint64
+	if err := s.DispatchOutbox(context.Background(), func(_ context.Context, id uint64, _ time.Time) error {
+		enqueued = append(enqueued, id)
+		return nil
+	}, 10); err != nil {
+		t.Fatal(err)
+	}
+	if len(enqueued) != 1 || enqueued[0] != pending.ID {
+		t.Fatalf("enqueued=%v, want only %d", enqueued, pending.ID)
+	}
+	var terminalEvent domain.OutboxEvent
+	if err := s.DB.Where("aggregate_id=?", terminal.ID).First(&terminalEvent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if terminalEvent.PublishedAt == nil || terminalEvent.DispatchError == "" {
+		t.Fatalf("terminal event was not safely handled: %#v", terminalEvent)
+	}
+	var pendingTask domain.AITask
+	if err := s.DB.First(&pendingTask, pending.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if pendingTask.Status != domain.TaskQueued {
+		t.Fatalf("pending task status=%s", pendingTask.Status)
+	}
+}
+
+func TestReindexDocumentCreatesNewAuditableTask(t *testing.T) {
+	s := database(t)
+	document, firstTask, err := s.CreateDocument(context.Background(), domain.Document{
+		Filename: "reindex.md", MediaType: "md", ContentHash: "hash", Content: "# reindex",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ReindexDocument(context.Background(), document.ID); err == nil {
+		t.Fatal("active indexing task was reindexed")
+	}
+	if err := s.DB.Model(&domain.AITask{}).Where("id=?", firstTask.ID).
+		Update("status", domain.TaskSucceeded).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DB.Model(&domain.Document{}).Where("id=?", document.ID).
+		Updates(map[string]any{"status": "ready", "index_version": "old-version"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	updated, nextTask, err := s.ReindexDocument(context.Background(), document.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextTask.ID == firstTask.ID || nextTask.Status != domain.TaskPending {
+		t.Fatalf("next task=%#v first=%d", nextTask, firstTask.ID)
+	}
+	if updated.Status != "uploaded" || updated.IndexVersion != "" || updated.IndexingTaskID != nextTask.ID {
+		t.Fatalf("updated document=%#v", updated)
+	}
+	var count int64
+	if err := s.DB.Model(&domain.AITask{}).Where("id IN ?", []uint64{firstTask.ID, nextTask.ID}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("task history count=%d", count)
+	}
+}

@@ -91,7 +91,7 @@ func TestDocumentTaskIndexesAsynchronously(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CompleteDocumentIndex(context.Background(), acquired, "index-token", documentID); err != nil {
+	if err := s.CompleteDocumentIndex(context.Background(), acquired, "index-token", documentID, "test-v1"); err != nil {
 		t.Fatal(err)
 	}
 	var ready domain.Document
@@ -105,6 +105,18 @@ func TestDocumentTaskIndexesAsynchronously(t *testing.T) {
 		if point.Payload["document_id"] != document.ID || len(point.Dense) != 64 || len(point.Sparse.Indices) == 0 {
 			t.Fatalf("invalid point %#v", point)
 		}
+	}
+	shadowVectors := &memoryVectors{}
+	shadow := &indexer.Indexer{Store: s, Embedding: model.Fake{Dimension: 64}, Vectors: shadowVectors, Dimension: 64}
+	if err := shadow.ShadowDocument(context.Background(), document.ID); err != nil {
+		t.Fatal(err)
+	}
+	var afterShadow domain.Document
+	if err := db.First(&afterShadow, document.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if afterShadow.Status != "ready" || afterShadow.IndexingTaskID != task.ID || len(shadowVectors.points) != int(count) {
+		t.Fatalf("shadow changed source state: document=%#v points=%d", afterShadow, len(shadowVectors.points))
 	}
 }
 

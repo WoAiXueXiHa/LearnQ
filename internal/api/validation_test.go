@@ -97,3 +97,16 @@ func TestDocumentUploadEnforcesFileAndMultipartLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestRequestIDRejectsOversizedOrUnsafeValues(t *testing.T) {
+	for _, value := range []string{strings.Repeat("x", 65), "unsafe request id"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/health/live", nil)
+		req.Header.Set("X-Request-ID", value)
+		validationHandler().ServeHTTP(rec, req)
+		got := rec.Header().Get("X-Request-ID")
+		if rec.Code != http.StatusOK || got == value || got == "" || len(got) > 64 {
+			t.Fatalf("input=%q status=%d request_id=%q", value, rec.Code, got)
+		}
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
 	"github.com/WoAiXueXiHa/LearnQ/internal/config"
 	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
+	appmetrics "github.com/WoAiXueXiHa/LearnQ/internal/metrics"
 	"github.com/WoAiXueXiHa/LearnQ/internal/queue"
 	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
 	"github.com/WoAiXueXiHa/LearnQ/internal/skill"
@@ -48,6 +49,7 @@ func main() {
 	redisClient := bootstrap.Redis(cfg)
 	defer redisClient.Close()
 	taskQueue := queue.New(redisClient)
+	metricRecorder := &appmetrics.Recorder{Client: redisClient}
 	registry := skill.New(chat)
 	evidence := &rag.EvidenceService{DB: db, Embedding: embedding, Vectors: vectors}
 	tools := agenttool.Service{DB: db, Evidence: evidence}
@@ -67,6 +69,14 @@ func main() {
 		api.WithImageStore(imagestore.New(cfg.ImageDir)),
 		api.WithRuntimeInfo(cfg.AIMode, runtimeChatModel, runtimeVisionModel, runtimeEmbeddingModel),
 		api.WithRAGMetadata(cfg.RAGCollection),
+		api.WithOperationalMetrics(metricRecorder, func(ctx context.Context) (int64, int64, error) {
+			ready, err := redisClient.ZCard(ctx, queue.ReadyKey).Result()
+			if err != nil {
+				return 0, 0, err
+			}
+			processing, err := redisClient.ZCard(ctx, queue.ProcessingKey).Result()
+			return ready, processing, err
+		}),
 		// 依赖探活：Redis ping 与 Qdrant Ready 都通过才认为就绪。
 		api.WithHealthChecks(func(ctx context.Context) error {
 			return redisClient.Ping(ctx).Err()

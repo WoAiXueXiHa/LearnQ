@@ -118,3 +118,31 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
 }
+
+func TestSwitchAliasUsesOneAtomicUpdate(t *testing.T) {
+	var update map[string]any
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := `{"result":{"aliases":[{"alias_name":"learnq_live","collection_name":"learnq_old"}]}}`
+		if r.Method == http.MethodPost {
+			if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+				t.Fatal(err)
+			}
+			body = `{"result":true}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	q := Qdrant{BaseURL: "http://qdrant.test", Collection: "learnq_new", Client: client}
+	if err := q.SwitchAlias(context.Background(), "learnq_live"); err != nil {
+		t.Fatal(err)
+	}
+	actions, ok := update["actions"].([]any)
+	if !ok || len(actions) != 2 {
+		t.Fatalf("alias update=%#v", update)
+	}
+	deleted := actions[0].(map[string]any)["delete_alias"].(map[string]any)
+	created := actions[1].(map[string]any)["create_alias"].(map[string]any)
+	if deleted["alias_name"] != "learnq_live" ||
+		created["alias_name"] != "learnq_live" || created["collection_name"] != "learnq_new" {
+		t.Fatalf("actions=%#v", actions)
+	}
+}

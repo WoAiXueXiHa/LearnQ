@@ -74,11 +74,26 @@ func ReadJSONL(reader io.Reader) ([]Case, error) {
 		if item.ID == "" || item.Question == "" || len(item.RelevantChunks) == 0 {
 			return nil, fmt.Errorf("evaluation case misses id, question, or relevant_chunks")
 		}
+		seenChunks := make(map[string]struct{}, len(item.RelevantChunks))
+		positive := 0
 		for _, judgment := range item.RelevantChunks {
-			// 模板样例常以 "replace-with-xxx" 作占位符，混入会算出无意义指标，直接拒绝。
-			if strings.TrimSpace(judgment.ChunkID) == "" || strings.Contains(strings.ToLower(judgment.ChunkID), "replace-with") {
+			chunkID := strings.TrimSpace(judgment.ChunkID)
+			if chunkID == "" || strings.Contains(strings.ToLower(chunkID), "replace-with") {
 				return nil, fmt.Errorf("evaluation case %s contains an empty or placeholder chunk_id", item.ID)
 			}
+			if judgment.Relevance < 0 {
+				return nil, fmt.Errorf("evaluation case %s contains negative relevance", item.ID)
+			}
+			if _, duplicate := seenChunks[chunkID]; duplicate {
+				return nil, fmt.Errorf("evaluation case %s contains duplicate chunk_id %s", item.ID, chunkID)
+			}
+			seenChunks[chunkID] = struct{}{}
+			if judgment.Relevance > 0 {
+				positive++
+			}
+		}
+		if positive == 0 {
+			return nil, fmt.Errorf("evaluation case %s has no positively relevant chunk", item.ID)
 		}
 		cases = append(cases, item)
 	}

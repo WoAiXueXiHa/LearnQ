@@ -91,12 +91,13 @@ type StudyModule struct {
 
 type OutboxEvent struct {
 	// OutboxEvent 与业务对象同事务写入，把跨 MySQL/Redis 的原子性问题转化为可重放投递。
-	ID          uint64     `gorm:"primaryKey"`
-	AggregateID uint64     // 对应的具体 task.ID
-	EventType   string     // 发生了什么事件
-	PayloadJSON string     `gorm:"column:payload_json"` // 事件携带的数据
-	PublishedAt *time.Time // nil 说明未确认发布，!nil 说明记录发布成功
-	CreatedAt   time.Time
+	ID            uint64     `gorm:"primaryKey"`
+	AggregateID   uint64     // 对应的具体 task.ID
+	EventType     string     // 发生了什么事件
+	PayloadJSON   string     `gorm:"column:payload_json"` // 事件携带的数据
+	PublishedAt   *time.Time // nil 说明未处理，!nil 说明已经发布或安全跳过
+	DispatchError string     // 非空表示聚合已终态/删除，事件被安全跳过
+	CreatedAt     time.Time
 }
 
 type TaskAttempt struct {
@@ -119,6 +120,7 @@ type Document struct {
 	ContentHash    string    `json:"content_hash"`
 	Content        string    `json:"-" gorm:"type:longtext"`
 	Status         string    `json:"status"`
+	IndexVersion   string    `json:"index_version"`
 	IndexingTaskID uint64    `json:"indexing_task_id"`
 	ErrorMessage   string    `json:"error_message,omitempty"`
 	CreatedAt      time.Time `json:"created_at"`

@@ -99,6 +99,23 @@ indexing_task_id=$(printf '%s' "$upload" | jq -r '.data.indexing_task_id')
 curl -fsS "$BASE_URL/api/v1/tasks/$indexing_task_id/detail" |
   jq -e '.data.task.kind == "document_index" and .data.document.status == "ready" and .data.report == null' >/dev/null
 
+curl -fsS "$BASE_URL/api/v1/documents/$document_id/status" |
+  jq -e '.data.index_version | type == "string" and length > 0' >/dev/null
+reindex=$(curl -fsS -X POST "$BASE_URL/api/v1/documents/$document_id/reindex")
+reindex_task_id=$(printf '%s' "$reindex" | jq -r '.data.indexing_task_id')
+test "$reindex_task_id" -ne "$indexing_task_id"
+attempt=0
+while :; do
+  reindex_status=$(curl -fsS "$BASE_URL/api/v1/tasks/$reindex_task_id" | jq -r '.data.status')
+  [ "$reindex_status" = succeeded ] && break
+  [ "$reindex_status" != dead ] || exit 1
+  attempt=$((attempt+1))
+  [ "$attempt" -lt 60 ] || exit 1
+  sleep 1
+done
+curl -fsS "$BASE_URL/api/v1/documents/$document_id/status" |
+  jq -e --argjson task "$reindex_task_id" '.data.status == "ready" and .data.indexing_task_id == $task and (.data.index_version | length > 0)' >/dev/null
+
 printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=' |
   base64 -d >"$image_file"
 image_upload=$(curl -fsS -X POST "$BASE_URL/api/v1/images" \
@@ -136,6 +153,11 @@ done
 rag=$(curl -fsS -X POST "$BASE_URL/api/v1/rag/query" \
   -H 'Content-Type: application/json' -d '{"question":"LearnQ 如何启动 Compose？","top_k":5}')
 printf '%s' "$rag" | jq -e '.data.answer | contains("[S1]")' >/dev/null
+metrics=$(curl -fsS "$BASE_URL/metrics")
+printf '%s' "$metrics" | grep -q '^learnq_outbox_unpublished '
+printf '%s' "$metrics" | grep -q '^learnq_queue_ready '
+printf '%s' "$metrics" | grep -q '^learnq_model_chat_requests_total '
+printf '%s' "$metrics" | grep -q '^learnq_rag_answers_total '
 chunk_id=$(printf '%s' "$rag" | jq -r '.data.citations[0].chunk_id')
 printf '{"id":"acceptance-rag","question":"LearnQ 如何启动 Compose？","relevant_chunks":[{"chunk_id":"%s","relevance":3}],"citation_text":"Compose 启动说明","correct_answer":"使用 docker compose 启动","tags":["compose"],"difficulty":"easy"}\n' "$chunk_id" |
   curl -fsS -X POST "$BASE_URL/api/v1/evaluations/rag" \
