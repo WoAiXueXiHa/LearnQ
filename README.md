@@ -103,6 +103,18 @@ curl -X POST http://127.0.0.1:8080/api/v1/agent/runs \
 
 如果没有有效证据，知识问答会明确返回依据不足；如果请求包含复习任务创建计划，只有显式设置 `allow_actions=true` 并提供有效 `report_id` 才允许写入复习任务。
 
+### Agent 评测集
+
+`data/eval/agent.jsonl` 保存 12 条可重复的 Agent 评测样例，覆盖知识问答、学习复盘和项目讲解三类任务。每条样例声明期望任务类型与允许工具，用于检查任务覆盖和工具权限边界。
+
+运行评测数据覆盖校验：
+
+```bash
+GOWORK=off go test ./internal/agent
+```
+
+需要 MySQL 的完整链路验证时，设置 `LEARNQ_TEST_MYSQL_DSN` 后运行带 integration 标签的 API 测试；该测试会验证学习记录、复习任务、Agent Run、Planner/Synthesizer/Guardrail Step 和 Tool Call 是否落库。
+
 ### Agent 工作台与执行 Trace
 
 前端 Agent 工作台不直接展示模型的原始调试日志，而是把一次执行整理为可读的观察面：

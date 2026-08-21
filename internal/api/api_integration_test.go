@@ -19,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/WoAiXueXiHa/LearnQ/internal/agent"
+	"github.com/WoAiXueXiHa/LearnQ/internal/agenttool"
 	"github.com/WoAiXueXiHa/LearnQ/internal/api"
 	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
 	"github.com/WoAiXueXiHa/LearnQ/internal/config"
@@ -59,6 +61,18 @@ func setup(t *testing.T) fixture {
 		handler: api.New(s, skill.New(model.Fake{}), api.WithImageStore(imagestore.New(t.TempDir()))).Handler(),
 		store:   s,
 	}
+}
+
+func setupAgent(t *testing.T) fixture {
+	t.Helper()
+	f := setup(t)
+	tools := agenttool.Service{DB: f.store.DB}
+	runtime := agent.New(f.store.DB, model.Fake{})
+	runtime.RegisterTool("study_history_search", tools.StudyHistorySearch)
+	runtime.RegisterTool("weekly_stats", tools.WeeklyStats)
+	runtime.RegisterTool("review_task_create", tools.ReviewTaskCreate)
+	f.handler = api.New(f.store, skill.New(model.Fake{}), api.WithAgentRuntime(runtime)).Handler()
+	return f
 }
 
 func request(t *testing.T, f fixture, method, path, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -392,6 +406,60 @@ func TestSkillRunPersistsAgentStepToolAndTraceEnvelope(t *testing.T) {
 	workflow := request(t, f, http.MethodPost, "/api/v1/skills/multi-agent/runs", `{"modules":["algorithm"]}`, map[string]string{"Content-Type": "application/json"})
 	if workflow.Code != 200 || !strings.Contains(workflow.Body.String(), "algorithm-diagnosis") {
 		t.Fatalf("workflow=%d %s", workflow.Code, workflow.Body)
+	}
+}
+
+func TestAgentRunPersistsPlanToolsReviewAndPresentation(t *testing.T) {
+	f := setupAgent(t)
+	message := "复盘我最近学习的 Go 并发"
+	_, task, err := f.store.CreateStudyRecord(context.Background(), store.CreateRecord{
+		Title: message, Summary: "学习 goroutine、channel 和 context",
+		DurationMinutes: 30,
+		Modules:         []domain.StudyModule{{Category: "backend", Content: "理解取消和超时边界"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	report := domain.Report{TaskID: task.ID, MarkdownContent: "# 每日复盘\n内容", ExportStatus: "succeeded", CreatedAt: now}
+	if err := f.store.DB.Create(&report).Error; err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]any{"message": message, "mode": "auto", "allow_actions": true, "context": map[string]any{"report_id": report.ID}})
+	response := request(t, f, http.MethodPost, "/api/v1/agent/runs", string(payload), map[string]string{"Content-Type": "application/json"})
+	if response.Code != http.StatusOK {
+		t.Fatalf("agent status=%d body=%s", response.Code, response.Body)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := envelope["data"].(map[string]any)
+	runID, _ := data["run_id"].(float64)
+	taskType, _ := data["task_type"].(string)
+	plan, _ := data["plan"].(map[string]any)
+	steps, _ := plan["steps"].([]any)
+	toolCalls, _ := data["tool_calls"].([]any)
+	if uint64(runID) == 0 || taskType != agent.TaskLearningReview || len(steps) != 3 || len(toolCalls) != 3 {
+		t.Fatalf("agent data=%#v", data)
+	}
+	var reviewCount int64
+	if err := f.store.DB.Table("review_tasks").Where("report_id=?", report.ID).Count(&reviewCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if reviewCount != 1 {
+		t.Fatalf("review tasks=%d, want 1", reviewCount)
+	}
+	detail := request(t, f, http.MethodGet, "/api/v1/agent-runs/"+strconvFormat(uint64(runID)), "", nil)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), "presentation") || !strings.Contains(detail.Body.String(), "step_name") {
+		t.Fatalf("agent detail=%d body=%s", detail.Code, detail.Body)
+	}
+	var saved map[string]any
+	if err := f.store.DB.Table("agent_runs").Where("id=?", uint64(runID)).Find(&saved).Error; err != nil {
+		t.Fatal(err)
+	}
+	if saved["task_type"] != agent.TaskLearningReview || saved["status"] != "succeeded" {
+		t.Fatalf("saved run=%#v", saved)
 	}
 }
 
