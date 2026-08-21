@@ -28,6 +28,8 @@ func (r Recorder) Record(ctx context.Context, taskID uint64, workflowID string, 
 		"model_name": response.Model, "input_summary": truncate(input, 500), "output_json": response.Content,
 		"input_tokens": response.InputTokens, "output_tokens": response.OutputTokens, "latency_ms": latency.Milliseconds(),
 		"error_reason": reason, "created_at": time.Now().UTC(),
+		"task_type": "legacy", "status": "succeeded", "plan_json": "{}", "self_check_json": "{}",
+		"completed_at": time.Now().UTC(),
 	}
 	var id uint64
 	err := r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

@@ -19,7 +19,7 @@
   <button id="tab-records" class="active" role="tab" aria-selected="true" aria-controls="records" data-view="records">学习记录</button>
   <button id="tab-task" role="tab" aria-selected="false" aria-controls="task" data-view="task">任务与报告</button>
   <button id="tab-reviews" role="tab" aria-selected="false" aria-controls="reviews" data-view="reviews">复习计划</button>
-  <button id="tab-skills" role="tab" aria-selected="false" aria-controls="skills" data-view="skills">AI Skill</button>
+  <button id="tab-skills" role="tab" aria-selected="false" aria-controls="skills" data-view="skills">Agent 工作台</button>
   <button id="tab-knowledge" role="tab" aria-selected="false" aria-controls="knowledge" data-view="knowledge">学习素材与 RAG</button>
 </nav>
 <main>
@@ -57,6 +57,16 @@
 
   <section id="skills" role="tabpanel" aria-labelledby="tab-skills" hidden>
     <div class="section-head"><div><h2>AI Skill 工作台</h2><p>选择不同 Skill 会使用不同分析路径和真实工具。</p></div></div>
+    <form id="agentForm" class="card agent-form">
+      <label class="wide">告诉 Agent 你要完成什么<input id="agentMessage" placeholder="例如：帮我说明 LearnQ 的 RAG 链路" required></label>
+      <div class="agent-controls">
+        <label>任务模式<select id="agentMode"><option value="auto">自动判断</option><option value="knowledge_qa">知识库问答</option><option value="learning_review">学习复盘</option><option value="project_explanation">项目讲解</option></select></label>
+        <label class="check-label"><input id="agentAllowActions" type="checkbox">允许创建复习任务</label>
+        <label>报告 ID（写入时需要）<input id="agentReportID" type="number" min="1" placeholder="可选"></label>
+      </div>
+      <button id="agentSubmit" type="submit">开始执行</button>
+    </form>
+    <div id="agentResult" class="stack empty">Agent 会先规划，再调用受控工具并展示证据。</div>
     <form id="skillForm" class="card form-grid">
       <label>Skill<select id="skillName"></select></label>
       <label class="wide">输入 JSON<textarea id="skillInput" class="code" rows="8"></textarea></label>

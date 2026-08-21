@@ -138,6 +138,9 @@ Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接
 | `POST` | `/api/v1/review-tasks/:id/skip` | 延后一天 |
 | `GET` | `/api/v1/skills` | 查询 Skill Registry |
 | `POST` | `/api/v1/skills/:name/runs` | 手动运行 Skill |
+| `POST` | `/api/v1/agent/runs` | 创建一次受控 Agent 执行 |
+| `GET` | `/api/v1/agent-runs?limit=10` | 查询最近 Agent Run |
+| `GET` | `/api/v1/agent-runs/:id` | 查询 Agent Run、步骤、工具调用和展示数据 |
 | `POST` | `/api/v1/documents` | 上传 UTF-8 Markdown、TXT 或 JSON 文档 |
 | `GET` | `/api/v1/documents` | 查询文档及索引状态与 index_version |
 | `POST` | `/api/v1/documents/:id/reindex` | 为文档创建新的可靠重建任务 |
@@ -183,6 +186,26 @@ curl -fsS -X POST http://127.0.0.1:8080/api/v1/rag/query \
   -H 'Content-Type: application/json' \
   -d '{"question":"LearnQ 的任务如何恢复？","top_k":5}' | jq
 ```
+
+创建 Agent Run 并查看完整执行结果：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/agent/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"帮我说明 LearnQ 的 RAG 链路","mode":"auto","allow_actions":false,"context":{}}' | jq
+```
+
+响应中的 `plan`、`tool_calls`、`evidence`、`answer` 和 `self_check` 对应页面上的五段式 Trace。打开浏览器中的 Agent 工作台可以直接查看任务判断、计划步骤、受控工具调用、证据卡片、最终回答和自检结论；原始 JSON 只在需要排查时展开。
+
+知识问答没有有效证据时会返回依据不足，不允许模型脱离知识库自由补充。涉及创建复习任务的请求必须同时满足 `allow_actions=true` 和有效 `report_id`，否则只展示建议，不产生写操作。
+
+建议使用以下三条路径验收 Agent 展示：
+
+1. 输入知识库中已有主题，确认出现检索工具、`S1` 引用和最终回答。
+2. 输入知识库中不存在的主题，确认显示依据不足，并在自检区域标记证据不足。
+3. 请求创建复习任务但关闭动作权限，确认工具状态为已拦截且没有新增复习任务。
+
+任务详情页中的旧版学习报告也会展示同样的 Trace 结构。若页面仍显示旧的单行 JSON，先执行 `docker compose up --build -d api`，再刷新浏览器缓存。
 
 上传图片、等待描述完成并加入知识库：
 

@@ -61,6 +61,68 @@ func (f Fake) Generate(ctx context.Context, req ChatRequest) (ChatResponse, erro
 	case "invalid_json":
 		return ChatResponse{Content: "{"}, nil
 	}
+	if req.Skill == "agent-planner" {
+		var input struct {
+			Message      string         `json:"message"`
+			AllowActions bool           `json:"allow_actions"`
+			Context      map[string]any `json:"context"`
+		}
+		_ = json.Unmarshal(req.Input, &input)
+		taskType := "knowledge_qa"
+		if strings.Contains(input.Message, "复盘") || strings.Contains(input.Message, "学习") || strings.Contains(input.Message, "复习") {
+			taskType = "learning_review"
+		} else if strings.Contains(input.Message, "项目") || strings.Contains(input.Message, "面试") || strings.Contains(input.Message, "讲解") {
+			taskType = "project_explanation"
+		}
+		steps := []map[string]any{}
+		switch taskType {
+		case "knowledge_qa":
+			steps = append(steps, map[string]any{"id": 1, "purpose": "检索可核验知识", "tool": "rag_search", "args": map[string]any{"question": input.Message, "top_k": 5}})
+		case "learning_review":
+			steps = append(steps,
+				map[string]any{"id": 1, "purpose": "查询相关学习历史", "tool": "study_history_search", "args": map[string]any{"query": input.Message, "limit": 5}},
+				map[string]any{"id": 2, "purpose": "读取近七天学习统计", "tool": "weekly_stats", "args": map[string]any{}})
+			if input.AllowActions {
+				if reportID, ok := input.Context["report_id"]; ok {
+					steps = append(steps, map[string]any{"id": 3, "purpose": "安排下一次复习", "tool": "review_task_create", "args": map[string]any{"report_id": reportID}})
+				}
+			}
+		case "project_explanation":
+			steps = append(steps,
+				map[string]any{"id": 1, "purpose": "检索项目事实", "tool": "rag_search", "args": map[string]any{"question": input.Message, "top_k": 5}},
+				map[string]any{"id": 2, "purpose": "查询相关学习记录", "tool": "study_history_search", "args": map[string]any{"query": input.Message, "limit": 5}})
+		}
+		content, _ := json.Marshal(map[string]any{"task_type": taskType, "intent": input.Message, "steps": steps})
+		return ChatResponse{Content: string(content), Model: "learnq-fake-planner-v1", InputTokens: len(req.Input) / 4, OutputTokens: len(content) / 4}, nil
+	}
+	if req.Skill == "agent-synthesizer" {
+		var input struct {
+			Message      string `json:"message"`
+			TaskType     string `json:"task_type"`
+			Observations []struct {
+				Tool      string `json:"tool"`
+				Result    any    `json:"result"`
+				Citations []struct {
+					Source  string `json:"source"`
+					Content string `json:"content"`
+				} `json:"citations"`
+			} `json:"observations"`
+		}
+		_ = json.Unmarshal(req.Input, &input)
+		answer := "已根据学习事实整理出下一步建议。"
+		for _, observation := range input.Observations {
+			if len(observation.Citations) > 0 {
+				citation := observation.Citations[0]
+				answer = fmt.Sprintf("关于“%s”，可核验资料指出：%s [%s]", input.Message, strings.TrimSpace(citation.Content), citation.Source)
+				break
+			}
+		}
+		if input.TaskType == "project_explanation" && answer == "已根据学习事实整理出下一步建议。" {
+			answer = "当前没有足够项目事实，无法核验具体实现细节。"
+		}
+		content, _ := json.Marshal(map[string]string{"answer": answer})
+		return ChatResponse{Content: string(content), Model: "learnq-fake-synthesizer-v1", InputTokens: len(req.Input) / 4, OutputTokens: len(content) / 4}, nil
+	}
 	if req.Skill == "rag-answer" {
 		var input struct {
 			Question string `json:"question"`

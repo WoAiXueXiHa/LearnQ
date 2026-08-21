@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/WoAiXueXiHa/LearnQ/internal/agent"
 	"github.com/WoAiXueXiHa/LearnQ/internal/agenttool"
 	"github.com/WoAiXueXiHa/LearnQ/internal/api"
 	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
@@ -54,6 +55,11 @@ func main() {
 	evidence := &rag.EvidenceService{DB: db, Embedding: embedding, Vectors: vectors}
 	tools := agenttool.Service{DB: db, Evidence: evidence}
 	registry.RegisterTool("weekly_stats", tools.WeeklyStats)
+	agentRuntime := agent.New(db, chat)
+	agentRuntime.RegisterTool("rag_search", tools.RAGQuery)
+	agentRuntime.RegisterTool("study_history_search", tools.StudyHistorySearch)
+	agentRuntime.RegisterTool("weekly_stats", tools.WeeklyStats)
+	agentRuntime.RegisterTool("review_task_create", tools.ReviewTaskCreate)
 	registry.RegisterTool("rag_query", tools.RAGQuery)
 	runtimeChatModel, runtimeVisionModel, runtimeEmbeddingModel :=
 		cfg.AIChatModel, cfg.AIVisionModel, cfg.AIEmbeddingModel
@@ -65,7 +71,7 @@ func main() {
 		runtimeEmbeddingModel = "learnq-fake-embedding-v1"
 	}
 	// 组装 API Handler，注入数据库、模型、向量库、队列和工具函数
-	handler := api.New(store.New(db), registry, api.WithRAG(chat, embedding, vectors), api.WithEvidence(evidence),
+	handler := api.New(store.New(db), registry, api.WithRAG(chat, embedding, vectors), api.WithEvidence(evidence), api.WithAgentRuntime(agentRuntime),
 		api.WithImageStore(imagestore.New(cfg.ImageDir)),
 		api.WithRuntimeInfo(cfg.AIMode, runtimeChatModel, runtimeVisionModel, runtimeEmbeddingModel),
 		api.WithRAGMetadata(cfg.RAGCollection),

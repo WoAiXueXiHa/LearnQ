@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/WoAiXueXiHa/LearnQ/internal/agent"
 	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
 	"github.com/WoAiXueXiHa/LearnQ/internal/evaluation"
 	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
@@ -31,15 +32,16 @@ import (
 type Server struct {
 	// Server 通过 Option 注入可选外部能力；基础 CRUD 测试无需启动 Redis/Qdrant/真实模型。
 	// vectors 抽象检索与文档删除两个能力，避免 api 直接依赖 rag 的具体实现类型。
-	store      *store.Store
-	skills     *skill.Registry
-	engine     *gin.Engine
-	recorder   trace.Recorder
-	chat       model.ChatModel
-	imageStore *imagestore.Store
-	embedding  model.EmbeddingModel
-	evidence   *rag.EvidenceService
-	vectors    interface {
+	store        *store.Store
+	skills       *skill.Registry
+	agentRuntime *agent.Runtime
+	engine       *gin.Engine
+	recorder     trace.Recorder
+	chat         model.ChatModel
+	imageStore   *imagestore.Store
+	embedding    model.EmbeddingModel
+	evidence     *rag.EvidenceService
+	vectors      interface {
 		evaluation.Retriever
 		DeleteDocument(context.Context, uint64) error
 	}
@@ -87,6 +89,10 @@ func WithRAG(chat model.ChatModel, embedding model.EmbeddingModel, vectors inter
 		server.vectors = vectors
 		server.evidence = &rag.EvidenceService{DB: server.store.DB, Embedding: embedding, Vectors: vectors}
 	}
+}
+
+func WithAgentRuntime(runtime *agent.Runtime) Option {
+	return func(server *Server) { server.agentRuntime = runtime }
 }
 
 func WithEvidence(evidence *rag.EvidenceService) Option {
@@ -213,6 +219,8 @@ func (s *Server) routes() {
 	v1.POST("/review-tasks/:id/skip", s.skipReview)
 	v1.GET("/skills", func(c *gin.Context) { ok(c, 200, s.skills.List()) })
 	v1.POST("/skills/:name/runs", s.runSkill)
+	v1.POST("/agent/runs", s.runAgent)
+	v1.GET("/agent-runs", s.listAgentRuns)
 	v1.GET("/agent-runs/:id", s.agentRun)
 	v1.POST("/documents", s.uploadDocument)
 	v1.GET("/documents", s.listDocuments)

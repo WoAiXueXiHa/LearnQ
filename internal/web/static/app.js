@@ -318,14 +318,127 @@ function renderMarkdown(markdown) {
 }
 
 function renderTrace(trace) {
+  const readJSON = value => {
+    if (!value) return {};
+    if (typeof value !== "string") return value;
+    try { return JSON.parse(value); } catch (_) { return {}; }
+  };
   const runs = trace?.agent_runs || [];
   const tools = trace?.tool_calls || [];
   const latestModel = runs.find(run => run?.model_name)?.model_name;
   if (latestModel) updateModelMode("", latestModel);
-  return `<div class="card"><h3>Agent 执行轨迹</h3>
-    ${runs.length ? runs.map(run => `<div class="trace-row"><strong>${escapeHTML(run.skill_name)}</strong><span>${escapeHTML(run.model_name)}</span><small>${run.latency_ms} ms · 输入 ${run.input_tokens} / 输出 ${run.output_tokens} tokens</small></div>`).join("") : `<p class="muted">Agent 尚未运行。</p>`}
-    ${tools.length ? `<h4>真实工具调用</h4>${tools.map(tool => `<details><summary>${escapeHTML(tool.tool_name)} · ${tool.latency_ms} ms ${tool.error_reason ? "· 失败" : ""}</summary><pre>${escapeHTML(tool.response_json)}</pre>${tool.retrieval_citations_json !== "[]" ? `<pre>${escapeHTML(tool.retrieval_citations_json)}</pre>` : ""}</details>`).join("")}` : ""}
-  </div>`;
+  if (!runs.length) {
+    return '<section class="trace-shell"><div class="trace-empty"><span class="trace-empty-icon">○</span><strong>还没有 Agent 执行记录</strong><small>完成一次学习报告或 Agent 任务后，执行过程会显示在这里。</small></div></section>';
+  }
+
+  const toolLabels = {
+    weekly_stats: "学习统计",
+    study_history_search: "学习历史",
+    rag_search: "知识库检索",
+    rag_query: "知识库检索",
+    review_task_create: "创建复习任务"
+  };
+  const statusText = status => status === "failed" ? "失败" : status === "blocked" ? "已拦截" : "已完成";
+  const statusClass = status => status === "failed" ? "failed" : status === "blocked" ? "blocked" : "done";
+  const toolSummary = response => {
+    if (response.status === "no_evidence") return "没有检索到可核验证据";
+    if (Array.isArray(response.evidence)) return response.evidence.length + " 条证据";
+    if (Array.isArray(response.records)) return response.records.length + " 条学习记录";
+    if (response.minutes !== undefined) return response.minutes + " 分钟 · " + (response.records || 0) + " 条记录";
+    if (response.status === "blocked") return "动作权限未开启，未执行写入";
+    return response.fact_source ? "事实来源：" + response.fact_source : "工具已返回结果";
+  };
+
+  const runCards = runs.map((run, runIndex) => {
+    const plan = readJSON(run.plan_json);
+    const output = readJSON(run.output_json);
+    const check = readJSON(run.self_check_json);
+    const runTools = tools.filter(tool => !run.id || !tool.agent_run_id || String(tool.agent_run_id) === String(run.id));
+    const planSteps = Array.isArray(plan.steps) ? plan.steps : [];
+    const planHTML = planSteps.length ? planSteps.map((step, index) =>
+      '<div class="trace-plan-step"><span class="trace-plan-number">' + (step.id || index + 1) + '</span><div><strong>' +
+      escapeHTML(step.purpose || toolLabels[step.tool] || step.tool || "执行步骤") + '</strong><small>' +
+      escapeHTML(toolLabels[step.tool] || step.tool || "Agent") + '</small></div></div>'
+    ).join("") : '<div class="trace-empty-inline">固定 Skill 执行，无额外规划步骤。</div>';
+
+    const toolHTML = runTools.length ? runTools.map((tool, index) => {
+      const response = readJSON(tool.response_json);
+      const status = tool.error_reason ? "failed" : response.status === "blocked" ? "blocked" : "succeeded";
+      const citations = readJSON(tool.retrieval_citations_json);
+      const citationCount = Array.isArray(citations) ? citations.length : 0;
+      const detail = {
+        request: readJSON(tool.request_json),
+        response,
+        citations: citations
+      };
+      return '<article class="trace-tool ' + statusClass(status) + '">' +
+        '<div class="trace-tool-marker">' + (index + 1) + '</div><div class="trace-tool-main">' +
+        '<div class="trace-tool-head"><div><strong>' + escapeHTML(toolLabels[tool.tool_name] || tool.tool_name) +
+        '</strong><span class="trace-tool-code">' + escapeHTML(tool.tool_name) + '</span></div><span class="trace-status ' +
+        statusClass(status) + '">' + statusText(status) + '</span></div>' +
+        '<div class="trace-tool-meta"><span>' + Number(tool.latency_ms || 0) + ' ms</span><span>' +
+        escapeHTML(toolSummary(response)) + '</span>' + (citationCount ? '<span>' + citationCount + ' 条引用候选</span>' : '') + '</div>' +
+        '<details class="trace-raw"><summary>查看工具详情</summary><pre>' + escapeHTML(JSON.stringify(detail, null, 2)) + '</pre></details>' +
+        '</div></article>';
+    }).join("") : '<div class="trace-empty-inline">本次执行没有工具调用。</div>';
+
+    const evidence = runTools.flatMap(tool => {
+      const citations = readJSON(tool.retrieval_citations_json);
+      return Array.isArray(citations) ? citations : [];
+    });
+    const evidenceHTML = evidence.length ? '<div class="trace-evidence-grid">' + evidence.map((item, index) =>
+      '<article class="trace-evidence-card"><div class="trace-evidence-label">S' + (index + 1) + '</div><div><strong>' +
+      escapeHTML(item.title || item.source || "检索证据") + '</strong><p>' + escapeHTML(item.summary || item.content || "") +
+      '</p><small>文档 #' + escapeHTML(String(item.document_id || "-")) + ' · 行 ' +
+      escapeHTML(String(item.start_line || "-")) + "–" + escapeHTML(String(item.end_line || "-")) + '</small></div></article>'
+    ).join("") + '</div>' : '<div class="trace-empty-inline">本次没有可展示的引用证据。</div>';
+
+    let answerHTML = "";
+    if (output.answer) {
+      answerHTML = '<div class="trace-answer-content markdown">' + renderMarkdown(output.answer) + '</div>';
+    } else if (output.title || output.summary) {
+      answerHTML = '<div class="trace-answer-content"><h4>' + escapeHTML(output.title || "学习报告") + '</h4><p>' +
+        escapeHTML(output.summary || "") + '</p>' + (output.sections || []).map(section =>
+        '<div class="trace-report-section"><strong>' + escapeHTML(section.heading || "") + '</strong><p>' +
+        renderMarkdown(section.content || "") + '</p></div>').join("") + '</div>';
+    } else {
+      answerHTML = '<div class="trace-empty-inline">暂未生成最终产物。</div>';
+    }
+
+    const runStatus = run.error_reason ? "failed" : run.status === "failed" ? "failed" : "succeeded";
+    const rawRun = {
+      input: run.input_summary,
+      plan,
+      output,
+      self_check: check
+    };
+    return '<article class="trace-run">' +
+      '<header class="trace-run-head"><div><span class="trace-eyebrow">执行 ' + (runIndex + 1) + '</span><h3>' +
+      escapeHTML(run.task_type || run.skill_name || "Agent Run") + '</h3><p>' +
+      escapeHTML(run.input_summary || "后台任务执行") + '</p></div><div class="trace-run-meta"><span class="trace-status ' +
+      statusClass(runStatus) + '">' + statusText(runStatus) + '</span><strong>' + Number(run.latency_ms || 0) +
+      ' ms</strong><small>' + escapeHTML(run.model_name || "模型未记录") + '</small></div></header>' +
+      '<div class="trace-kpis"><span><strong>' + runTools.length + '</strong> 个工具</span><span><strong>' +
+      evidence.length + '</strong> 条证据</span><span>输入 ' + Number(run.input_tokens || 0) + ' · 输出 ' +
+      Number(run.output_tokens || 0) + ' tokens</span></div>' +
+      '<section class="trace-node"><div class="trace-node-title"><span class="trace-node-index">01</span><div><strong>执行计划</strong><small>Agent 如何拆解目标</small></div></div><div class="trace-plan">' +
+      planHTML + '</div></section>' +
+      '<section class="trace-node"><div class="trace-node-title"><span class="trace-node-index">02</span><div><strong>工具调用</strong><small>受控工具执行结果</small></div></div><div class="trace-tools">' +
+      toolHTML + '</div></section>' +
+      '<section class="trace-node"><div class="trace-node-title"><span class="trace-node-index">03</span><div><strong>证据与引用</strong><small>回答实际可依据的内容</small></div></div>' +
+      evidenceHTML + '</section>' +
+      '<section class="trace-node"><div class="trace-node-title"><span class="trace-node-index">04</span><div><strong>最终产物</strong><small>基于工具结果生成的回答</small></div></div>' +
+      answerHTML + '</section>' +
+      '<section class="trace-node trace-check-node"><div class="trace-node-title"><span class="trace-node-index">05</span><div><strong>自检结果</strong><small>系统对输出边界的确定性检查</small></div></div><div class="trace-check-grid">' +
+      '<span class="' + (check.citation_valid ? "pass" : "warn") + '">引用 ' + (check.citation_valid ? "通过" : "不足") + '</span><span class="' +
+      (check.grounded ? "pass" : "warn") + '">证据 ' + (check.grounded ? "充足" : "不足") + '</span><span class="' +
+      (check.action_policy_passed !== false ? "pass" : "warn") + '">动作权限 ' + (check.action_policy_passed !== false ? "通过" : "受限") + '</span>' +
+      '</div>' + ((check.warnings || []).length ? '<ul class="trace-warnings">' + check.warnings.map(item => '<li>' + escapeHTML(item) + '</li>').join("") + '</ul>' : '') + '</section>' +
+      '<details class="trace-raw trace-run-raw"><summary>查看本次执行原始数据</summary><pre>' + escapeHTML(JSON.stringify(rawRun, null, 2)) + '</pre></details>' +
+      '</article>';
+  }).join("");
+
+  return '<section class="trace-shell"><div class="trace-shell-head"><div><span class="trace-eyebrow">AGENT OBSERVABILITY</span><h2>Agent 执行轨迹</h2><p>从目标、计划到证据和自检，完整展示这次执行如何完成。</p></div><span class="trace-live-dot">已记录</span></div>' + runCards + '</section>';
 }
 
 const taskStatusText = {
@@ -896,6 +1009,39 @@ $("#ragForm").onsubmit = async event => {
   }
 };
 
+function renderAgentResult(data) {
+  const plan = data.plan || {steps: []};
+  const calls = data.tool_calls || [];
+  const evidence = data.evidence || [];
+  const check = data.self_check || {};
+  const stepHTML = (plan.steps || []).map(step => '<div class="agent-step"><span>' + escapeHTML(String(step.id)) + '</span><div><strong>' + escapeHTML(step.tool || '计划') + '</strong><small>' + escapeHTML(step.purpose || '') + '</small></div></div>').join('');
+  const callHTML = calls.map(call => '<article class="agent-call"><div class="card-title"><strong>' + escapeHTML(call.name) + '</strong><span class="status ' + (call.status === 'succeeded' ? 'succeeded' : call.status === 'blocked' ? 'pending' : 'failed') + '">' + escapeHTML(call.status) + '</span></div><small>' + Number(call.latency_ms || 0) + ' ms' + (call.error ? ' · ' + escapeHTML(call.error) : '') + '</small></article>').join('');
+  const evidenceHTML = evidence.map((item, index) => '<article class="card citation"><strong>[S' + (index + 1) + '] ' + escapeHTML(item.title || item.source || '知识库证据') + '</strong><p>' + escapeHTML(item.content || item.summary || '') + '</p></article>').join('');
+  const warnings = (check.warnings || []).map(item => '<li>' + escapeHTML(item) + '</li>').join('');
+  $('#agentResult').className = 'stack';
+  $('#agentResult').innerHTML = '<article class="card agent-answer"><div class="card-title"><h3>' + escapeHTML(data.task_type || 'Agent 执行') + '</h3><span class="status succeeded">' + escapeHTML(data.status || '') + '</span></div><div class="markdown">' + renderMarkdown(data.answer || '') + '</div></article>' +
+    '<section class="card"><h3>执行计划</h3><p class="muted">' + escapeHTML(plan.intent || '') + '</p><div class="agent-plan">' + stepHTML + '</div></section>' +
+    '<section class="card"><h3>工具调用</h3><div class="agent-calls">' + (callHTML || '<p class="muted">没有调用工具。</p>') + '</div></section>' +
+    (evidenceHTML ? '<section><h3>回答依据</h3><div class="cards">' + evidenceHTML + '</div></section>' : '<div class="card warning">本次没有可展示的知识库证据。</div>') +
+    '<section class="card agent-check"><h3>自检</h3><p>引用：' + (check.citation_valid ? '通过' : '未通过') + ' · 证据约束：' + (check.grounded ? '通过' : '不足') + ' · 动作权限：' + (check.action_policy_passed ? '通过' : '受限') + '</p>' + (warnings ? '<ul>' + warnings + '</ul>' : '') + '</section>';
+}
+
+$('#agentForm').onsubmit = async event => {
+  event.preventDefault();
+  const button = $('#agentSubmit');
+  setButtonBusy(button, true, '执行中…');
+  const context = {};
+  const reportID = Number($('#agentReportID').value);
+  if (reportID > 0) context.report_id = reportID;
+  try {
+    const data = await request('/agent/runs', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message: $('#agentMessage').value, mode: $('#agentMode').value, allow_actions: $('#agentAllowActions').checked, context})}, 85000);
+    renderAgentResult(data);
+  } catch (error) {
+    $('#agentResult').innerHTML = '<div class="card danger">' + escapeHTML(error.message) + '</div>';
+  } finally {
+    setButtonBusy(button, false);
+  }
+};
 async function loadSkills() {
   const runButton = $("#skillForm button[type=submit]");
   runButton.disabled = true;

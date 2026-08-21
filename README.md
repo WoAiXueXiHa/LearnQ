@@ -15,6 +15,28 @@ LearnQ 是一个面向个人学习复盘的本地 AI 应用。用户提交一次
 - Skill 工作台：运行版本化 Skill 和 Eino Compose Multi-Agent 实验，保存 Agent、Tool、耗时和 token 轨迹。
 - 运行状态：展示任务时间线、失败原因、报告、引用和依赖健康状态，并通过 /metrics 暴露队列、Outbox、租约、恢复、模型耗时和 token 指标。
 
+## Agent 执行链路
+
+LearnQ 的 AI 主链路不是让模型直接回答，而是把用户目标拆成受控执行过程：
+
+```text
+用户目标
+  -> Planner 判断任务类型并生成计划
+  -> Go 校验工具白名单、参数和动作权限
+  -> Executor 顺序调用知识库、学习历史、统计和复习工具
+  -> Synthesizer 只基于 observation 和 evidence 生成回答
+  -> Guardrail 校验引用、证据边界和写操作权限
+  -> MySQL 保存 Run、Step、Tool Call 与自检结果
+```
+
+首版支持三类任务：
+
+- `knowledge_qa`：检索知识库并生成带 `[S1]` 引用的回答。
+- `learning_review`：结合学习历史和近七天统计生成复盘建议。
+- `project_explanation`：根据项目资料组织方案、权衡、验证和追问，不编造 QPS、P99 或生产规模。
+
+Planner 只能提出计划，不能直接执行函数。Go 后端负责工具白名单、调用次数上限、参数校验和复习任务写权限；这样模型具有任务分解能力，但业务状态仍由后端控制。每次执行都会记录计划、工具结果、检索证据、最终回答和自检结论，前端以 Agent 工作台展示完整过程。
+
 ## 系统架构
 
 ```text
@@ -24,7 +46,7 @@ Browser
 Gin API + Embedded Web
    |
    +---- MySQL ----------------------------------------+
-   |     业务事实 / 任务 / Outbox / 报告 / Trace        |
+   |     业务事实 / 任务 / Outbox / 报告 / Trace         |
    |                                                   |
    +--> Outbox Dispatcher --> Redis ready queue        |
                                  |                     |
@@ -66,6 +88,32 @@ Gin API + Embedded Web
 ### MySQL 作为事实源
 
 学习记录、任务状态、报告、复习、文档和执行轨迹都以 MySQL 为最终事实。Redis 负责可恢复的任务调度，Qdrant 保存可重建的检索索引，避免把业务正确性绑定到缓存状态。
+
+## Agent API
+
+启动本地服务后，可以通过 Agent 工作台或 API 演示完整链路：
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/agent/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"帮我说明 LearnQ 的 RAG 链路","mode":"auto","allow_actions":false,"context":{}}'
+```
+
+响应包括 `run_id`、`task_type`、`plan`、`tool_calls`、`evidence`、`answer` 和 `self_check`。最近执行记录可通过 `GET /api/v1/agent-runs?limit=10` 查询，详情可通过 `GET /api/v1/agent-runs/:id` 查询。
+
+如果没有有效证据，知识问答会明确返回依据不足；如果请求包含复习任务创建计划，只有显式设置 `allow_actions=true` 并提供有效 `report_id` 才允许写入复习任务。
+
+### Agent 工作台与执行 Trace
+
+前端 Agent 工作台不直接展示模型的原始调试日志，而是把一次执行整理为可读的观察面：
+
+```text
+执行概览 -> 执行计划 -> 工具调用 -> 证据与引用 -> 最终产物 -> 自检结果
+```
+
+工具调用默认展示工具用途、耗时、状态和结果摘要；知识库命中内容以 `S1`、`S2` 证据卡片展示，并保留文档编号和行号。原始请求与响应放在折叠区域，便于排查而不干扰主要阅读路径。自检区域明确区分引用格式、证据充分性和动作权限，避免把格式检查误认为事实正确性验证。
+
+任务详情页中的历史 Skill Trace 也沿用同一套展示方式，并兼容没有计划数据的旧记录。布局在 375px、390px 和 430px 等手机宽度下自动收窄，保证工具结果、引用和最终回答可以直接在移动浏览器中查看。
 
 ### Transactional Outbox
 
@@ -109,6 +157,7 @@ Reaper 从 MySQL 分批扫描过期任务并推进重试或终止；Reconciler �
 ├── internal/
 │   ├── api/                 # HTTP API 与读模型
 │   ├── store/               # MySQL 事务与任务状态
+│   ├── agent/                # Agent Runtime、计划、工具执行与自检
 │   ├── queue/               # Redis 队列与 Lua
 │   ├── worker/              # 异步任务执行
 │   ├── recovery/            # Reaper 与 Reconciler

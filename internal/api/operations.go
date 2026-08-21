@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/WoAiXueXiHa/LearnQ/internal/agent"
 	"io"
 	"net/http"
 	"regexp"
@@ -245,6 +246,50 @@ func (s *Server) runSkill(c *gin.Context) {
 	ok(c, 200, gin.H{"agent_run_id": runID, "output": json.RawMessage(output.Content)})
 }
 
+// runAgent executes the bounded Planner -> Tools -> Synthesizer -> Guardrail path.
+func (s *Server) runAgent(c *gin.Context) {
+	if s.agentRuntime == nil {
+		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "Agent Runtime is not configured", nil)
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 128<<10))
+	if err != nil || !json.Valid(body) {
+		fail(c, 422, "VALIDATION_FAILED", "valid Agent JSON is required", nil)
+		return
+	}
+	var request agent.RunRequest
+	if err := json.Unmarshal(body, &request); err != nil {
+		fail(c, 422, "VALIDATION_FAILED", "Agent request is invalid", nil)
+		return
+	}
+	requestCtx, cancel := context.WithTimeout(c.Request.Context(), skillRequestTimeout)
+	defer cancel()
+	result, err := s.agentRuntime.Run(requestCtx, request)
+	if err != nil {
+		var dependencyErr *model.DependencyError
+		if errors.As(err, &dependencyErr) {
+			failModelDependency(c, err)
+			return
+		}
+		fail(c, 422, "AGENT_RUN_FAILED", err.Error(), nil)
+		return
+	}
+	ok(c, 200, result)
+}
+
+func (s *Server) listAgentRuns(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "10"))
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	var runs []map[string]any
+	if err := s.store.DB.Table("agent_runs").Where("skill_name=?", "agent-runtime").Order("id DESC").Limit(limit).Find(&runs).Error; err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not load Agent Runs", nil)
+		return
+	}
+	ok(c, 200, runs)
+}
+
 // agentRun 处理 GET /api/v1/agent-runs/:id：返回单次执行的 run、steps 与 tool_calls。
 func (s *Server) agentRun(c *gin.Context) {
 	id, valid := parseID(c)
@@ -265,7 +310,35 @@ func (s *Server) agentRun(c *gin.Context) {
 		fail(c, 500, "INTERNAL_ERROR", "could not load tool calls", nil)
 		return
 	}
-	ok(c, 200, gin.H{"run": run, "steps": steps, "tool_calls": tools})
+	plan := decodeTraceJSON(run["plan_json"])
+	check := decodeTraceJSON(run["self_check_json"])
+	output := decodeTraceJSON(run["output_json"])
+	outputMap, _ := output.(map[string]any)
+	presentation := gin.H{
+		"run_id": run["id"], "task_type": run["task_type"], "status": run["status"],
+		"plan": plan, "answer": outputMap["answer"], "evidence": outputMap["evidence"],
+		"self_check": check, "steps": steps, "tool_calls": tools,
+	}
+	ok(c, 200, gin.H{"run": run, "steps": steps, "tool_calls": tools, "presentation": presentation})
+
+}
+
+// decodeTraceJSON converts MySQL JSON fields into values the Web UI can render directly.
+func decodeTraceJSON(value any) any {
+	var raw []byte
+	switch typed := value.(type) {
+	case string:
+		raw = []byte(typed)
+	case []byte:
+		raw = typed
+	default:
+		return value
+	}
+	var decoded any
+	if json.Unmarshal(raw, &decoded) != nil {
+		return value
+	}
+	return decoded
 }
 
 // uploadDocument 处理 POST /api/v1/documents：multipart 上传，限 5 MiB 且仅收 md/txt/json；
