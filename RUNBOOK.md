@@ -153,7 +153,7 @@ Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接
 | `POST` | `/api/v1/images/:id/index` | 将已完成描述幂等地加入知识库 |
 | `DELETE` | `/api/v1/images/:id` | 删除图片及其衍生文档/向量 |
 | `POST` | `/api/v1/rag/query` | 基于已就绪文档进行 RAG 查询 |
-| `POST` | `/api/v1/evaluations/rag` | 使用包含真实 chunk ID 的 JSONL 执行 RAG 离线评估 |
+| `POST` | `/api/v1/evaluations/rag` | 使用真实 chunk ID 或可唯一解析的 `citation_text` JSONL 执行 RAG 离线评估 |
 | `GET` | `/api/v1/analytics/weekly` | 查询周统计 |
 
 创建学习记录：
@@ -186,6 +186,22 @@ curl -fsS -X POST http://127.0.0.1:8080/api/v1/rag/query \
   -H 'Content-Type: application/json' \
   -d '{"question":"LearnQ 的任务如何恢复？","top_k":5}' | jq
 ```
+
+运行 RAG 离线评估：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/documents \
+  -F 'file=@README.md;type=text/markdown' | jq
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/documents \
+  -F 'file=@RUNBOOK.md;type=text/markdown' | jq
+
+# 等待文档状态变为 ready 后执行。data/eval/rag.jsonl 使用 citation_text，
+# 服务端会解析为当前 ready chunk；命中 0 个或多个 chunk 时评测会拒绝执行。
+curl -fsS -X POST http://127.0.0.1:8080/api/v1/evaluations/rag \
+  --data-binary @data/eval/rag.jsonl | jq
+```
+
+报告中的 Markdown 表按 `dense-only`、`sparse-only` 和 `hybrid-rrf` 展示 Recall@5、NDCG 与检索覆盖率。一次成功评估会写入 `rag_evaluations`，可通过 `GET /api/v1/evaluations/rag/:id/report.md` 取回同一张结果表。
 
 创建 Agent Run 并查看完整执行结果：
 
@@ -292,6 +308,69 @@ make acceptance
 - 周统计与 Worker 停启恢复
 
 脚本退出时会清理自己的容器和数据卷，不影响默认 LearnQ 环境。自动测试始终使用 Fake 或 Mock 模型，不会产生付费 API 调用。
+
+## 故障恢复演示
+
+以下实验会修改队列、任务状态或停止 Worker，建议在临时 Compose 项目中执行。每个实验结束后都可以用 `/api/v1/tasks/:id/detail`、`/metrics` 或 MySQL 查询核对。
+
+### 模型临时失败重试
+
+自动证据：
+
+```bash
+GOWORK=off go test ./internal/model -run TestFakeFailureInjection
+LEARNQ_TEST_MYSQL_DSN='learnq:learnq@tcp(127.0.0.1:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true' \
+  GOWORK=off go test -tags=integration ./internal/store -run TestThreeAttemptsUseRetryWaitThenDead
+```
+
+预期：Fake 模型能注入 `temporary model error`；Store 在临时失败后按退避把任务推进 `retry_wait` 或最终 `dead`，不会把失败报告标记为成功。
+
+### Redis 队列丢失后 Reconciler 补回
+
+```bash
+body='{"title":"reconcile demo","summary":"queue loss","duration_minutes":20,"modules":[{"category":"backend","content":"outbox reconciler"}]}'
+task_id=$(curl -fsS -X POST http://127.0.0.1:8080/api/v1/study-records \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: reconcile-demo' \
+  -d "$body" | jq -r '.data.task_id')
+
+docker compose exec mysql mysql -ulearnq -plearnq learnq \
+  -e "UPDATE ai_tasks SET status='queued', available_at=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 10 MINUTE) WHERE id=$task_id"
+docker compose exec redis redis-cli ZREM learnq:tasks:ready "$task_id"
+
+# Worker 内置 Reconciler 周期会补回；也可重启 worker 触发后台循环继续执行。
+sleep 8
+docker compose exec redis redis-cli ZSCORE learnq:tasks:ready "$task_id"
+curl -fsS http://127.0.0.1:8080/metrics | grep learnq_reconciler_queued_enqueued_total
+```
+
+预期：Redis ready ZSet 重新出现该 task，score 是未来时间因此不会立刻被 Worker claim；指标 `learnq_reconciler_queued_enqueued_total` 增加；业务事实仍以 MySQL 中的 `queued` 任务为准。
+
+### 旧 Worker lease 过期后提交被 fencing 拒绝
+
+自动证据：
+
+```bash
+LEARNQ_TEST_MYSQL_DSN='learnq:learnq@tcp(127.0.0.1:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true' \
+  GOWORK=off go test -tags=integration ./internal/store -run TestExpiredLeaseCanOnlyBeFailedByReaperPath
+```
+
+预期：过期 Worker 的常规 `Fail`/`Complete` 路径返回 `task lease lost`；只有 Reaper 专用的过期路径能推进重试或终止，避免旧结果覆盖新 generation。
+
+### shadow rebuild 失败不切 alias
+
+```bash
+# 先确认至少有 ready 文档，并让 alias 指向当前集合。
+curl -fsS http://127.0.0.1:6333/aliases | jq
+
+# 使用不可达的 Qdrant URL 制造 shadow rebuild 失败。
+QDRANT_URL=http://127.0.0.1:1 RAG_COLLECTION=learnq_live \
+  GOWORK=off go run ./cmd/reindex --all --limit 1000 \
+  --shadow-collection learnq_shadow_bad --alias learnq_live
+
+curl -fsS http://127.0.0.1:6333/aliases | jq
+```
+
+预期：命令失败并输出 `alias was not changed` 或连接错误；第二次 alias 查询仍指向旧 collection。只有全部 ready 文档成功写入 shadow collection 后才会切换 alias。
 
 ## 常见问题
 

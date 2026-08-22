@@ -22,7 +22,7 @@ func TestEvaluationRequiresExplicitDataset(t *testing.T) {
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/evaluations/rag", strings.NewReader("{}"))
 	validationHandler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "real chunk ids is required") {
+	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), "evaluation JSONL dataset is required") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body)
 	}
 }

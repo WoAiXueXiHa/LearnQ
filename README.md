@@ -85,6 +85,21 @@ Gin API + Embedded Web
 
 ## 设计亮点
 
+### AI 工程化亮点
+
+一句话业务闭环：用户提交学习事实，系统用可靠异步任务生成报告和复习计划，并把文档问答限制在可核验证据内。
+
+| 链路 | 面试时可展示的证据 |
+|---|---|
+| 可控 Agent | Planner 只产出计划，Go 后端执行工具白名单、参数校验、调用次数上限和写权限校验；Run、Step、Tool Call 与 Self Check 全部落库。 |
+| 可核验 RAG | ready 文档 chunk 先经 MySQL 复核再作为证据；回答引用本次证据；离线评估比较 dense-only、sparse-only、hybrid-rrf 的 Recall@5、NDCG@5 和覆盖率。 |
+| 可恢复异步任务 | record、task、outbox 同事务提交；Redis 只做调度，MySQL Acquire 建立事实源租约；Reaper/Reconciler 负责过期任务和队列缺口恢复。 |
+| 可重建索引 | MySQL 保存文档和 chunks，Qdrant 可重建；Embedding 升级可用 shadow collection，全部成功后再切 alias。 |
+
+为什么不用同步模型调用：模型调用耗时长且可能临时失败，同步请求会把用户提交、模型依赖和报告持久化绑在一个脆弱路径里。LearnQ 先持久化业务事实，再通过可重试任务生成 AI 结果，用户可以查询任务状态和失败原因。
+
+为什么 Redis Claim 后还要 MySQL Acquire：Redis Claim 只说明一个 Worker 从调度队列拿到了 ID；MySQL Acquire 才把任务从 `queued` 条件更新为 `processing`，写入 attempt、lease token 和 generation。最终完成也必须匹配这些字段，所以旧 Worker、重复投递和人工重试后的旧结果都会被 fencing 拒绝。
+
 ### MySQL 作为事实源
 
 学习记录、任务状态、报告、复习、文档和执行轨迹都以 MySQL 为最终事实。Redis 负责可恢复的任务调度，Qdrant 保存可重建的检索索引，避免把业务正确性绑定到缓存状态。

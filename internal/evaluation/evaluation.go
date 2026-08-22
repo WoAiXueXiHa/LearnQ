@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -56,6 +57,10 @@ type Retriever interface {
 	Hybrid(context.Context, []float32, rag.SparseVector, int) ([]rag.Hit, error)
 }
 
+// CitationResolver resolves a citation snippet against the currently ready
+// indexed chunks. It returns every chunk id whose content contains the snippet.
+type CitationResolver func(context.Context, string) ([]string, error)
+
 // ReadJSONL 逐行解析 JSONL 评估集：跳过空行，校验每个用例的必填字段
 // 与 chunk_id 占位符，任一用例非法则整体失败并返回错误。
 func ReadJSONL(reader io.Reader) ([]Case, error) {
@@ -71,33 +76,81 @@ func ReadJSONL(reader io.Reader) ([]Case, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &item); err != nil {
 			return nil, err
 		}
-		if item.ID == "" || item.Question == "" || len(item.RelevantChunks) == 0 {
-			return nil, fmt.Errorf("evaluation case misses id, question, or relevant_chunks")
+		item.ID = strings.TrimSpace(item.ID)
+		item.Question = strings.TrimSpace(item.Question)
+		item.CitationText = strings.TrimSpace(item.CitationText)
+		if item.ID == "" || item.Question == "" {
+			return nil, fmt.Errorf("evaluation case misses id or question")
 		}
-		seenChunks := make(map[string]struct{}, len(item.RelevantChunks))
-		positive := 0
-		for _, judgment := range item.RelevantChunks {
-			chunkID := strings.TrimSpace(judgment.ChunkID)
-			if chunkID == "" || strings.Contains(strings.ToLower(chunkID), "replace-with") {
-				return nil, fmt.Errorf("evaluation case %s contains an empty or placeholder chunk_id", item.ID)
-			}
-			if judgment.Relevance < 0 {
-				return nil, fmt.Errorf("evaluation case %s contains negative relevance", item.ID)
-			}
-			if _, duplicate := seenChunks[chunkID]; duplicate {
-				return nil, fmt.Errorf("evaluation case %s contains duplicate chunk_id %s", item.ID, chunkID)
-			}
-			seenChunks[chunkID] = struct{}{}
-			if judgment.Relevance > 0 {
-				positive++
-			}
+		if len(item.RelevantChunks) == 0 && item.CitationText == "" {
+			return nil, fmt.Errorf("evaluation case %s misses relevant_chunks or citation_text", item.ID)
 		}
-		if positive == 0 {
-			return nil, fmt.Errorf("evaluation case %s has no positively relevant chunk", item.ID)
+		if len(item.RelevantChunks) > 0 {
+			if err := validateJudgments(item.ID, item.RelevantChunks); err != nil {
+				return nil, err
+			}
 		}
 		cases = append(cases, item)
 	}
 	return cases, scanner.Err()
+}
+
+// ResolveCitationText turns citation_text-only cases into relevant_chunks by
+// searching ready document chunks. Missing or ambiguous snippets fail the whole
+// dataset so metrics cannot be produced from accidental matches.
+func ResolveCitationText(ctx context.Context, cases []Case, resolver CitationResolver) ([]Case, error) {
+	if resolver == nil {
+		return nil, errors.New("citation resolver is required")
+	}
+	resolved := make([]Case, len(cases))
+	copy(resolved, cases)
+	for index := range resolved {
+		if len(resolved[index].RelevantChunks) > 0 {
+			continue
+		}
+		snippet := strings.TrimSpace(resolved[index].CitationText)
+		if snippet == "" {
+			return nil, fmt.Errorf("evaluation case %s misses citation_text", resolved[index].ID)
+		}
+		chunkIDs, err := resolver(ctx, snippet)
+		if err != nil {
+			return nil, fmt.Errorf("resolve citation_text for case %s: %w", resolved[index].ID, err)
+		}
+		switch len(chunkIDs) {
+		case 0:
+			return nil, fmt.Errorf("evaluation case %s citation_text matched no ready chunk", resolved[index].ID)
+		case 1:
+			resolved[index].RelevantChunks = []Judgment{{ChunkID: chunkIDs[0], Relevance: 3}}
+		default:
+			return nil, fmt.Errorf("evaluation case %s citation_text is ambiguous: matched %d ready chunks", resolved[index].ID, len(chunkIDs))
+		}
+	}
+	return resolved, nil
+}
+
+func validateJudgments(caseID string, judgments []Judgment) error {
+	seenChunks := make(map[string]struct{}, len(judgments))
+	positive := 0
+	for _, judgment := range judgments {
+		chunkID := strings.TrimSpace(judgment.ChunkID)
+		if chunkID == "" || strings.Contains(strings.ToLower(chunkID), "replace-with") {
+			return fmt.Errorf("evaluation case %s contains an empty or placeholder chunk_id", caseID)
+		}
+		if judgment.Relevance < 0 {
+			return fmt.Errorf("evaluation case %s contains negative relevance", caseID)
+		}
+		if _, duplicate := seenChunks[chunkID]; duplicate {
+			return fmt.Errorf("evaluation case %s contains duplicate chunk_id %s", caseID, chunkID)
+		}
+		seenChunks[chunkID] = struct{}{}
+		if judgment.Relevance > 0 {
+			positive++
+		}
+	}
+	if positive == 0 {
+		return fmt.Errorf("evaluation case %s has no positively relevant chunk", caseID)
+	}
+	return nil
 }
 
 // Run 对全部用例跑三种检索路径并累计三组指标，最后按用例数取平均。

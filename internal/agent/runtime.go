@@ -129,6 +129,9 @@ func (r *Runtime) Run(ctx context.Context, request RunRequest) (Result, error) {
 				args["report_id"] = request.Context["report_id"]
 			}
 		}
+		if err := validateToolArgs(step.Tool, args); err != nil {
+			return Result{}, err
+		}
 		input := mustJSON(args)
 		call := ToolCall{Name: step.Tool, Request: input, Status: "succeeded"}
 		tool, ok := r.Tools[step.Tool]
@@ -284,6 +287,97 @@ func validTask(value string) bool {
 	return value == TaskKnowledgeQA || value == TaskLearningReview || value == TaskProjectExplanation
 }
 
+func validateToolArgs(tool string, args map[string]any) error {
+	switch tool {
+	case "rag_search":
+		if err := rejectUnknownArgs(tool, args, map[string]bool{"question": true, "topic": true, "summary": true, "title": true, "top_k": true}); err != nil {
+			return err
+		}
+		query := ""
+		for _, key := range []string{"question", "topic", "summary", "title"} {
+			if value, ok := args[key].(string); ok && strings.TrimSpace(value) != "" {
+				query = strings.TrimSpace(value)
+				break
+			}
+		}
+		if query == "" {
+			return errors.New("rag_search requires a non-empty question, topic, summary or title")
+		}
+		if topK, exists, err := intArg(args, "top_k"); err != nil {
+			return err
+		} else if exists && (topK < 1 || topK > 20) {
+			return errors.New("rag_search.top_k must be between 1 and 20")
+		}
+	case "study_history_search":
+		if err := rejectUnknownArgs(tool, args, map[string]bool{"query": true, "limit": true}); err != nil {
+			return err
+		}
+		query, _ := args["query"].(string)
+		if strings.TrimSpace(query) == "" {
+			return errors.New("study_history_search.query is required")
+		}
+		if limit, exists, err := intArg(args, "limit"); err != nil {
+			return err
+		} else if exists && (limit < 1 || limit > 10) {
+			return errors.New("study_history_search.limit must be between 1 and 10")
+		}
+	case "weekly_stats":
+		if len(args) != 0 {
+			return errors.New("weekly_stats does not accept arguments")
+		}
+	case "review_task_create":
+		if err := rejectUnknownArgs(tool, args, map[string]bool{"report_id": true}); err != nil {
+			return err
+		}
+		reportID, exists, err := intArg(args, "report_id")
+		if err != nil {
+			return err
+		}
+		if !exists || reportID < 1 {
+			return errors.New("review_task_create.report_id must be a positive integer")
+		}
+	default:
+		return fmt.Errorf("tool %q is not configured for argument validation", tool)
+	}
+	return nil
+}
+
+func rejectUnknownArgs(tool string, args map[string]any, allowed map[string]bool) error {
+	for key := range args {
+		if !allowed[key] {
+			return fmt.Errorf("%s contains unsupported argument %q", tool, key)
+		}
+	}
+	return nil
+}
+
+func intArg(args map[string]any, key string) (int, bool, error) {
+	value, exists := args[key]
+	if !exists || value == nil {
+		return 0, false, nil
+	}
+	switch typed := value.(type) {
+	case int:
+		return typed, true, nil
+	case int64:
+		return int(typed), true, nil
+	case uint64:
+		maxInt := int(^uint(0) >> 1)
+		if typed > uint64(maxInt) {
+			return 0, true, fmt.Errorf("%s is too large", key)
+		}
+		return int(typed), true, nil
+	case float64:
+		integer := int(typed)
+		if typed != float64(integer) {
+			return 0, true, fmt.Errorf("%s must be an integer", key)
+		}
+		return integer, true, nil
+	default:
+		return 0, true, fmt.Errorf("%s must be an integer", key)
+	}
+}
+
 func inferTask(message string) string {
 	if strings.Contains(message, "复盘") || strings.Contains(message, "学习") || strings.Contains(message, "复习") {
 		return TaskLearningReview
@@ -296,22 +390,30 @@ func inferTask(message string) string {
 
 func checkAnswer(taskType, answer string, observations []map[string]any) SelfCheck {
 	check := SelfCheck{CitationValid: true, Grounded: true, ActionPolicyPass: true}
+	for _, observation := range observations {
+		result, _ := observation["result"].(map[string]any)
+		if result["status"] == "blocked" {
+			check.ActionPolicyPass = false
+			check.Warnings = append(check.Warnings, "写操作权限未通过：本次没有执行状态变更")
+			break
+		}
+	}
 	if taskType == TaskKnowledgeQA || taskType == TaskProjectExplanation {
 		candidates := len(collectEvidence(observations))
 		refs := citationPattern.FindAllStringSubmatch(answer, -1)
 		if candidates == 0 {
 			check.CitationValid, check.Grounded = false, false
-			check.Warnings = append(check.Warnings, "没有可引用证据")
+			check.Warnings = append(check.Warnings, "证据不足：本次执行没有可引用证据")
 		}
 		if len(refs) == 0 && candidates > 0 {
 			check.CitationValid = false
-			check.Warnings = append(check.Warnings, "回答未包含证据引用")
+			check.Warnings = append(check.Warnings, "引用格式无效：回答没有引用本次证据")
 		}
 		for _, ref := range refs {
 			index, _ := strconv.Atoi(ref[1])
 			if index < 1 || index > candidates {
 				check.CitationValid = false
-				check.Warnings = append(check.Warnings, "回答包含越界引用")
+				check.Warnings = append(check.Warnings, "引用格式无效：回答引用了本次证据列表之外的来源")
 				break
 			}
 		}

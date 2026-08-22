@@ -35,6 +35,36 @@ func TestAllowedToolBoundary(t *testing.T) {
 	}
 }
 
+func TestValidateToolArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		args map[string]any
+		want string
+	}{
+		{name: "rag empty query", tool: "rag_search", args: map[string]any{"question": " "}, want: "requires a non-empty"},
+		{name: "rag top k low", tool: "rag_search", args: map[string]any{"question": "q", "top_k": 0}, want: "top_k"},
+		{name: "rag extra", tool: "rag_search", args: map[string]any{"question": "q", "sql": "drop"}, want: "unsupported argument"},
+		{name: "weekly no args", tool: "weekly_stats", args: map[string]any{"limit": 1}, want: "does not accept arguments"},
+		{name: "review report id", tool: "review_task_create", args: map[string]any{"report_id": 0}, want: "positive integer"},
+		{name: "study limit", tool: "study_history_search", args: map[string]any{"query": "go", "limit": 99}, want: "limit"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateToolArgs(test.tool, test.args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("err=%v want=%q", err, test.want)
+			}
+		})
+	}
+	if err := validateToolArgs("rag_search", map[string]any{"question": "q", "top_k": float64(5)}); err != nil {
+		t.Fatalf("valid rag args rejected: %v", err)
+	}
+	if err := validateToolArgs("review_task_create", map[string]any{"report_id": uint64(7)}); err != nil {
+		t.Fatalf("valid review args rejected: %v", err)
+	}
+}
+
 func TestCheckAnswerCitationsAndEvidenceBoundary(t *testing.T) {
 	observations := []map[string]any{{
 		"citations": json.RawMessage("[{\"source\":\"S1\",\"content\":\"可靠证据\"}]"),
@@ -50,6 +80,12 @@ func TestCheckAnswerCitationsAndEvidenceBoundary(t *testing.T) {
 	empty := checkAnswer(TaskKnowledgeQA, "无法回答", nil)
 	if empty.Grounded || empty.CitationValid {
 		t.Fatalf("empty evidence was treated as grounded: %#v", empty)
+	}
+	blocked := checkAnswer(TaskLearningReview, "建议复习。", []map[string]any{{
+		"result": map[string]any{"status": "blocked"},
+	}})
+	if blocked.ActionPolicyPass || !strings.Contains(strings.Join(blocked.Warnings, ","), "写操作权限") {
+		t.Fatalf("blocked action passed: %#v", blocked)
 	}
 }
 

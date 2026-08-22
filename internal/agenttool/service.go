@@ -50,7 +50,8 @@ func (s Service) RAGQuery(ctx context.Context, input json.RawMessage) (json.RawM
 	if question == "" {
 		return nil, nil, fmt.Errorf("rag_query needs question, topic, summary or title")
 	}
-	evidence, err := s.Evidence.Search(ctx, question, 5)
+	topK := topKFrom(input)
+	evidence, err := s.Evidence.Search(ctx, question, topK)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -64,6 +65,19 @@ func (s Service) RAGQuery(ctx context.Context, input json.RawMessage) (json.RawM
 	})
 	citationBody, _ := json.Marshal(evidence)
 	return body, citationBody, nil
+}
+
+func topKFrom(raw json.RawMessage) int {
+	var input map[string]any
+	_ = json.Unmarshal(raw, &input)
+	value, ok := input["top_k"]
+	if !ok {
+		return 5
+	}
+	if number, ok := value.(float64); ok && number == float64(int(number)) && number >= 1 && number <= 20 {
+		return int(number)
+	}
+	return 5
 }
 
 // questionFrom 按固定优先级从输入提取检索问题（question > topic > summary > title），

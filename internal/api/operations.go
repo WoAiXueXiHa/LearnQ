@@ -691,21 +691,27 @@ func truncate(v string, n int) string {
 }
 
 // evaluateRAG 处理 POST /api/v1/evaluations/rag：接收含真实 chunk id 的 JSONL 数据集，
+// 或仅包含 citation_text 的可读数据集。citation_text 必须唯一命中当前 ready chunk。
 // 运行 Recall@K/NDCG 评估，并把指标与 Markdown 报告落库。
 func (s *Server) evaluateRAG(c *gin.Context) {
-	// 评估必须显式提供使用真实 chunk id 的 JSONL，避免把占位数据保存为可信基准。
+	// 评估必须显式提供 JSONL，避免把空请求或占位数据保存为可信基准。
 	body, readErr := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, 2<<20))
 	if readErr != nil {
 		fail(c, 413, "VALIDATION_FAILED", "request body is too large or unreadable", readErr.Error())
 		return
 	}
 	if len(strings.TrimSpace(string(body))) == 0 || strings.TrimSpace(string(body)) == "{}" {
-		fail(c, 422, "VALIDATION_FAILED", "evaluation dataset with real chunk ids is required", nil)
+		fail(c, 422, "VALIDATION_FAILED", "evaluation JSONL dataset is required", nil)
 		return
 	}
 	cases, err := evaluation.ReadJSONL(strings.NewReader(string(body)))
 	if err != nil {
 		fail(c, 422, "VALIDATION_FAILED", "evaluation dataset must be valid JSONL", err.Error())
+		return
+	}
+	cases, err = evaluation.ResolveCitationText(c.Request.Context(), cases, s.resolveReadyChunkIDs)
+	if err != nil {
+		fail(c, 422, "VALIDATION_FAILED", "evaluation citation_text must identify exactly one ready chunk", err.Error())
 		return
 	}
 	if s.embedding == nil || s.vectors == nil {
@@ -721,7 +727,8 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 	}
 	metrics, _ := json.Marshal(result.Retrievers)
 	report := evaluation.Markdown(result)
-	datasetSum := sha256.Sum256(body)
+	resolvedBody, _ := json.Marshal(cases)
+	datasetSum := sha256.Sum256(resolvedBody)
 	configJSON, _ := json.Marshal(map[string]any{"dense_limit": 20, "sparse_limit": 20, "fusion": "rrf", "evaluation": "retrieval_only"})
 	row := map[string]any{
 		"mode": result.Mode, "dataset_version": hex.EncodeToString(datasetSum[:]),
@@ -734,6 +741,33 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 		return
 	}
 	ok(c, 202, row)
+}
+
+func (s *Server) resolveReadyChunkIDs(ctx context.Context, citationText string) ([]string, error) {
+	if s == nil || s.store == nil || s.store.DB == nil {
+		return nil, errors.New("document chunk store is not configured")
+	}
+	citationText = strings.TrimSpace(citationText)
+	if citationText == "" {
+		return nil, errors.New("citation_text is required")
+	}
+	var rows []struct {
+		ID string `json:"id"`
+	}
+	if err := s.store.DB.WithContext(ctx).Table("document_chunks dc").
+		Select("dc.id").
+		Joins("JOIN documents d ON d.id=dc.document_id").
+		Where("d.status='ready' AND LOCATE(?, dc.content)>0", citationText).
+		Order("dc.document_id,dc.chunk_index,dc.id").
+		Limit(2).
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(rows))
+	for index := range rows {
+		ids[index] = rows[index].ID
+	}
+	return ids, nil
 }
 
 // getEvaluation 处理 GET /api/v1/evaluations/rag/:id：返回一次评估的完整记录。
