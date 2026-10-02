@@ -440,3 +440,20 @@ SHA-256 与包含实际块 ID 的解析后 SHA-256。产物含私有原文摘录
 
 `make test-tools` 中不依赖私有文章的测试应全部执行；旧 Redis 原文专属测试在缺少
 `REDIS_ARTICLE_PATH` 时显示 Skip，不能据此宣称 Redis 实际样例已验证。
+
+## 服务器容量采样（P0.5 准备）
+
+在已准备好的隔离服务器 Compose 项目上执行，只读取状态，不启动或删除服务：
+
+```bash
+mkdir -p data/reports/capacity
+python3 scripts/sample-capacity.py --project learnq_capacity \
+  --samples 60 --interval 5 --disk-path /var/lib/docker \
+  > data/reports/capacity/samples.jsonl
+```
+
+根据实际 Docker 数据目录调整 `--disk-path`，并使用有 Docker 读取权限的账号。
+JSONL 保存容器内存/CPU/IO、重启计数、OOM 状态、宿主机可用内存、swap 累计页数
+与磁盘余量。swap 活动应比较相邻样本差值；容器内存是采样工作集，可能漏掉瞬时峰值。
+采集成功不代表容量通过。正式验收还须在目标 2 GB 服务器完成启动、负载、重启、
+备份恢复及连续运行验证，单独记录镜像构建峰值和用户入口。
