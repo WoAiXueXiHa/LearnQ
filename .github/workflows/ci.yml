@@ -11,9 +11,10 @@ jobs:
       - run: make fmt-check
       - run: make vet
       - run: make test
+      - run: make test-tools
       - run: GOWORK=off go test -race ./...
       - run: node --check internal/web/static/app.js
-      - run: bash -n scripts/acceptance.sh scripts/manual-test.sh
+      - run: bash -n scripts/acceptance.sh scripts/manual-test.sh scripts/eval-rag.sh
 
   integration:
     runs-on: ubuntu-latest

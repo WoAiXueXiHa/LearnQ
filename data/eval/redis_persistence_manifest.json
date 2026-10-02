@@ -1,0 +1,47 @@
+{
+  "dataset_id": "redis-persistence-five-questions",
+  "status": "offline_inputs_frozen_not_retested",
+  "article": {
+    "location": "private user attachment; set REDIS_ARTICLE_PATH to a local copy with this SHA-256 (do not commit the article)",
+    "sha256": "40bd20a9ff109bcac2f31799e8db5a354fcf47453b4b974329237d4fdfe77703",
+    "splitlines": 283
+  },
+  "fixture": {
+    "path": "data/eval/redis_persistence_evidence.json",
+    "sha256": "6a6103ecff9898c848fc8ab2f96a9745579baf815424086150ad04e27f8b3c55",
+    "dataset_version": "redis-persistence-evidence-v2"
+  },
+  "current_chunker": {
+    "path": "scripts/eval-redis-evidence.py",
+    "sha256": "774114af67e63a82157557b3807d5d5ede31515c63f10a96c1637238fd2f96fb",
+    "version": "markdown-block-v2",
+    "dry_run_candidate_count": 60,
+    "dry_run_path": "data/reports/redis_persistence/markdown_block_v2_60_dry_run.txt",
+    "dry_run_sha256": "824eb1ca7a29a5d41ad832c7abc38061c02e635cdb47e7279732cb2c22f3b90c"
+  },
+  "historical_dense": {
+    "model": "@cf/qwen/qwen3-embedding-0.6b",
+    "candidate_count": 66,
+    "top_k": 5,
+    "source": "2026-09-29 session user-provided result, response_item ordinal 784; old dry-run attachment de8ed74e-2dff-46f0-8881-616a95f58ba7",
+    "path": "data/reports/redis_persistence/legacy_dense_66_top5.txt",
+    "sha256": "d3de947062b5fafac48ab70b9d4689d4834ea290bec1b257e8a8e41e4291878e",
+    "qualification": "historical output with former annotations; not a rerun or current baseline"
+  },
+  "limitations": [
+    "Report files are gitignored because they contain excerpts from a user article.",
+    "Current 60-candidate run is dry-run only; no embedding or retrieval was called.",
+    "No Qdrant, Fake, or current real dense result is recorded in this manifest."
+  ],
+  "errata": {
+    "path": "data/eval/redis_persistence_errata.json",
+    "sha256": "333cfbd7eccf7f6765dcb730215485cca8a873848ac82423a28b0a1cb32c4a53",
+    "human_confirmation_status": "pending"
+  },
+  "rag_regression": {
+    "path": "data/eval/rag.jsonl",
+    "sha256": "bf4929e6076e3881c1f1b93ada1ff972ed46ad5540600968a7a13de5a1a3b490",
+    "cases": 18,
+    "qualification": "portable README/RUNBOOK regression; distinct from private Redis evidence-point dataset"
+  }
+}

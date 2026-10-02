@@ -159,7 +159,8 @@ printf '%s' "$metrics" | grep -q '^learnq_queue_ready '
 printf '%s' "$metrics" | grep -q '^learnq_model_chat_requests_total '
 printf '%s' "$metrics" | grep -q '^learnq_rag_answers_total '
 chunk_id=$(printf '%s' "$rag" | jq -r '.data.citations[0].chunk_id')
-printf '{"id":"acceptance-rag","question":"LearnQ 如何启动 Compose？","relevant_chunks":[{"chunk_id":"%s","relevance":3}],"citation_text":"Compose 启动说明","correct_answer":"使用 docker compose 启动","tags":["compose"],"difficulty":"easy"}\n' "$chunk_id" |
+# 直接用上一步 RAG 答案里的真实 chunk id 做标注；citation_text 与 relevant_chunks 不能并存。
+printf '{"id":"acceptance-rag","question":"LearnQ 如何启动 Compose？","relevant_chunks":[{"chunk_id":"%s","relevance":3}],"correct_answer":"使用 docker compose 启动","tags":["compose"],"difficulty":"easy"}\n' "$chunk_id" |
   curl -fsS -X POST "$BASE_URL/api/v1/evaluations/rag" \
     -H 'Content-Type: application/jsonl' --data-binary @- |
   jq -e '.data.status == "succeeded"' >/dev/null

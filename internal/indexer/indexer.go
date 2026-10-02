@@ -105,7 +105,7 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 	if err := i.status(ctx, document.ID, "uploaded", "parsing"); err != nil {
 		return 0, err
 	}
-	chunks := rag.ChunkText(document.Content, 800, 120)
+	chunks := rag.ChunkText(document.Content, rag.DefaultChunkSize, rag.DefaultChunkOverlap)
 	if len(chunks) == 0 {
 		// 空文档切不出块，直接以错误终止；否则会以零切片走完流程，把空文档错误标记为 ready。
 		return 0, fmt.Errorf("document produced no chunks")

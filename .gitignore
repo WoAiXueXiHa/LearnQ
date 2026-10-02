@@ -17,6 +17,8 @@
 /coverage.out
 /*.test
 /*.out
+__pycache__/
+*.pyc
 
 # Runtime data
 /data/reports/

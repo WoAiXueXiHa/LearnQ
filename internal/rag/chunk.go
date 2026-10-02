@@ -27,8 +27,16 @@ type runeAt struct {
 	line  int
 }
 
+// 默认切块参数。索引与离线校验必须用同一组值，否则报告里的行区间对不上线上索引，
+// 因此这里显式导出，而不是让调用方各写一份字面量。
+const (
+	DefaultChunkSize    = 800
+	DefaultChunkOverlap = 120
+)
+
 // ChunkText 把整段文本切成若干个等长 Chunk 并带重叠窗口（末块可能偏短）。
-// size/overlap 非正或非法时回退默认值 800/120；空文本返回空切片而非报错，
+// size/overlap 非正或非法时回退默认值；注意 overlap 传 0 是合法输入，表示不重叠，
+// 只有越界（>= size 或为负）才触发回退。空文本返回空切片而非报错，
 // 是否接受空结果由调用方决定。
 func ChunkText(text string, size, overlap int) []Chunk {
 	// 按 rune 而非 byte 切片，避免截断 UTF-8 中文；重叠窗口保留跨块语义，
@@ -36,10 +44,10 @@ func ChunkText(text string, size, overlap int) []Chunk {
 	// 参数回退：size 必须为正，overlap 必须落在 [0, size) 内，非法值统一回退默认，
 	// 使所有调用方得到一致且可重建的分块结果。
 	if size <= 0 {
-		size = 800
+		size = DefaultChunkSize
 	}
 	if overlap < 0 || overlap >= size {
-		overlap = 120
+		overlap = DefaultChunkOverlap
 	}
 	var runes []runeAt
 	line := 1

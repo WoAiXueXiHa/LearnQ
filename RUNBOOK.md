@@ -195,13 +195,21 @@ curl -fsS -X POST http://127.0.0.1:8080/api/v1/documents \
 curl -fsS -X POST http://127.0.0.1:8080/api/v1/documents \
   -F 'file=@RUNBOOK.md;type=text/markdown' | jq
 
-# 等待文档状态变为 ready 后执行。data/eval/rag.jsonl 使用 citation_text，
-# 服务端会解析为当前 ready chunk；命中 0 个或多个 chunk 时评测会拒绝执行。
-curl -fsS -X POST http://127.0.0.1:8080/api/v1/evaluations/rag \
-  --data-binary @data/eval/rag.jsonl | jq
+# 等待文档状态变为 ready 后执行；等价于 curl --data-binary @data/eval/rag.jsonl。
+make eval-rag
 ```
 
-报告中的 Markdown 表按 `dense-only`、`sparse-only` 和 `hybrid-rrf` 展示 Recall@5、NDCG 与检索覆盖率。一次成功评估会写入 `rag_evaluations`，可通过 `GET /api/v1/evaluations/rag/:id/report.md` 取回同一张结果表。
+`data/eval/rag.jsonl` 的每条用例只提供 `citation_text`，服务端按当前 ready chunk 解析：
+命中 0 个或多个 chunk 都会让整次评测失败并报出用例 id，`relevant_chunks` 与 `citation_text`
+不允许同时出现（两种写法并存时前者会让后者被静默忽略）。`make eval-rag` 默认发这份数据集，
+需要换数据集时用 `EVAL_DATASET=path/to/other.jsonl`；这一步会真实调用 embedding，先在 Fake
+模式下确认数据集能解析通过。
+
+报告分两部分：汇总表按 `dense-only`、`sparse-only` 和 `hybrid-rrf` 给出 Recall@5、NDCG、
+检索覆盖率和无关候选数（均值只用于横向比较，不代表回答正确率）；逐例表保留每题每条候选的
+排名、是否属于人工标注、来源文档与行区间、块 ID 和原文摘录，漏证据时能直接看到入选的是哪些
+无关块。一次成功评估会写入 `rag_evaluations`，可通过 `GET /api/v1/evaluations/rag/:id/report.md`
+取回完整报告，头部标注模式、embedding 模型、collection 和数据集哈希。
 
 创建 Agent Run 并查看完整执行结果：
 
@@ -379,10 +387,12 @@ curl -fsS http://127.0.0.1:6333/aliases | jq
 | `/health/ready` 返回 503 | 查看响应中的 `dependencies`，再检查对应容器和 `api/worker` 日志 |
 | 页面一直显示任务处理中 | 确认 `worker` 为 `ok`，查看任务 `last_error` 和 Worker 日志 |
 | 8080 端口被占用 | 在 `.env` 设置新的 `LEARNQ_HTTP_PORT` 后重启 Compose |
-| Real 模式启动失败 | 检查 Chat、Embedding、Vision 三套配置及 `EMBEDDING_DIM` 是否完整 |
-| Ollama Embedding 调用失败 | 检查 `ollama` 容器、宿主机 `11434` 端口以及模型是否已经拉取 |
-| 图片长期处理中 | 检查 `qwen3-vl:4b` 是否驻留 GPU、`TASK_TIMEOUT` 是否合理，并确认 `LEASE_DURATION > TASK_TIMEOUT` |
-| 图片提示 context exhausted | 保持 `AI_VISION_PROVIDER=ollama`，并将 `AI_VISION_CONTEXT_LENGTH` 设为至少 `8192` |
+| Real 模式启动失败 | 报错会点名缺失的变量：补齐 `.env` 里的 Chat、Embedding（Worker 还需要 Vision）配置，并确认 `EMBEDDING_DIM` 与模型一致 |
+| Cloudflare Embedding 调用失败 | 检查 `AI_EMBEDDING_BASE_URL` 里的 Account ID、Token 是否具备 Workers AI 权限、URL 是否以 `/ai/v1` 结尾 |
+| DeepSeek 调用返回 401/404 | 确认 Key 有效，且 `AI_CHAT_MODEL`/`AI_VISION_MODEL` 与账号可用模型名一致 |
+| Ollama Embedding 调用失败（备选路径） | 检查 `ollama` 容器、宿主机 `11434` 端口以及模型是否已经拉取 |
+| 图片长期处理中 | 检查视觉服务是否正常（Ollama 路径看 `qwen3-vl:4b` 是否驻留 GPU）、`TASK_TIMEOUT` 是否合理，并确认 `LEASE_DURATION > TASK_TIMEOUT` |
+| 图片提示 context exhausted（Ollama 路径） | 保持 `AI_VISION_PROVIDER=ollama`，并将 `AI_VISION_CONTEXT_LENGTH` 设为至少 `8192` |
 | 图片分析完成但知识库没有内容 | 图片默认不会自动入库；在页面点击“加入知识库”或调用 `/images/:id/index` |
 | Qdrant 提示维度不一致 | 恢复原维度；仅在可丢弃本地索引时才清理并重建数据卷 |
 | Qdrant 数据卷丢失或集合为空 | `/health/ready` 只代表服务可用；使用单文档重建接口或 `cmd/reindex --all` 从 MySQL 恢复向量 |
@@ -401,3 +411,32 @@ GOWORK=off go run ./cmd/api
 ```
 
 三个进程需要使用同一套环境变量；先执行迁移，再启动 Worker 和 API。
+
+## Redis 逐点证据对照（P0）
+
+私有文章通过正常上传入口入库并成为 ready 后，记录其文档 ID。真实模式上传本身会
+为每块调用 embedding，费用应与查询费用分别记录；以下工具不上传、不重建文章。
+
+```bash
+# 只映射实际持久化切块，核对文章哈希、行跨度和完整原文；不调用模型。
+make eval-redis-qdrant EVAL_REDIS_ARGS='--document-id 123'
+
+# 获得真实模型调用预算后运行；五道冻结问题各调用一次 query embedding。
+# BASE_URL 指向隔离的 Fake 栈时也可无费用验证三路检索管线。
+make eval-redis-qdrant EVAL_REDIS_ARGS='--document-id 123 --run'
+
+make test-tools
+```
+
+`POST /api/v1/evaluations/rag?resolve_only=true` 支持仅解析证据。新的 JSONL 标注含
+`document_id`、`article_sha256`、`evidence_points`，每个要点的 `lines` 是可接受的任一
+原文行跨度。服务端依据 MySQL 原文和实际切块的全文/字节位置映射；命中一部分长行
+或只有行区间重叠不足以算覆盖。跨块时按实际 Top K 的完整文本区间并集判断。
+
+报告逐题展示证据点覆盖 X/Y、缺失要点、来源行跨度、文档/文章哈希与候选。
+证据点覆盖和传统 chunk Recall 分开阅读，均不代表答案真实性。报告还区分原始输入
+SHA-256 与包含实际块 ID 的解析后 SHA-256。产物含私有原文摘录，应保存在已忽略的
+`data/reports/`；真实 Redis 与 Fake 合成文章结果须分别保存，不能互称基线。
+
+`make test-tools` 中不依赖私有文章的测试应全部执行；旧 Redis 原文专属测试在缺少
+`REDIS_ARTICLE_PATH` 时显示 Skip，不能据此宣称 Redis 实际样例已验证。

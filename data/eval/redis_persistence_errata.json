@@ -1,0 +1,57 @@
+{
+  "dataset_id": "redis-persistence-five-questions",
+  "article_sha256": "40bd20a9ff109bcac2f31799e8db5a354fcf47453b4b974329237d4fdfe77703",
+  "source_checked_at": "2026-10-01",
+  "entries": [
+    {
+      "id": "redis-errata-fync",
+      "article_lines": [
+        [
+          73,
+          73
+        ],
+        [
+          79,
+          79
+        ]
+      ],
+      "article_claim": "原文用 fync 表示 AOF 刷盘步骤。",
+      "external_source": {
+        "title": "Redis persistence | Docs",
+        "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/",
+        "section": "How durable is the append only file?",
+        "checked_at": "2026-10-01"
+      },
+      "source_finding": "官方文档使用 fsync 和 appendfsync always/everysec/no。原文 fync 为待修正拼写；检索命中原文不代表术语已正确。",
+      "external_source_status": "checked",
+      "human_confirmation_status": "pending"
+    },
+    {
+      "id": "redis-errata-aof-version",
+      "article_lines": [
+        [
+          139,
+          145
+        ],
+        [
+          208,
+          218
+        ],
+        [
+          283,
+          283
+        ]
+      ],
+      "article_claim": "文章同时描述传统 AOF 重写缓冲区和 MP-AOF 的 BASE、INCR、Manifest。",
+      "external_source": {
+        "title": "Redis persistence | Docs",
+        "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/",
+        "section": "How it works / Append-only file",
+        "checked_at": "2026-10-01"
+      },
+      "source_finding": "官方文档将内存重写缓冲区及追加替换归于 Redis < 7.0，将 base/increment 文件和 manifest 归于 Redis >= 7.0。原文相关段落需人工确认版本前提与具体表述。",
+      "external_source_status": "checked",
+      "human_confirmation_status": "pending"
+    }
+  ]
+}

@@ -1,0 +1,222 @@
+{
+  "source": "用户提供的 Redis 持久化文章；行号按原文件计算",
+  "questions": [
+    {
+      "id": "redis-1",
+      "question": "RDB 和 AOF 分别保存什么，主要取舍是什么？",
+      "evidence": [
+        {
+          "point": "RDB 保存时间点快照",
+          "lines": [
+            [
+              8,
+              8
+            ],
+            [
+              18,
+              18
+            ],
+            [
+              242,
+              242
+            ]
+          ]
+        },
+        {
+          "point": "AOF 记录写命令",
+          "lines": [
+            [
+              9,
+              9
+            ],
+            [
+              243,
+              243
+            ]
+          ]
+        },
+        {
+          "point": "RDB 的恢复和丢失取舍",
+          "lines": [
+            [
+              11,
+              11
+            ],
+            [
+              242,
+              242
+            ]
+          ]
+        },
+        {
+          "point": "AOF 的安全性、体积和恢复取舍",
+          "lines": [
+            [
+              12,
+              12
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "redis-2",
+      "question": "RDB 为什么可以继续处理请求？写时拷贝如何影响快照？",
+      "evidence": [
+        {
+          "point": "父进程继续处理请求，子进程生成快照",
+          "lines": [
+            [
+              32,
+              32
+            ],
+            [
+              245,
+              245
+            ]
+          ]
+        },
+        {
+          "point": "修改时复制内存页",
+          "lines": [
+            [
+              42,
+              42
+            ],
+            [
+              245,
+              245
+            ]
+          ]
+        },
+        {
+          "point": "子进程仍读取修改前的数据",
+          "lines": [
+            [
+              44,
+              44
+            ],
+            [
+              245,
+              245
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "redis-3",
+      "question": "AOF 的 write 和 fsync 有什么区别？",
+      "evidence": [
+        {
+          "point": "write 进入内核缓冲区",
+          "lines": [
+            [
+              72,
+              72
+            ]
+          ]
+        },
+        {
+          "point": "原文第 73 行描述将内核缓冲区刷盘",
+          "lines": [
+            [
+              73,
+              73
+            ]
+          ]
+        },
+        {
+          "point": "write 成功不等于数据落盘",
+          "lines": [
+            [
+              75,
+              75
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "redis-4",
+      "question": "AOF 重写如何保留 fork 之后的写命令？",
+      "evidence": [
+        {
+          "point": "fork 后的命令需要补进新 AOF",
+          "lines": [
+            [
+              139,
+              141
+            ]
+          ]
+        },
+        {
+          "point": "旧 AOF 和重写缓冲区各自负责的恢复路径",
+          "lines": [
+            [
+              143,
+              143
+            ]
+          ]
+        },
+        {
+          "point": "把增量追加到新 AOF 再替换",
+          "lines": [
+            [
+              145,
+              145
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "redis-5",
+      "question": "MP-AOF 如何组织 BASE、INCR 和 Manifest？",
+      "evidence": [
+        {
+          "point": "BASE 的角色",
+          "lines": [
+            [
+              208,
+              208
+            ]
+          ]
+        },
+        {
+          "point": "INCR 的角色和重放顺序",
+          "lines": [
+            [
+              209,
+              209
+            ]
+          ]
+        },
+        {
+          "point": "Manifest 管理 BASE/INCR 文件",
+          "lines": [
+            [
+              211,
+              211
+            ]
+          ]
+        },
+        {
+          "point": "重写完成后切换 Manifest 指向的新文件集合",
+          "lines": [
+            [
+              218,
+              218
+            ],
+            [
+              283,
+              283
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "article_sha256": "40bd20a9ff109bcac2f31799e8db5a354fcf47453b4b974329237d4fdfe77703",
+  "dataset_version": "redis-persistence-evidence-v2"
+}

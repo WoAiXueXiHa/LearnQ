@@ -690,6 +690,22 @@ func truncate(v string, n int) string {
 	return strings.TrimSpace(string(r[:n])) + "…"
 }
 
+// ragEvaluationRow 对应 rag_evaluations 一行。这里用结构体而不是 map 插入：
+// GORM 只对结构体回填自增主键，而响应里没有 id 就无法拼接 GET report.md 的地址。
+type ragEvaluationRow struct {
+	ID             uint64    `json:"id" gorm:"column:id"`
+	Mode           string    `json:"mode" gorm:"column:mode"`
+	DatasetVersion string    `json:"dataset_version" gorm:"column:dataset_version"`
+	EmbeddingModel string    `json:"embedding_model" gorm:"column:embedding_model"`
+	CollectionName string    `json:"collection_name" gorm:"column:collection_name"`
+	TopK           int       `json:"top_k" gorm:"column:top_k"`
+	ConfigJSON     string    `json:"config_json" gorm:"column:config_json"`
+	MetricsJSON    string    `json:"metrics_json" gorm:"column:metrics_json"`
+	ReportMarkdown string    `json:"report_markdown" gorm:"column:report_markdown"`
+	Status         string    `json:"status" gorm:"column:status"`
+	CreatedAt      time.Time `json:"created_at" gorm:"column:created_at"`
+}
+
 // evaluateRAG 处理 POST /api/v1/evaluations/rag：接收含真实 chunk id 的 JSONL 数据集，
 // 或仅包含 citation_text 的可读数据集。citation_text 必须唯一命中当前 ready chunk。
 // 运行 Recall@K/NDCG 评估，并把指标与 Markdown 报告落库。
@@ -714,6 +730,15 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 		fail(c, 422, "VALIDATION_FAILED", "evaluation citation_text must identify exactly one ready chunk", err.Error())
 		return
 	}
+	cases, err = evaluation.ResolveEvidencePoints(c.Request.Context(), cases, s.loadEvidenceChunks)
+	if err != nil {
+		fail(c, 422, "VALIDATION_FAILED", "evidence spans must resolve against ready document chunks", err.Error())
+		return
+	}
+	if c.Query("resolve_only") == "true" {
+		ok(c, 200, cases)
+		return
+	}
 	if s.embedding == nil || s.vectors == nil {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "retrieval dependencies are not configured", nil)
 		return
@@ -725,18 +750,25 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "evaluation retrieval failed", err.Error())
 		return
 	}
-	metrics, _ := json.Marshal(result.Retrievers)
-	report := evaluation.Markdown(result)
 	resolvedBody, _ := json.Marshal(cases)
 	datasetSum := sha256.Sum256(resolvedBody)
+	// 报告要能独立说明自己出自哪份数据集、哪个模型和哪个集合；这些运行元数据只有 handler 知道，
+	// 所以在渲染前补进 Report，让落库的报告与 rag_evaluations 行保持同一套事实。
+	result.EmbeddingModel = s.embeddingModel
+	result.Collection = s.ragCollection
+	result.ResolvedHash = hex.EncodeToString(datasetSum[:])
+	inputSum := sha256.Sum256(body)
+	result.DatasetHash = hex.EncodeToString(inputSum[:])
+	metrics, _ := json.Marshal(result.Retrievers)
+	report := evaluation.Markdown(result)
 	configJSON, _ := json.Marshal(map[string]any{"dense_limit": 20, "sparse_limit": 20, "fusion": "rrf", "evaluation": "retrieval_only"})
-	row := map[string]any{
-		"mode": result.Mode, "dataset_version": hex.EncodeToString(datasetSum[:]),
-		"embedding_model": s.embeddingModel, "collection_name": s.ragCollection,
-		"top_k": result.TopK, "config_json": string(configJSON), "metrics_json": string(metrics),
-		"report_markdown": report, "status": "succeeded", "created_at": time.Now().UTC(),
+	row := ragEvaluationRow{
+		Mode: result.Mode, DatasetVersion: result.DatasetHash,
+		EmbeddingModel: s.embeddingModel, CollectionName: s.ragCollection,
+		TopK: result.TopK, ConfigJSON: string(configJSON), MetricsJSON: string(metrics),
+		ReportMarkdown: report, Status: "succeeded", CreatedAt: time.Now().UTC(),
 	}
-	if err := s.store.DB.Table("rag_evaluations").Create(row).Error; err != nil {
+	if err := s.store.DB.Table("rag_evaluations").Create(&row).Error; err != nil {
 		fail(c, 500, "INTERNAL_ERROR", "evaluation result could not be saved", nil)
 		return
 	}
@@ -856,4 +888,36 @@ func (s *Server) weekly(c *gin.Context) {
 		"report_pipeline": reports, "algorithm_trend": algorithmTrend,
 		"fact_source": "mysql",
 	})
+}
+
+// loadEvidenceChunks reads the authoritative ready document and persisted chunk text.
+func (s *Server) loadEvidenceChunks(ctx context.Context, id uint64) (string, []evaluation.EvidenceChunk, error) {
+	if s == nil || s.store == nil || s.store.DB == nil {
+		return "", nil, errors.New("document chunk store is not configured")
+	}
+	var doc domain.Document
+	if err := s.store.DB.WithContext(ctx).Where("id=? AND status='ready'", id).First(&doc).Error; err != nil {
+		return "", nil, err
+	}
+	var rows []domain.DocumentChunk
+	if err := s.store.DB.WithContext(ctx).Where("document_id=?", id).Order("chunk_index,id").Find(&rows).Error; err != nil {
+		return "", nil, err
+	}
+	expected := rag.ChunkText(doc.Content, rag.DefaultChunkSize, rag.DefaultChunkOverlap)
+	runes := []rune(doc.Content)
+	byteOffsets := make([]int, len(runes)+1)
+	for j, r := range runes {
+		byteOffsets[j+1] = byteOffsets[j] + utf8.RuneLen(r)
+	}
+	chunks := make([]evaluation.EvidenceChunk, len(rows))
+	for i, row := range rows {
+		chunks[i] = evaluation.EvidenceChunk{ID: row.ID, Content: row.Content, StartLine: row.StartLine, EndLine: row.EndLine}
+		if row.ChunkIndex < 0 || row.ChunkIndex >= len(expected) || expected[row.ChunkIndex].Content != row.Content || expected[row.ChunkIndex].StartLine != row.StartLine || expected[row.ChunkIndex].EndLine != row.EndLine {
+			return "", nil, errors.New("persisted chunks differ from current chunker; rebuild before evaluation")
+		}
+		start := row.ChunkIndex * (rag.DefaultChunkSize - rag.DefaultChunkOverlap)
+		offset := byteOffsets[start]
+		chunks[i].StartByte = &offset
+	}
+	return doc.Content, chunks, nil
 }
