@@ -51,48 +51,46 @@ LEARNQ_HTTP_PORT=18080
 
 默认配置为 `AI_MODE=fake`，不会调用外部模型，也不需要 API Key。该模式能够演示学习报告、复习、文档索引、RAG、Skill 和 Trace 的完整链路，推荐用于本地开发和自动验收。
 
-真实模型模式需要同时配置 Chat、Embedding 与 Vision。推荐使用 DeepSeek Chat，并通过本机
-Ollama 运行 `qwen3-embedding:0.6b` 和 `qwen3-vl:4b`；Embedding 和图片像素都只发往本机
-Ollama。RAG 最终回答会把命中的知识库片段发送给 Chat 服务商，上传资料前应确认其隐私边界。
+真实模型模式需要同时配置 Chat、Embedding 与 Vision，默认目标配置全部使用外部服务：Chat 与
+Vision 走 DeepSeek，Embedding 走 Cloudflare Workers AI 的 `@cf/qwen/qwen3-embedding-0.6b`
+（1024 维），服务器不下载本地推理模型。该配置下，Markdown 正文片段与问题会发送到
+Cloudflare，生成题目/反馈所需的证据与外链图片会发送到 DeepSeek；RAG 最终回答会把命中的
+知识库片段发送给 Chat 服务商，上传资料前应确认其隐私边界。
 
-先在宿主机准备 Ollama：
+先准备两组凭据：
 
-```bash
-docker run -d \
-  --name ollama \
-  --restart unless-stopped \
-  -v ollama-models:/root/.ollama \
-  -p 11434:11434 \
-  ollama/ollama
-
-docker exec ollama ollama pull qwen3-embedding:0.6b
-docker exec ollama ollama pull qwen3-vl:4b
-```
+- DeepSeek：在控制台创建 API Key，填入 `AI_CHAT_API_KEY`；`AI_VISION_API_KEY` 可填同一把。
+- Cloudflare：Account ID 替换 `AI_EMBEDDING_BASE_URL` 里的 `REPLACE_WITH_CF_ACCOUNT_ID`，
+  另建一个带 Workers AI 权限的 API Token 填入 `AI_EMBEDDING_API_KEY`。
 
 然后修改被 Git 忽略的 `.env`：
 
 ```dotenv
 AI_MODE=real
 AI_CHAT_BASE_URL=https://api.deepseek.com
-AI_CHAT_API_KEY=replace-with-your-deepseek-key
-AI_CHAT_MODEL=deepseek-v4-pro
-AI_EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1
-AI_EMBEDDING_API_KEY=ollama
-AI_EMBEDDING_MODEL=qwen3-embedding:0.6b
+AI_CHAT_API_KEY=<DeepSeek API Key>
+AI_CHAT_MODEL=deepseek-flash
+AI_EMBEDDING_BASE_URL=https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1
+AI_EMBEDDING_API_KEY=<Cloudflare API Token>
+AI_EMBEDDING_MODEL=@cf/qwen/qwen3-embedding-0.6b
 EMBEDDING_DIM=1024
-AI_VISION_PROVIDER=ollama
-AI_VISION_BASE_URL=http://host.docker.internal:11434/v1
-AI_VISION_API_KEY=ollama
-AI_VISION_MODEL=qwen3-vl:4b
-AI_VISION_CONTEXT_LENGTH=8192
+AI_VISION_PROVIDER=openai
+AI_VISION_BASE_URL=https://api.deepseek.com
+AI_VISION_API_KEY=<与 AI_CHAT_API_KEY 相同的 DeepSeek Key>
+AI_VISION_MODEL=deepseek-flash
 TASK_TIMEOUT=120s
 LEASE_DURATION=150s
 ```
 
-`AI_EMBEDDING_API_KEY=ollama` 和 `AI_VISION_API_KEY=ollama` 只是本地兼容配置，不是真实密钥。
-Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接运行 Go 进程时，
-将两项 Ollama Base URL 改为 `http://127.0.0.1:11434/v1`。Ollama Vision 使用原生
-`/api/chat`，会自动移除 Base URL 末尾的 `/v1`，请求关闭思考并按 JSON Schema 输出；
+`AI_CHAT_API_KEY` 与 `AI_VISION_API_KEY` 可以指向同一把 DeepSeek 凭据，但两项分别校验，
+只填一处会在启动时报出缺少的另一项。Embedding 走 OpenAI 兼容的 `/embeddings`，Base URL
+需以 `/ai/v1` 结尾。`AI_VISION_CONTEXT_LENGTH` 只对 Ollama 路径有效，OpenAI 兼容路径不使用。
+
+仍保留本地 Ollama 作为备选：把两项 Base URL 指向 `http://host.docker.internal:11434/v1`
+（直接运行 Go 进程时用 `http://127.0.0.1:11434/v1`），`AI_VISION_PROVIDER` 设回 `ollama`，
+`AI_EMBEDDING_MODEL`/`AI_VISION_MODEL` 改为 `qwen3-embedding:0.6b`/`qwen3-vl:4b`。该路径需要
+先在宿主机准备 Ollama（`ollama/ollama` 镜像，拉取上述两个模型）；Ollama Vision 使用原生
+`/api/chat`，会自动移除 Base URL 末尾的 `/v1`，请求关闭思考并按 JSON Schema 输出，
 同时兼容 Qwen3-VL 将结构化 JSON 放入 `thinking` 字段的行为。
 
 | 变量 | 默认值 | 用途 |
@@ -103,13 +101,14 @@ Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接
 | `QDRANT_URL` | `http://127.0.0.1:6333` | Qdrant HTTP 地址 |
 | `AI_MODE` | `fake` | `fake` 或 `real` |
 | `AI_CHAT_BASE_URL` | `https://api.deepseek.com` | 报告、Skill 和 RAG 最终回答使用的 Chat 服务 |
-| `AI_EMBEDDING_BASE_URL` | `http://host.docker.internal:11434/v1` | Compose 访问宿主机 Ollama 的 OpenAI 兼容地址 |
-| `AI_EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | 本地 Embedding 模型 |
+| `AI_CHAT_MODEL` | `deepseek-flash` | Chat 模型名 |
+| `AI_EMBEDDING_BASE_URL` | `https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1` | Cloudflare Workers AI 的 OpenAI 兼容地址，需替换 `<ACCOUNT_ID>` |
+| `AI_EMBEDDING_MODEL` | `@cf/qwen/qwen3-embedding-0.6b` | Embedding 模型（1024 维） |
 | `RAG_COLLECTION` | 按模式和 Embedding 模型生成 | 隔离 Fake 与 Real 向量，通常无需手动设置 |
-| `AI_VISION_PROVIDER` | `ollama` | `ollama` 使用原生接口；`openai` 使用 OpenAI 兼容接口 |
-| `AI_VISION_BASE_URL` | `http://host.docker.internal:11434/v1` | 本地视觉模型地址 |
-| `AI_VISION_MODEL` | `qwen3-vl:4b` | 本地视觉模型 |
-| `AI_VISION_CONTEXT_LENGTH` | `8192` | Ollama Vision 上下文；长截图不应低于该值 |
+| `AI_VISION_PROVIDER` | `openai` | `ollama` 使用原生接口；`openai` 使用 OpenAI 兼容接口 |
+| `AI_VISION_BASE_URL` | `https://api.deepseek.com` | 视觉服务地址（OpenAI 兼容） |
+| `AI_VISION_MODEL` | `deepseek-flash` | 视觉模型 |
+| `AI_VISION_CONTEXT_LENGTH` | `8192` | 仅 Ollama Vision 使用的上下文长度；长截图不应低于该值 |
 | `TASK_TIMEOUT` | `45s` | 单次任务执行超时；Real 视觉模式建议按机器性能调大 |
 | `LEASE_DURATION` | `60s` | Worker 租约，必须严格大于 `TASK_TIMEOUT` |
 | `SHUTDOWN_GRACE` | `70s` | Worker 停机等待时间，必须大于 0，通常应覆盖租约时长 |
@@ -117,8 +116,9 @@ Compose 通过 `host.docker.internal` 访问宿主机的 `11434` 端口；直接
 | `LEARNQ_HTTP_PORT` | `8080` | Compose 对宿主机暴露的端口 |
 
 不要把真实密钥写入 `.env.example` 或其他受 Git 跟踪的文件；本地密钥只保存在 `.env`。
-`qwen3-embedding:0.6b` 返回 1024 维向量，`EMBEDDING_DIM` 必须与其实际输出和现有 Qdrant collection 一致；开发环境中如需重建索引，
-应先确认数据可以清除。
+`@cf/qwen/qwen3-embedding-0.6b` 返回 1024 维向量，`EMBEDDING_DIM` 必须与其实际输出和现有
+Qdrant collection 一致；更换 Embedding 模型会改变 `RAG_COLLECTION` 名，旧向量不再被检索到，
+需要重建索引。开发环境中如需重建索引，应先确认数据可以清除。
 
 ## 核心 API
 
