@@ -255,3 +255,38 @@ func (q Qdrant) query(ctx context.Context, input map[string]any) ([]Hit, error) 
 	}
 	return result.Result.Points, nil
 }
+
+// Active retrieval filters each candidate stream before ranking so retired builds
+// cannot consume top-K slots. MySQL still revalidates after this snapshot filter.
+func activeChunkFilter(ids []string) map[string]any {
+	return map[string]any{"must": []any{map[string]any{"key": "chunk_id", "match": map[string]any{"any": ids}}}}
+}
+func (q Qdrant) DenseActive(ctx context.Context, vector []float32, topK int, ids []string) ([]Hit, error) {
+	if len(ids) == 0 {
+		return []Hit{}, nil
+	}
+	return q.query(ctx, map[string]any{"query": vector, "using": "dense", "limit": topK, "with_payload": true, "filter": activeChunkFilter(ids)})
+}
+func (q Qdrant) SparseActive(ctx context.Context, vector SparseVector, topK int, ids []string) ([]Hit, error) {
+	if len(ids) == 0 {
+		return []Hit{}, nil
+	}
+	return q.query(ctx, map[string]any{"query": vector, "using": "sparse", "limit": topK, "with_payload": true, "filter": activeChunkFilter(ids)})
+}
+func (q Qdrant) HybridActive(ctx context.Context, dense []float32, sparse SparseVector, topK int, ids []string) ([]Hit, error) {
+	if len(ids) == 0 {
+		return []Hit{}, nil
+	}
+	filter := activeChunkFilter(ids)
+	return q.query(ctx, map[string]any{"prefetch": []any{
+		map[string]any{"query": dense, "using": "dense", "limit": max(20, topK), "filter": filter},
+		map[string]any{"query": sparse, "using": "sparse", "limit": max(20, topK), "filter": filter}},
+		"query": map[string]string{"fusion": "rrf"}, "limit": topK, "with_payload": true, "filter": filter})
+}
+
+// DeleteIndex removes only one abandoned build; it never deletes active versions.
+func (q Qdrant) DeleteIndex(ctx context.Context, documentID, indexID uint64) error {
+	return q.request(ctx, http.MethodPost, "/collections/"+q.Collection+"/points/delete?wait=true", map[string]any{"filter": map[string]any{"must": []any{
+		map[string]any{"key": "document_id", "match": map[string]any{"value": documentID}},
+		map[string]any{"key": "index_id", "match": map[string]any{"value": indexID}}}}}, nil)
+}

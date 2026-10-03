@@ -8,11 +8,26 @@ import (
 
 func validFakeConfig() Config {
 	return Config{
-		AIMode:        "fake",
-		EmbeddingDim:  64,
-		TaskTimeout:   45 * time.Second,
-		LeaseDuration: 60 * time.Second,
-		ShutdownGrace: 70 * time.Second,
+		AuthoritySnapshotTTL: 720 * time.Hour,
+		AIMode:               "fake",
+		EmbeddingDim:         64,
+		TaskTimeout:          45 * time.Second,
+		LeaseDuration:        60 * time.Second,
+		ShutdownGrace:        70 * time.Second,
+	}
+}
+
+func TestAuthoritySnapshotTTL(t *testing.T) {
+	for _, value := range []string{"0h", "-1h", "8761h", "invalid", "24h", "720h", "8760h"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("AUTHORITY_SNAPSHOT_TTL", value)
+			cfg := validFakeConfig()
+			cfg.AuthoritySnapshotTTL = Load().AuthoritySnapshotTTL
+			valid := value == "24h" || value == "720h" || value == "8760h"
+			if err := cfg.ValidateAPI(); (err == nil) != valid {
+				t.Fatalf("TTL %s: %v, want valid %v", value, err, valid)
+			}
+		})
 	}
 }
 

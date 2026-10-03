@@ -17,30 +17,35 @@ import (
 // 进程内唯一的配置结构：由 Load() 从环境变量填充（含默认值）、Validate() 校验，
 // 其余包只读取不改写。
 type Config struct {
-	HTTPAddr           string
-	MySQLDSN           string
-	RedisAddr          string
-	RedisPassword      string
-	QdrantURL          string
-	RAGCollection      string
-	AIMode             string
-	AIChatBaseURL      string
-	AIChatAPIKey       string
-	AIChatModel        string
-	AIEmbeddingBaseURL string
-	AIEmbeddingAPIKey  string
-	AIEmbeddingModel   string
-	EmbeddingDim       int
-	AIVisionProvider   string
-	AIVisionBaseURL    string
-	AIVisionAPIKey     string
-	AIVisionModel      string
-	AIVisionContext    int
-	TaskTimeout        time.Duration
-	LeaseDuration      time.Duration
-	ShutdownGrace      time.Duration
-	ReportDir          string
-	ImageDir           string
+	AuthoritySnapshotTTL  time.Duration
+	ArticleMaxImages      int
+	AIDailyBudgetMicroCNY int
+	AICallReserveMicroCNY int
+	HTTPAddr              string
+	MySQLDSN              string
+	RedisAddr             string
+	RedisPassword         string
+	QdrantURL             string
+	DocumentChunkVersion  string
+	RAGCollection         string
+	AIMode                string
+	AIChatBaseURL         string
+	AIChatAPIKey          string
+	AIChatModel           string
+	AIEmbeddingBaseURL    string
+	AIEmbeddingAPIKey     string
+	AIEmbeddingModel      string
+	EmbeddingDim          int
+	AIVisionProvider      string
+	AIVisionBaseURL       string
+	AIVisionAPIKey        string
+	AIVisionModel         string
+	AIVisionContext       int
+	TaskTimeout           time.Duration
+	LeaseDuration         time.Duration
+	ShutdownGrace         time.Duration
+	ReportDir             string
+	ImageDir              string
 }
 
 // 没有参数，只负责组装，不校验，一定会返回一个 Config 实例，但不保证有效
@@ -55,32 +60,37 @@ func Load() Config {
 		collection = "learnq_chunks_real_" + sanitizeCollectionPart(embeddingModel)
 	}
 	return Config{
+		AuthoritySnapshotTTL:  envDuration("AUTHORITY_SNAPSHOT_TTL", 720*time.Hour),
+		ArticleMaxImages:      envInt("ARTICLE_MAX_IMAGES", 32),
+		AIDailyBudgetMicroCNY: envInt("AI_DAILY_BUDGET_MICROCNY", 0),
+		AICallReserveMicroCNY: envInt("AI_CALL_RESERVE_MICROCNY", 0),
 		// 默认 DSN 开启 multiStatements：迁移文件里的多条 DDL 才能在一次 Exec 中执行。
 		// Chat/Embedding 密钥不用 env() 兜底：未设置则保持空串，交由 Validate() 判定；AI_VISION_API_KEY 例外（有 "ollama" 默认值，见 Validate 注释）。
-		HTTPAddr:           env("HTTP_ADDR", "127.0.0.1:8080"),
-		MySQLDSN:           env("MYSQL_DSN", "learnq:learnq@tcp(127.0.0.1:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true"),
-		RedisAddr:          env("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword:      os.Getenv("REDIS_PASSWORD"),
-		QdrantURL:          env("QDRANT_URL", "http://127.0.0.1:6333"),
-		RAGCollection:      env("RAG_COLLECTION", collection),
-		AIMode:             mode,
-		AIChatBaseURL:      env("AI_CHAT_BASE_URL", "https://api.deepseek.com"),
-		AIChatAPIKey:       os.Getenv("AI_CHAT_API_KEY"),
-		AIChatModel:        env("AI_CHAT_MODEL", "deepseek-v4-pro"),
-		AIEmbeddingBaseURL: env("AI_EMBEDDING_BASE_URL", "http://127.0.0.1:11434/v1"),
-		AIEmbeddingAPIKey:  os.Getenv("AI_EMBEDDING_API_KEY"),
-		AIEmbeddingModel:   embeddingModel,
-		EmbeddingDim:       envInt("EMBEDDING_DIM", 1024),
-		AIVisionProvider:   env("AI_VISION_PROVIDER", "ollama"),
-		AIVisionBaseURL:    env("AI_VISION_BASE_URL", "http://127.0.0.1:11434/v1"),
-		AIVisionAPIKey:     env("AI_VISION_API_KEY", "ollama"),
-		AIVisionModel:      env("AI_VISION_MODEL", "qwen3-vl:4b"),
-		AIVisionContext:    envInt("AI_VISION_CONTEXT_LENGTH", 8192),
-		TaskTimeout:        envDuration("TASK_TIMEOUT", 45*time.Second),
-		LeaseDuration:      envDuration("LEASE_DURATION", 60*time.Second),
-		ShutdownGrace:      envDuration("SHUTDOWN_GRACE", 70*time.Second),
-		ReportDir:          env("REPORT_DIR", "data/reports"),
-		ImageDir:           env("IMAGE_DIR", "data/images"),
+		HTTPAddr:             env("HTTP_ADDR", "127.0.0.1:8080"),
+		MySQLDSN:             env("MYSQL_DSN", "learnq:learnq@tcp(127.0.0.1:3306)/learnq?parseTime=true&charset=utf8mb4&multiStatements=true"),
+		RedisAddr:            env("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:        os.Getenv("REDIS_PASSWORD"),
+		QdrantURL:            env("QDRANT_URL", "http://127.0.0.1:6333"),
+		RAGCollection:        env("RAG_COLLECTION", collection),
+		DocumentChunkVersion: env("DOCUMENT_CHUNK_VERSION", "markdown-block-800-v1"),
+		AIMode:               mode,
+		AIChatBaseURL:        env("AI_CHAT_BASE_URL", "https://api.deepseek.com"),
+		AIChatAPIKey:         os.Getenv("AI_CHAT_API_KEY"),
+		AIChatModel:          env("AI_CHAT_MODEL", "deepseek-v4-pro"),
+		AIEmbeddingBaseURL:   env("AI_EMBEDDING_BASE_URL", "http://127.0.0.1:11434/v1"),
+		AIEmbeddingAPIKey:    os.Getenv("AI_EMBEDDING_API_KEY"),
+		AIEmbeddingModel:     embeddingModel,
+		EmbeddingDim:         envInt("EMBEDDING_DIM", 1024),
+		AIVisionProvider:     env("AI_VISION_PROVIDER", "ollama"),
+		AIVisionBaseURL:      env("AI_VISION_BASE_URL", "http://127.0.0.1:11434/v1"),
+		AIVisionAPIKey:       env("AI_VISION_API_KEY", "ollama"),
+		AIVisionModel:        env("AI_VISION_MODEL", "qwen3-vl:4b"),
+		AIVisionContext:      envInt("AI_VISION_CONTEXT_LENGTH", 8192),
+		TaskTimeout:          envDuration("TASK_TIMEOUT", 45*time.Second),
+		LeaseDuration:        envDuration("LEASE_DURATION", 60*time.Second),
+		ShutdownGrace:        envDuration("SHUTDOWN_GRACE", 70*time.Second),
+		ReportDir:            env("REPORT_DIR", "data/reports"),
+		ImageDir:             env("IMAGE_DIR", "data/images"),
 	}
 }
 
@@ -96,6 +106,12 @@ func (c Config) ValidateWorker() error { return c.validate(true) }
 
 // validate 在进程启动阶段集中失败，避免任务领取后才发现密钥或 URL 配置不可用。
 func (c Config) validate(requireVision bool) error {
+	if c.AuthoritySnapshotTTL <= 0 || c.AuthoritySnapshotTTL > 365*24*time.Hour {
+		return fmt.Errorf("AUTHORITY_SNAPSHOT_TTL must be positive and at most 8760h")
+	}
+	if c.DocumentChunkVersion != "" && c.DocumentChunkVersion != "markdown-block-800-v1" && c.DocumentChunkVersion != "rune-800-overlap-120-v1" {
+		return fmt.Errorf("DOCUMENT_CHUNK_VERSION must be markdown-block-800-v1 or rune-800-overlap-120-v1")
+	}
 	// 不区分模型，所有模式可用
 	if c.EmbeddingDim <= 0 {
 		return fmt.Errorf("EMBEDDING_DIM must be a positive integer")

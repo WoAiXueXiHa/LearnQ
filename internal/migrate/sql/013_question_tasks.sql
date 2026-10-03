@@ -1,0 +1,1 @@
+ALTER TABLE question_sets ADD COLUMN generation_task_id BIGINT UNSIGNED NOT NULL DEFAULT 0;

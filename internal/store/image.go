@@ -303,6 +303,13 @@ func (s *Store) PrepareImageDelete(ctx context.Context, imageID uint64) (domain.
 		if image.Status == "deleting" {
 			return nil
 		}
+		var references int64
+		if err := tx.Model(&domain.ArticleImage{}).Where("image_id=?", imageID).Count(&references).Error; err != nil {
+			return err
+		}
+		if references != 0 {
+			return errors.New("image is referenced by an article version")
+		}
 		now := time.Now().UTC()
 		if err := terminateTaskForDelete(tx, image.DescriptionTaskID, "image deleted by user", now); err != nil {
 			return err

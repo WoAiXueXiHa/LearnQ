@@ -32,3 +32,19 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Private articles, workspace planning and deployment evidence
+/Redis 持久化.md
+/STATUS.md
+/STUDY.md
+/TEST_REPORT.md
+/PLAN.md
+/DELIVERY_REPORT.md
+/PRODUCT_REVIEW_PLAN.md
+
+# Only reviewed evaluation fixtures belong under data in Git
+/data/*
+!/data/eval/
+/backups/
+*.prof
+*.pprof

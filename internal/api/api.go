@@ -30,6 +30,10 @@ import (
 )
 
 type Server struct {
+	authoritySnapshotTTL time.Duration
+	articleMaxImages     int
+	dailyBudgetMicroCNY  int64
+	callReserveMicroCNY  int64
 	// Server 通过 Option 注入可选外部能力；基础 CRUD 测试无需启动 Redis/Qdrant/真实模型。
 	// vectors 抽象检索与文档删除两个能力，避免 api 直接依赖 rag 的具体实现类型。
 	store        *store.Store
@@ -78,6 +82,8 @@ type errBody struct {
 
 // Option 以闭包方式注入 Server 的可选依赖，避免构造函数参数列表随能力增长而膨胀。
 type Option func(*Server)
+
+func WithArticleImageLimit(limit int) Option { return func(s *Server) { s.articleMaxImages = limit } }
 
 func WithRAG(chat model.ChatModel, embedding model.EmbeddingModel, vectors interface {
 	evaluation.Retriever
@@ -225,8 +231,49 @@ func (s *Server) routes() {
 	v1.POST("/documents", s.uploadDocument)
 	v1.GET("/documents", s.listDocuments)
 	v1.GET("/documents/:id/status", s.documentStatus)
+	v1.POST("/documents/:id/image-corrections", s.correctImageDescription)
+	v1.GET("/documents/:id/indexes/:index_id/images", s.articleImages)
+	v1.GET("/documents/:id/indexes/:index_id/images/:image_ref_id", s.articleImageEvidence)
+	v1.POST("/documents/:id/indexes/:index_id/images/:image_ref_id/process", s.processArticleImage)
+	v1.POST("/documents/:id/indexes/:index_id/images/:image_ref_id/skip", s.skipArticleImage)
+	v1.GET("/documents/:id/indexes/:index_id/chunks/:chunk_id", s.documentEvidence)
 	v1.POST("/documents/:id/reindex", s.reindexDocument)
+	v1.POST("/documents/:id/question-sets", s.generateQuestionSet)
+	v1.POST("/question-sets/:id/attempts", s.startPractice)
+	v1.GET("/question-sets/:id", s.getQuestionSet)
+	v1.GET("/question-sets", s.listQuestionSets)
+	v1.GET("/practice-attempts", s.listPracticeAttempts)
+	v1.PUT("/question-sets/:id", s.editQuestionSet)
+	v1.POST("/question-sets/:id/confirm", s.confirmQuestionSet)
+	v1.GET("/practice-attempts/:id", s.getPractice)
+	v1.PUT("/practice-attempts/:id/answers", s.savePractice)
+	v1.POST("/practice-attempts/:id/submit", s.submitPractice)
+	v1.POST("/practice-attempts/:id/review", s.schedulePracticeReview)
+	v1.GET("/practice-reviews", s.listPracticeReviews)
+	v1.POST("/practice-reviews/:id/start", s.startPracticeReview)
+	v1.POST("/answer-feedback/:id/corrections", s.correctFeedback)
+	v1.GET("/answer-feedback/:id/corrections", s.practiceCorrections)
+	v1.GET("/authority-sources", s.listAuthorities)
+	v1.POST("/authority-sources", s.registerAuthority)
+	v1.POST("/authority-sources/:id/snapshots", s.captureAuthority)
+	v1.GET("/authority-sources/:id/snapshots", s.listAuthoritySnapshots)
+	v1.GET("/authority-snapshots/:id", s.getAuthoritySnapshot)
+	v1.GET("/answer-feedback/:id/claims", s.listAuthorityClaims)
+	v1.GET("/authority-claims/:id", s.getAuthorityClaim)
+	v1.GET("/model-calls", s.modelCalls)
+	v1.POST("/model-calls/:id/billings", s.reconcileModelBilling)
+	v1.GET("/model-prices", s.listModelPrices)
+	v1.GET("/model-budget", s.modelBudget)
+	v1.POST("/model-prices", s.registerModelPrice)
+	v1.POST("/authority-claims/:id/checks", s.queueAuthorityCheck)
+	v1.POST("/authority-checks/:id/reviews", s.reviewAuthorityCheck)
 	v1.DELETE("/documents/:id", s.deleteDocument)
+	v1.GET("/documents/:id/export", s.exportDocument)
+	v1.POST("/documents/:id/archive", s.archiveDocument)
+	v1.POST("/documents/:id/restore", s.restoreDocument)
+	v1.GET("/documents/:id/deletion-plan", s.documentDeletionPlan)
+	v1.POST("/documents/:id/purge", s.purgeDocument)
+	v1.GET("/documents/:id/deletion", s.getDocumentDeletion)
 	v1.POST("/images", s.uploadImage)
 	v1.GET("/images", s.listImages)
 	v1.GET("/images/:id", s.getImage)
@@ -404,7 +451,7 @@ func (s *Server) createStudyRecord(c *gin.Context) {
 	var encoded []byte
 	var statusCode = http.StatusAccepted
 	var conflict bool
-	err = s.store.DB.WithContext(c).Transaction(func(tx *gorm.DB) error {
+	err = s.store.DB.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
 		if key != "" {
 			// INSERT IGNORE 借助唯一键完成首次抢占：影响 1 行表示本请求持有该 key；
 			// 影响 0 行说明 key 已存在，随后读回已存记录决定是重放还是 409。
@@ -715,6 +762,14 @@ func (s *Server) retryTask(c *gin.Context) {
 		fail(c, 409, "TASK_NOT_RETRYABLE", "only dead tasks may be retried", nil)
 		return
 	}
+	if task.Kind == "question_generate" || task.Kind == "practice_feedback" || task.Kind == "authority_check" {
+		if err := s.store.RetryPracticeTask(c.Request.Context(), id); err != nil {
+			fail(c, 409, "TASK_NOT_RETRYABLE", err.Error(), nil)
+			return
+		}
+		ok(c, 202, gin.H{"task_id": id, "status": "pending"})
+		return
+	}
 	var documentID uint64
 	if task.Kind == "document_index" {
 		var payload struct {
@@ -728,7 +783,7 @@ func (s *Server) retryTask(c *gin.Context) {
 		if lookupFailed(c, s.store.DB.First(&document, payload.DocumentID).Error, "could not load task document") {
 			return
 		}
-		if document.Status != "failed" {
+		if document.Status != "failed" && !(document.Status == "ready" && document.IndexingTaskID == task.ID) {
 			fail(c, 409, "DOCUMENT_NOT_RETRYABLE", "only failed documents may be retried", gin.H{"status": document.Status})
 			return
 		}
@@ -748,7 +803,7 @@ func (s *Server) retryTask(c *gin.Context) {
 			return nil
 		}
 		if documentID != 0 {
-			result = tx.Model(&domain.Document{}).Where("id=? AND status='failed'", documentID).
+			result = tx.Model(&domain.Document{}).Where("id=? AND indexing_task_id=? AND status IN ('failed','ready')", documentID, task.ID).
 				Updates(map[string]any{"status": "uploaded", "error_message": "", "updated_at": now})
 			if result.Error != nil {
 				return result.Error

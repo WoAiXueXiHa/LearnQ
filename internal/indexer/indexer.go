@@ -5,14 +5,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+	"strings"
 	"time"
 
 	"github.com/WoAiXueXiHa/LearnQ/internal/domain"
 	"github.com/WoAiXueXiHa/LearnQ/internal/model"
 	"github.com/WoAiXueXiHa/LearnQ/internal/rag"
 	"github.com/WoAiXueXiHa/LearnQ/internal/store"
-	"gorm.io/gorm"
 )
 
 type VectorStore interface {
@@ -23,18 +26,25 @@ type VectorStore interface {
 }
 
 type Indexer struct {
-	Store     *store.Store
-	Embedding model.EmbeddingModel
-	Vectors   VectorStore
-	Dimension int
-	Version   string
+	Store        *store.Store
+	Embedding    model.EmbeddingModel
+	Vectors      VectorStore
+	Dimension    int
+	ChunkVersion string
+	Version      string
 }
 
+func (i *Indexer) ConfiguredChunkVersion() string {
+	if i.ChunkVersion != "" {
+		return i.ChunkVersion
+	}
+	return rag.LegacyChunkVersion
+}
 func (i *Indexer) IndexVersion() string {
 	if i.Version != "" {
 		return i.Version
 	}
-	return fmt.Sprintf("chunk-v1-dim-%d", i.Dimension)
+	return fmt.Sprintf("configured_chunk=%s;dim=%d", i.ConfiguredChunkVersion(), i.Dimension)
 }
 
 // ShadowDocument rebuilds vectors for a ready document into an independent
@@ -50,7 +60,7 @@ func (i *Indexer) ShadowDocument(ctx context.Context, documentID uint64) error {
 		return fmt.Errorf("shadow rebuild requires ready document %d", documentID)
 	}
 	var chunks []domain.DocumentChunk
-	if err := i.Store.DB.WithContext(ctx).Where("document_id=?", documentID).
+	if err := i.Store.DB.WithContext(ctx).Where("document_id=? AND index_id=?", documentID, document.ActiveIndexID).
 		Order("chunk_index,id").Find(&chunks).Error; err != nil {
 		return err
 	}
@@ -58,20 +68,23 @@ func (i *Indexer) ShadowDocument(ctx context.Context, documentID uint64) error {
 		return fmt.Errorf("ready document %d has no persisted chunks", documentID)
 	}
 	texts := make([]string, len(chunks))
-	for index := range chunks {
-		texts[index] = chunks[index].Content
+	legacySource := document.ActiveIndexID == 0
+	if !legacySource {
+		var version domain.DocumentIndex
+		if err := i.Store.DB.WithContext(ctx).First(&version, document.ActiveIndexID).Error; err != nil {
+			return err
+		}
+		legacySource = version.ChunkVersion == rag.LegacyChunkVersion
 	}
-	dense, err := i.Embedding.Embed(ctx, texts)
+	for index := range chunks {
+		texts[index] = chunks[index].EmbeddingContent
+		if legacySource {
+			texts[index] = chunks[index].Content
+		}
+	}
+	dense, err := i.embedText(ctx, texts)
 	if err != nil {
 		return err
-	}
-	if len(dense) != len(chunks) {
-		return fmt.Errorf("embedding result count mismatch")
-	}
-	for _, vector := range dense {
-		if len(vector) != i.Dimension {
-			return fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
-		}
 	}
 	if err := i.Vectors.EnsureCollection(ctx, i.Dimension); err != nil {
 		return err
@@ -79,17 +92,22 @@ func (i *Indexer) ShadowDocument(ctx context.Context, documentID uint64) error {
 	if err := i.Vectors.DeleteDocument(ctx, documentID); err != nil {
 		return err
 	}
-	points := make([]rag.Point, len(chunks))
+	points := make([]rag.Point, 0, len(chunks))
 	for index, chunk := range chunks {
-		points[index] = rag.Point{ID: uuidFromHash(chunk.ID), Dense: dense[index], Sparse: rag.Sparse(chunk.Content), Payload: map[string]any{
-			"document_id": documentID, "chunk_id": chunk.ID, "title": chunk.Title,
-			"start_line": chunk.StartLine, "end_line": chunk.EndLine, "summary": truncate(chunk.Content, 240),
-		}}
+		if vector, ok := dense[index]; ok {
+			points = append(points, rag.Point{ID: uuidFromHash(chunk.ID), Dense: vector, Sparse: rag.Sparse(texts[index]), Payload: map[string]any{
+				"document_id": documentID, "chunk_id": chunk.ID, "index_id": chunk.IndexID, "title": chunk.Title,
+				"start_line": chunk.StartLine, "end_line": chunk.EndLine, "summary": truncate(chunk.Content, 240),
+			}})
+		}
+	}
+	if len(points) == 0 {
+		return nil
 	}
 	return i.Vectors.Upsert(ctx, points)
 }
 
-func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, error) {
+func (i *Indexer) Process(ctx context.Context, task domain.AITask) (resultID uint64, processErr error) {
 	// 文档状态按 uploaded -> parsing -> embedding -> indexing -> ready 单向推进。
 	// 每一步都用条件更新做并发保护，删除请求或重复 Worker 无法悄悄覆盖当前状态。
 	var payload struct {
@@ -102,87 +120,136 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 	if err := i.Store.DB.WithContext(ctx).First(&document, payload.DocumentID).Error; err != nil {
 		return 0, err
 	}
-	if err := i.status(ctx, document.ID, "uploaded", "parsing"); err != nil {
+	if err := i.status(ctx, task, document.ID, "uploaded", "parsing"); err != nil {
 		return 0, err
 	}
-	chunks := rag.ChunkText(document.Content, rag.DefaultChunkSize, rag.DefaultChunkOverlap)
+	actualChunkVersion := i.ConfiguredChunkVersion()
+	if actualChunkVersion != rag.LegacyChunkVersion && actualChunkVersion != rag.MarkdownChunkVersion {
+		return 0, fmt.Errorf("unsupported chunk version %q", actualChunkVersion)
+	}
+	if document.MediaType != "md" && document.MediaType != ".md" && document.MediaType != "text/markdown" {
+		actualChunkVersion = rag.LegacyChunkVersion
+	}
+	var chunks []rag.Chunk
+	var articleImages []rag.ImageReference
+	if actualChunkVersion == rag.MarkdownChunkVersion {
+		var err error
+		parsed, parseErr := rag.ParseMarkdown(document.Content)
+		if parseErr != nil {
+			return 0, parseErr
+		}
+		articleImages = parsed.ImageRefs
+		chunks, err = rag.ChunkMarkdown(document.Content)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		chunks = rag.ChunkText(document.Content, rag.DefaultChunkSize, rag.DefaultChunkOverlap)
+	}
 	if len(chunks) == 0 {
 		// 空文档切不出块，直接以错误终止；否则会以零切片走完流程，把空文档错误标记为 ready。
 		return 0, fmt.Errorf("document produced no chunks")
 	}
-	if err := i.status(ctx, document.ID, "parsing", "embedding"); err != nil {
+	if err := i.status(ctx, task, document.ID, "parsing", "embedding"); err != nil {
 		return 0, err
 	}
 	texts := make([]string, len(chunks))
 	for index := range chunks {
-		texts[index] = chunks[index].Content
+		texts[index] = chunks[index].EmbeddingContent
+		if actualChunkVersion == rag.LegacyChunkVersion {
+			texts[index] = chunks[index].Content
+		}
 	}
-	dense, err := i.Embedding.Embed(ctx, texts)
+	dense, err := i.embedText(ctx, texts)
 	if err != nil {
 		return 0, err
 	}
-	if len(dense) != len(chunks) {
-		return 0, fmt.Errorf("embedding result count mismatch")
-	}
-	for _, vector := range dense {
-		// 向量维度必须与 Qdrant collection 一致，不一致说明 Embedding 配置漂移，
-		// 继续 Upsert 会污染整个检索空间。
-		if len(vector) != i.Dimension {
-			return 0, fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
-		}
-	}
-	if err := i.status(ctx, document.ID, "embedding", "indexing"); err != nil {
+	if err := i.status(ctx, task, document.ID, "embedding", "indexing"); err != nil {
 		return 0, err
 	}
 	// EnsureCollection 确保 Qdrant collection 存在且维度一致，创建动作是幂等的。
 	if err := i.Vectors.EnsureCollection(ctx, i.Dimension); err != nil {
 		return 0, err
 	}
-	// 重建前删除整篇文档的旧点。文档此时不是 ready，在线检索不会暴露清理窗口。
-	if err := i.Vectors.DeleteDocument(ctx, document.ID); err != nil {
-		return 0, err
-	}
+	// Each execution attempt owns a separate immutable build; never delete active points.
+	version := domain.DocumentIndex{DocumentID: document.ID, TaskID: task.ID, ExecutionGeneration: task.ExecutionGeneration, AttemptNo: task.AttemptNo,
+		Content: document.Content, ContentHash: document.ContentHash, IndexVersion: i.IndexVersion(),
+		ChunkVersion: actualChunkVersion, Dimension: i.Dimension, Status: "building", CreatedAt: time.Now().UTC()}
+	defer func() {
+		if processErr == nil || version.ID == 0 {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := i.abandon(cleanupCtx, document.ID, version.ID); err != nil {
+			processErr = fmt.Errorf("%w; build cleanup failed: %v", processErr, err)
+		}
+	}()
 	rows := make([]domain.DocumentChunk, len(chunks))
-	points := make([]rag.Point, len(chunks))
+	points := make([]rag.Point, 0, len(chunks))
 	now := time.Now().UTC()
-	for index, chunk := range chunks {
-		// 稳定 ID 让重试具有幂等性；同一内容块会覆盖原记录和向量点。
-		id := stableID(document.ID, chunk.Index, chunk.Hash)
-		rows[index] = domain.DocumentChunk{ID: id, DocumentID: document.ID, ChunkIndex: chunk.Index, Title: chunk.Title, StartLine: chunk.StartLine, EndLine: chunk.EndLine, Content: chunk.Content, ContentHash: chunk.Hash, CreatedAt: now}
-		points[index] = rag.Point{ID: uuidFromHash(id), Dense: dense[index], Sparse: rag.Sparse(chunk.Content), Payload: map[string]any{
-			"document_id": document.ID, "chunk_id": id, "title": chunk.Title, "start_line": chunk.StartLine,
-			"end_line": chunk.EndLine, "summary": truncate(chunk.Content, 240),
-		}}
-	}
-	if err := i.Store.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		// 先清理旧切片，允许切块算法升级后 chunk 数量和稳定 ID 发生变化。
-		if err := tx.Where("document_id=?", document.ID).Delete(&domain.DocumentChunk{}).Error; err != nil {
+	err = i.Store.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var current domain.Document
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, document.ID).Error; err != nil {
 			return err
 		}
-		for index := range rows {
-			if err := tx.Where("id=?", rows[index].ID).Assign(rows[index]).FirstOrCreate(&rows[index]).Error; err != nil {
+		if current.Status != "indexing" || current.IndexingTaskID != task.ID {
+			return fmt.Errorf("document state changed before build persistence")
+		}
+		var owner int64
+		if err := tx.Model(&domain.AITask{}).Where("id=? AND status='processing' AND execution_generation=? AND attempt_no=? AND lease_token=? AND lease_until>?", task.ID, task.ExecutionGeneration, task.AttemptNo, task.LeaseToken, time.Now().UTC()).Count(&owner).Error; err != nil {
+			return err
+		}
+		if owner != 1 {
+			return errors.New("task lease lost before build persistence")
+		}
+		if err := tx.Create(&version).Error; err != nil {
+			return err
+		}
+		// Persist every occurrence, including unresolved references, before any
+		// remote processing. A text-ready index does not imply image completeness.
+		for _, ref := range articleImages {
+			row := domain.ArticleImage{DocumentID: document.ID, IndexID: version.ID,
+				StartByte: ref.StartByte, EndByte: ref.EndByte, StartLine: ref.StartLine, EndLine: ref.EndLine,
+				OriginalURL: ref.URL, AltText: ref.Alt, SyntaxKind: ref.Kind, Status: ref.Status,
+				CreatedAt: now, UpdatedAt: now}
+			if err := tx.Create(&row).Error; err != nil {
 				return err
 			}
 		}
-		return nil
-	}); err != nil {
-		return 0, err
-	}
-	if err := i.Vectors.Upsert(ctx, points); err != nil {
-		return 0, err
-	}
-	if err := i.requireStatus(ctx, document.ID, "indexing"); err != nil {
-		// MySQL 与 Qdrant 无法共享事务。若向量写入期间文档被删除/改态，
-		// 立即反向删除两侧切片，避免“文档不可见但向量仍可召回”的幽灵证据。
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		cleanupErr := i.Vectors.DeleteDocument(cleanupCtx, document.ID)
-		_ = i.Store.DB.WithContext(cleanupCtx).
-			Where("document_id=?", document.ID).Delete(&domain.DocumentChunk{}).Error
-		if cleanupErr != nil {
-			return 0, fmt.Errorf("%w; vector cleanup failed: %v", err, cleanupErr)
+		for index, chunk := range chunks {
+			// 块身份包含构建版本，重复文本与迟到重试不能覆盖其他版本。
+			id := stableID(document.ID, chunk.Index, fmt.Sprintf("%d:%s", version.ID, chunk.Hash))
+			headingJSON, _ := json.Marshal(chunk.HeadingPath)
+			imagesJSON, _ := json.Marshal(chunk.ImageRefs)
+			spansJSON, _ := json.Marshal(chunk.BlockSpans)
+			rows[index] = domain.DocumentChunk{EmbeddingContent: texts[index], HeadingPathJSON: string(headingJSON), BlockSpansJSON: string(spansJSON), ImageRefsJSON: string(imagesJSON), BlockType: chunk.BlockType, ID: id, DocumentID: document.ID, IndexID: version.ID, StartByte: chunk.StartByte, EndByte: chunk.EndByte, ChunkIndex: chunk.Index, Title: chunk.Title, StartLine: chunk.StartLine, EndLine: chunk.EndLine, Content: chunk.Content, ContentHash: chunk.Hash, CreatedAt: now}
+			if vector, ok := dense[index]; ok {
+				points = append(points, rag.Point{ID: uuidFromHash(id), Dense: vector, Sparse: rag.Sparse(texts[index]), Payload: map[string]any{
+					"document_id": document.ID, "chunk_id": id, "index_id": version.ID, "title": chunk.Title, "start_line": chunk.StartLine,
+					"end_line": chunk.EndLine, "summary": truncate(chunk.Content, 240),
+				}})
+			}
 		}
+		return tx.Create(&rows).Error
+	})
+	if err != nil {
 		return 0, err
+	}
+	if len(points) > 0 {
+		if err := i.Vectors.Upsert(ctx, points); err != nil {
+			return 0, err
+		}
+	}
+	if err := i.requireStatus(ctx, task, document.ID, "indexing"); err != nil {
+		return 0, err
+	}
+	result := i.Store.DB.WithContext(ctx).Model(&domain.DocumentIndex{}).Where("id=? AND status='building'", version.ID).Update("status", "built")
+	if result.Error != nil {
+		return 0, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return 0, errors.New("index build disappeared before completion")
 	}
 	return document.ID, nil
 }
@@ -190,8 +257,8 @@ func (i *Indexer) Process(ctx context.Context, task domain.AITask) (uint64, erro
 // status 以条件 UPDATE 推进文档状态机：仅当当前状态等于 from 时才更新为 to。
 // RowsAffected != 1 说明状态已被并发路径改动（删除请求、重复 Worker），
 // 此时返回错误让上层放弃本次索引，不做强制覆盖。
-func (i *Indexer) status(ctx context.Context, id uint64, from, to string) error {
-	result := i.Store.DB.WithContext(ctx).Exec("UPDATE documents SET status=?,updated_at=? WHERE id=? AND status=?", to, time.Now().UTC(), id, from)
+func (i *Indexer) status(ctx context.Context, task domain.AITask, id uint64, from, to string) error {
+	result := i.Store.DB.WithContext(ctx).Exec("UPDATE documents SET status=?,updated_at=? WHERE id=? AND status=? AND indexing_task_id=? AND EXISTS (SELECT 1 FROM ai_tasks t WHERE t.id=? AND t.status='processing' AND t.execution_generation=? AND t.attempt_no=? AND t.lease_token=? AND t.lease_until>?)", to, time.Now().UTC(), id, from, task.ID, task.ID, task.ExecutionGeneration, task.AttemptNo, task.LeaseToken, time.Now().UTC())
 	if result.Error != nil {
 		return result.Error
 	}
@@ -205,7 +272,7 @@ func (i *Indexer) status(ctx context.Context, id uint64, from, to string) error 
 
 // requireStatus 在向量写入后复查文档仍处于 indexing。若期间被删除或改态，
 // 索引结果不应保留，调用方据此触发 MySQL 与 Qdrant 的双向清理。
-func (i *Indexer) requireStatus(ctx context.Context, id uint64, expected string) error {
+func (i *Indexer) requireStatus(ctx context.Context, task domain.AITask, id uint64, expected string) error {
 	var current string
 	result := i.Store.DB.WithContext(ctx).Raw("SELECT status FROM documents WHERE id=?", id).Scan(&current)
 	if result.Error != nil {
@@ -213,6 +280,13 @@ func (i *Indexer) requireStatus(ctx context.Context, id uint64, expected string)
 	}
 	if result.RowsAffected != 1 || current != expected {
 		return fmt.Errorf("document state changed before index completion (current=%s)", current)
+	}
+	var owner int64
+	if err := i.Store.DB.WithContext(ctx).Model(&domain.AITask{}).Where("id=? AND status='processing' AND execution_generation=? AND attempt_no=? AND lease_token=? AND lease_until>?", task.ID, task.ExecutionGeneration, task.AttemptNo, task.LeaseToken, time.Now().UTC()).Count(&owner).Error; err != nil {
+		return err
+	}
+	if owner != 1 {
+		return errors.New("task lease lost before index completion")
 	}
 	return nil
 }
@@ -237,4 +311,65 @@ func truncate(value string, limit int) string {
 		return value
 	}
 	return string(runes[:limit])
+}
+
+// abandon compensates only this execution's build, preserving the active index.
+func (i *Indexer) abandon(ctx context.Context, documentID, indexID uint64) error {
+	var doc domain.Document
+	err := i.Store.DB.WithContext(ctx).First(&doc, documentID).Error
+	deleted := errors.Is(err, gorm.ErrRecordNotFound) || (err == nil && doc.Status == "deleting")
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if scoped, ok := i.Vectors.(interface {
+		DeleteIndex(context.Context, uint64, uint64) error
+	}); ok {
+		if err := scoped.DeleteIndex(ctx, documentID, indexID); err != nil {
+			return err
+		}
+	} else if deleted {
+		if err := i.Vectors.DeleteDocument(ctx, documentID); err != nil {
+			return err
+		}
+	}
+	if deleted {
+		return i.Store.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Where("index_id=?", indexID).Delete(&domain.DocumentChunk{}).Error; err != nil {
+				return err
+			}
+			return tx.Delete(&domain.DocumentIndex{}, indexID).Error
+		})
+	}
+	return i.Store.DB.WithContext(ctx).Model(&domain.DocumentIndex{}).Where("id=? AND status IN ('building','built')", indexID).Update("status", "failed").Error
+}
+
+// Metadata-only source chunks remain persisted for exact coverage, but providers
+// never receive empty embedding inputs and raw markup is not used as a fallback.
+func (i *Indexer) embedText(ctx context.Context, texts []string) (map[int][]float32, error) {
+	inputs := make([]string, 0, len(texts))
+	indices := make([]int, 0, len(texts))
+	for j, value := range texts {
+		if strings.TrimSpace(value) != "" {
+			inputs = append(inputs, value)
+			indices = append(indices, j)
+		}
+	}
+	result := make(map[int][]float32, len(inputs))
+	if len(inputs) == 0 {
+		return result, nil
+	}
+	dense, err := i.Embedding.Embed(ctx, inputs)
+	if err != nil {
+		return nil, err
+	}
+	if len(dense) != len(inputs) {
+		return nil, fmt.Errorf("embedding result count mismatch")
+	}
+	for j, vector := range dense {
+		if len(vector) != i.Dimension {
+			return nil, fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
+		}
+		result[indices[j]] = vector
+	}
+	return result, nil
 }

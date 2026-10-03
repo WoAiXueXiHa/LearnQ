@@ -4,7 +4,8 @@ ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=$GOPROXY
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
+COPY cmd ./cmd
+COPY internal ./internal
 ARG TARGET=api
 RUN CGO_ENABLED=0 GOWORK=off go build -trimpath -o /out/app ./cmd/${TARGET}
 

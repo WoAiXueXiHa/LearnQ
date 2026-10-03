@@ -1,4 +1,4 @@
-.PHONY: fmt fmt-check vet test test-tools race test-integration up down reset-data acceptance manual-test eval-rag eval-redis-qdrant reindex
+.PHONY: fmt fmt-check vet test test-tools race test-integration up down reset-data acceptance acceptance-practice manual-test eval-rag eval-redis-qdrant reindex
 
 # 按 git 索引枚举 Go 文件：包含未跟踪的新文件，排除 data/reports、tmp 等被忽略的本地草稿，
 # 否则这些不入库的临时脚本会让 fmt-check 永远失败。
@@ -23,7 +23,9 @@ race:
 	GOWORK=off go test -race $(GO_PACKAGES)
 
 test-integration:
-	GOWORK=off go test -p 1 -tags=integration $(GO_PACKAGES)
+	@test -n "$(LEARNQ_TEST_MYSQL_DSN)" || { echo 'LEARNQ_TEST_MYSQL_DSN must target disposable MySQL' >&2; exit 1; }
+	@test -n "$(LEARNQ_TEST_REDIS_ADDR)" || { echo 'LEARNQ_TEST_REDIS_ADDR must target disposable Redis' >&2; exit 1; }
+	GOWORK=off go test -p 1 -count=1 -timeout 120s -tags=integration $(GO_PACKAGES)
 up:
 	docker compose up --build -d
 down:
@@ -32,6 +34,8 @@ reset-data:
 	docker compose down -v
 acceptance:
 	./scripts/acceptance.sh
+acceptance-practice:
+	bash ./scripts/acceptance-practice.sh
 manual-test:
 	./scripts/manual-test.sh
 eval-redis-qdrant:

@@ -24,9 +24,10 @@ type ImageDescription struct {
 }
 
 type VisionRequest struct {
-	Image     []byte
-	MediaType string
-	Prompt    string
+	MaxOutputTokens int
+	Image           []byte
+	MediaType       string
+	Prompt          string
 }
 
 type VisionResponse struct {
@@ -139,7 +140,14 @@ func (m OpenAICompatibleVision) Describe(ctx context.Context, req VisionRequest)
 		}},
 		"response_format": map[string]string{"type": "json_object"},
 	}
+	if strings.HasPrefix(m.Model, "deepseek-") {
+		body["thinking"] = map[string]string{"type": "disabled"}
+	}
 	encoded, err := json.Marshal(body)
+	if req.MaxOutputTokens > 0 {
+		body["max_tokens"] = req.MaxOutputTokens
+		encoded, err = json.Marshal(body)
+	}
 	if err != nil {
 		return VisionResponse{}, err
 	}

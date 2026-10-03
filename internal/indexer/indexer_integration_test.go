@@ -86,7 +86,7 @@ func TestDocumentTaskIndexesAsynchronously(t *testing.T) {
 		t.Fatalf("acquire=%v err=%v", ok, err)
 	}
 	vectors := &memoryVectors{}
-	processor := &indexer.Indexer{Store: s, Embedding: model.Fake{Dimension: 64}, Vectors: vectors, Dimension: 64}
+	processor := &indexer.Indexer{Store: s, Embedding: model.Fake{Dimension: 64}, Vectors: vectors, Dimension: 64, Version: "test-v1"}
 	documentID, err := processor.Process(context.Background(), acquired)
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestDeletingDocumentCannotBeResurrectedAfterVectorUpsert(t *testing.T) {
 			t.Errorf("mark deleting: %v", err)
 		}
 	}}
-	processor := &indexer.Indexer{Store: s, Embedding: model.Fake{Dimension: 64}, Vectors: vectors, Dimension: 64}
+	processor := &indexer.Indexer{Store: s, Embedding: model.Fake{Dimension: 64}, Vectors: vectors, Dimension: 64, Version: "test-v1"}
 	if _, err := processor.Process(context.Background(), acquired); err == nil {
 		t.Fatal("delete race unexpectedly completed")
 	}

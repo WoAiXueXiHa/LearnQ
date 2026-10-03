@@ -65,6 +65,9 @@ type OpenAICompatible struct {
 // Generate 构造 OpenAI 兼容 /chat/completions 请求：JSON Schema 拼入 system prompt
 // 并请求 json_object 响应格式；空 choices 或空内容视为上游异常。
 func (m OpenAICompatible) Generate(ctx context.Context, req ChatRequest) (ChatResponse, error) {
+	if strings.HasPrefix(m.ChatModel, "deepseek-") && len(req.ResponseSchema) > 0 {
+		return m.generateDeepSeekStructured(ctx, req)
+	}
 	systemPrompt := strings.TrimSpace(req.Prompt)
 	if len(req.ResponseSchema) > 0 {
 		systemPrompt += "\n\nReturn only one JSON object that matches this JSON Schema exactly:\n" + string(req.ResponseSchema)
@@ -73,9 +76,16 @@ func (m OpenAICompatible) Generate(ctx context.Context, req ChatRequest) (ChatRe
 		{"role": "system", "content": systemPrompt},
 		{"role": "user", "content": string(req.Input)},
 	}, "response_format": map[string]string{"type": "json_object"}}
+	if strings.HasPrefix(m.ChatModel, "deepseek-") {
+		body["thinking"] = map[string]string{"type": "disabled"}
+	}
+	if req.MaxOutputTokens > 0 {
+		body["max_tokens"] = req.MaxOutputTokens
+	}
 	var response struct {
 		Choices []struct {
-			Message struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
@@ -91,6 +101,9 @@ func (m OpenAICompatible) Generate(ctx context.Context, req ChatRequest) (ChatRe
 	if len(response.Choices) == 0 {
 		return ChatResponse{}, fmt.Errorf("chat response has no choices")
 	}
+	if response.Choices[0].FinishReason == "length" {
+		return ChatResponse{InputTokens: response.Usage.Prompt, OutputTokens: response.Usage.Completion, Model: m.ChatModel}, &DependencyError{Code: "AI_OUTPUT_TRUNCATED"}
+	}
 	if strings.TrimSpace(response.Choices[0].Message.Content) == "" {
 		return ChatResponse{}, fmt.Errorf("chat response content is empty")
 	}
@@ -100,21 +113,30 @@ func (m OpenAICompatible) Generate(ctx context.Context, req ChatRequest) (ChatRe
 // Embed 批量向量化；配置了 Dimension 时显式向供应商请求维度，
 // 并校验返回数量、顺序与维度，防止向量漂移破坏 Qdrant collection 一致性。
 func (m OpenAICompatible) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	vectors, _, err := m.EmbedWithUsage(ctx, texts)
+	return vectors, err
+}
+
+func (m OpenAICompatible) EmbedWithUsage(ctx context.Context, texts []string) ([][]float32, int, error) {
 	body := map[string]any{"model": m.EmbeddingModel, "input": texts}
 	if m.Dimension > 0 {
 		body["dimensions"] = m.Dimension
 	}
 	var response struct {
+		Usage struct {
+			Prompt int `json:"prompt_tokens"`
+			Total  int `json:"total_tokens"`
+		} `json:"usage"`
 		Data []struct {
 			Embedding []float32 `json:"embedding"`
 			Index     int       `json:"index"`
 		} `json:"data"`
 	}
 	if err := m.call(ctx, "/embeddings", body, &response); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(response.Data) != len(texts) {
-		return nil, fmt.Errorf("embedding response count mismatch: got %d want %d", len(response.Data), len(texts))
+		return nil, 0, fmt.Errorf("embedding response count mismatch: got %d want %d", len(response.Data), len(texts))
 	}
 	out := make([][]float32, len(texts))
 	seen := make([]bool, len(texts))
@@ -122,17 +144,21 @@ func (m OpenAICompatible) Embed(ctx context.Context, texts []string) ([][]float3
 		// 供应商可能乱序返回 embedding，按 index 复原输入顺序并拒绝重复、缺失或维度漂移。
 		if item.Index < 0 || item.Index >= len(out) || seen[item.Index] ||
 			len(item.Embedding) == 0 || (m.Dimension > 0 && len(item.Embedding) != m.Dimension) {
-			return nil, fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
+			return nil, 0, fmt.Errorf("EMBEDDING_DIMENSION_MISMATCH")
 		}
 		seen[item.Index] = true
 		out[item.Index] = item.Embedding
 	}
 	for index, present := range seen {
 		if !present {
-			return nil, fmt.Errorf("embedding response missing index %d", index)
+			return nil, 0, fmt.Errorf("embedding response missing index %d", index)
 		}
 	}
-	return out, nil
+	tokens := response.Usage.Prompt
+	if tokens == 0 {
+		tokens = response.Usage.Total
+	}
+	return out, tokens, nil
 }
 
 // call 是 Chat/Embedding 共用的 HTTP 封装：超时与网络错误映射为可重试的

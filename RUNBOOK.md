@@ -317,6 +317,19 @@ make acceptance
 
 脚本退出时会清理自己的容器和数据卷，不影响默认 LearnQ 环境。自动测试始终使用 Fake 或 Mock 模型，不会产生付费 API 调用。
 
+## 全栈维护备份（工具已实现，恢复未验收）
+
+`scripts/backup-stack.py` 备份显式选定的 Compose 项目。执行前安排维护窗口；该命令停止 API、worker、Qdrant 和 Redis，MySQL 保持运行并做一致性逻辑转储。期间不要手工写数据库或切换镜像。
+
+```bash
+python3 scripts/backup-stack.py --project <现有项目名> \
+  --output <私有备份根目录>/<新的备份目录> --maintenance --retention-days 30
+```
+
+输出目录必须尚不存在。备份包括 MySQL SQL、冷停机的 Qdrant 数据目录、图片、报告和 Redis 数据，manifest 记录组件 SHA-256、镜像 ID、时间及到期日。配置密钥不包含在备份里，需通过原有私有方式保管。未完成的备份会保留 `incomplete` 标记；不要用于恢复。退出时仅尝试启动本轮停止的原先运行容器，随后仍需查看健康检查。
+
+备份目录含文章和作答，不提交 Git、不公开。到期日只是保留策略记录，目前没有自动删除备份；文章彻底删除不会擦除已有备份，需按保留策略处理。恢复必须使用独立项目和空卷，并核对数据库、向量、图片、报告及真实业务引用；当前备份脚本尚未实际执行，恢复入口和演练仍待完成。文章 ZIP 导出不具备全栈恢复能力。
+
 ## 故障恢复演示
 
 以下实验会修改队列、任务状态或停止 Worker，建议在临时 Compose 项目中执行。每个实验结束后都可以用 `/api/v1/tasks/:id/detail`、`/metrics` 或 MySQL 查询核对。
@@ -454,6 +467,62 @@ python3 scripts/sample-capacity.py --project learnq_capacity \
 
 根据实际 Docker 数据目录调整 `--disk-path`，并使用有 Docker 读取权限的账号。
 JSONL 保存容器内存/CPU/IO、重启计数、OOM 状态、宿主机可用内存、swap 累计页数
-与磁盘余量。swap 活动应比较相邻样本差值；容器内存是采样工作集，可能漏掉瞬时峰值。
+与磁盘余量。容器重建时 Docker 查询可能短暂失败，采样器会记录 `sample_error`
+缺口并有限重试（默认最多连续 3 次）；这些行不是有效资源样本。最终采样未恢复或连续
+错误达上限会非零退出，不能把失败当作采集成功。swap 活动应比较相邻样本差值；容器内存是采样工作集，可能漏掉瞬时峰值。
 采集成功不代表容量通过。正式验收还须在目标 2 GB 服务器完成启动、负载、重启、
 备份恢复及连续运行验证，单独记录镜像构建峰值和用户入口。
+
+
+## P1 索引版本契约（2026-10-02 增量）
+
+迁移 `009_document_indexes.sql` 新增不可变索引快照、活动索引指针和块字节位置。新重建隔离写入，任务成功与活动版本切换在 MySQL 同一事务提交；已有活动版本在重建期间继续可读，失败保留旧版本。旧块保留为 `index_id=0`，只有能按历史 800/120 契约证明位置时才作为可定位证据。
+
+历史引用可按返回的文档、索引和块 ID 读取原文快照：
+
+~~~bash
+curl -fsS http://127.0.0.1:8080/api/v1/documents/1/indexes/2/chunks/CHUNK_ID | jq
+~~~
+
+该接口返回原文、文章哈希、块内容、行号、UTF-8 字节范围及是否仍活动；位置或哈希不一致返回 `410 EVIDENCE_INVALID`，未激活版本返回 `409 EVIDENCE_NOT_READY`，已删除或不存在返回 404。当前删除仍是彻底删除该文档全部版本；未来题组引用保护尚未实现。旧索引/失败构建的自动清理也未加入，容量采样须观察版本累积。
+
+RAG 与评测在 Qdrant 取 Top K 前限定 MySQL 活动块；评测解析或运行期间活动块集合变化返回 `409 INDEX_CHANGED`，重试前重新解析证据。评测记录的 `config_json.active_chunk_ids` 保存本次候选范围，不是语义质量证明。
+
+上文 shadow 概述仅适用于历史兼容模式，当前限制如下：
+
+命令只支持尚未版本化的历史文档，复用其已持久化 chunks 写入新 collection；只要存在 `active_index_id>0` 的文档，就拒绝此模式。若 `--limit` 未覆盖全部 ready 文档或构建期间文档集合/索引发生变化，也不切换 alias。历史兼容模式需在停止文档写入/索引任务的维护窗口执行，MySQL 校验与 Qdrant alias 切换之间仍无跨组件事务。新版本文档使用普通单文档/批量重建；完整 embedding/collection 迁移契约留待后续，不改写不可变版本元数据。
+
+### 恢复前校验
+
+```bash
+python3 scripts/verify-stack-backup.py --backup <备份目录>
+```
+
+校验器要求全部五个组件及完成标记，逐文件核对大小/SHA-256，读取压缩内容验证完整性，拒绝绝对路径、上级路径、重复条目、符号链接和特殊文件，并限制解压总量（默认 10 GiB，可用 `--max-unpacked-bytes` 调整）。校验只读取备份，不解压、不启动服务。`integrity_checked_not_restored` 不表示数据库能导入、Qdrant 版本兼容或业务引用可恢复；这些仍需独立恢复演练。
+
+### 隔离恢复入口
+
+```bash
+python3 scripts/restore-stack-isolated.py --backup <备份目录> \
+  --output <新的私有演练目录> --api-port 18083 --qdrant-port 18084
+```
+
+先验证备份和本地镜像 ID，生成独立 Compose 文件、随机项目名及新卷，不接收已有目标项目/卷名，也不自动拉取镜像。恢复 SQL 与冷数据目录时保留文件所有权；完成后只将状态写为 `restored_requires_business_verification`。API/Qdrant 仅监听 localhost；模型强制 Fake 且预算零，原有真实向量数据保留但不认领真实检索质量。配置使用本仓库的标准数据库/目录布局，若源环境改过目录、数据库名或基础服务参数，应先核对兼容性。
+
+演练项目和卷保留，失败也保留 `result.json`；不要把它当生产恢复或自动切换入口。后续必须比较表数据、向量和文件哈希，实际打开历史原文/图片/题组/作答并验证重启恢复。2026-10-03 已在本机合成 Fake 栈执行冷备份/新卷恢复和业务校验，相关日志保存在忽略的 `data/reports/` 目录；该单独入口不自动清理演练卷。
+
+### 备份到期清理
+
+```bash
+python3 scripts/expire-stack-backups.py --root <私有备份根目录> --output <新的清理清单.json>
+# 查看清单中的目录、到期时间和文件；明确执行才会删除：
+python3 scripts/expire-stack-backups.py --apply-plan <清理清单.json>
+```
+
+默认仅预览，不删除。执行时重新扫描影响并比较清单哈希与目录身份，只删除已到期、完整且文件哈希匹配的 LearnQ 备份目录。未到期、未知格式、额外文件、链接或内容变动均不处理；影响变化需重新生成清单。删除无法撤销，清单应保存在被删目录之外。该工具没有安装定时任务，现有备份仍需按运维安排显式执行保留策略。
+
+### 五题浏览器验收入口
+
+`make acceptance-practice` 默认执行 API 场景（含冷备份/新卷恢复与业务比对），再用 Playwright Chromium 操作真实页面并保存 DOM、PNG 截图、Trace 和页面错误。恢复子项目及测试项目只清理各自随机新建的卷；恢复端口默认 localhost:18085/18086，主测试 API 默认 localhost:18081。测试环境需要先安装 Playwright 和 Chromium（参见 [官方安装说明](https://playwright.dev/python/docs/library)），工具不会在运行中自动下载依赖。依赖缺失或浏览器场景失败会令整体命令失败，不计 Skip 通过。
+
+`PRACTICE_BROWSER=0 make acceptance-practice` 只做 API 场景，必须标为 API-only；不能据此认领浏览器验收。浏览器工具也可对 localhost 上的隔离 Fake API 单独执行，运行前验证模式，只上传自己的合成文章。2026-10-03 已执行浏览器实测，含移动布局、慢保存、纠错复习和删除。图片修订与真实双来源核查页面的完整交互仍待补齐，不等于所有页面行为已验收。`PRACTICE_RECOVERY=0` 可明确关闭冷备份恢复，此时不能认领恢复验收。依赖可安装在独立 Python 环境：`python -m pip install playwright==1.63.0`，随后 `python -m playwright install --with-deps chromium`。

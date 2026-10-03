@@ -399,7 +399,7 @@ func (s *Server) uploadDocument(c *gin.Context) {
 	}
 	now := time.Now().UTC()
 	sum := sha256.Sum256(body)
-	doc, task, err := s.store.CreateDocument(c, domain.Document{Filename: header.Filename, MediaType: ext, ContentHash: hex.EncodeToString(sum[:]), Content: string(body), CreatedAt: now, UpdatedAt: now})
+	doc, task, err := s.store.CreateDocument(c.Request.Context(), domain.Document{Filename: header.Filename, MediaType: ext, ContentHash: hex.EncodeToString(sum[:]), Content: string(body), CreatedAt: now, UpdatedAt: now})
 	if err != nil {
 		fail(c, 500, "INTERNAL_ERROR", "document save failed", nil)
 		return
@@ -457,6 +457,15 @@ func (s *Server) deleteDocument(c *gin.Context) {
 	if !valid {
 		return
 	}
+	var practiceReferences int64
+	if err := s.store.DB.WithContext(c.Request.Context()).Model(&domain.QuestionSet{}).Where("document_id=?", id).Count(&practiceReferences).Error; err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not check practice dependencies", nil)
+		return
+	}
+	if practiceReferences > 0 {
+		fail(c, 409, "DOCUMENT_IN_USE", "article is referenced by practice history", nil)
+		return
+	}
 	var document domain.Document
 	if lookupFailed(c, s.store.DB.First(&document, id).Error, "could not load document") {
 		return
@@ -477,7 +486,7 @@ func (s *Server) deleteDocument(c *gin.Context) {
 	}
 	// RAG 未配置（无 vectors）时跳过外部删除，仅清理 MySQL 元数据。
 	if s.vectors != nil {
-		if err := s.vectors.DeleteDocument(c, id); err != nil {
+		if err := s.vectors.DeleteDocument(c.Request.Context(), id); err != nil {
 			fail(c, 503, "DEPENDENCY_UNAVAILABLE", "could not remove Qdrant points; document remains deleting and may be retried", nil)
 			return
 		}
@@ -522,6 +531,9 @@ func (s *Server) deleteDocument(c *gin.Context) {
 			}
 		}
 		if err := tx.Exec("DELETE FROM document_chunks WHERE document_id=?", id).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("document_id=?", id).Delete(&domain.DocumentIndex{}).Error; err != nil {
 			return err
 		}
 		return tx.Delete(&document).Error
@@ -584,8 +596,15 @@ func (s *Server) ragQuery(c *gin.Context) {
 	}
 	citations := make([]gin.H, 0, len(evidenceRows))
 	for rank, evidence := range evidenceRows {
+		evidenceURL := evidence.EvidenceURL
+		if evidenceURL == "" {
+			evidenceURL = "/api/v1/documents/" + strconv.FormatUint(evidence.DocumentID, 10) + "/indexes/" + strconv.FormatUint(evidence.IndexID, 10) + "/chunks/" + evidence.ChunkID
+		}
 		citations = append(citations, gin.H{
 			"source": evidence.Source, "document_id": evidence.DocumentID, "chunk_id": evidence.ChunkID,
+			"index_id": evidence.IndexID, "start_byte": evidence.StartByte, "end_byte": evidence.EndByte,
+			"heading_path": evidence.HeadingPath, "block_type": evidence.BlockType, "block_spans": evidence.BlockSpans, "image_refs": evidence.ImageRefs,
+			"evidence_url": evidenceURL, "image_ref_id": evidence.ImageRefID,
 			"title": evidence.Title, "start_line": evidence.StartLine, "end_line": evidence.EndLine,
 			"summary": truncate(evidence.Content, 160), "rank": rank + 1, "score": evidence.Score,
 		})
@@ -725,6 +744,11 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 		fail(c, 422, "VALIDATION_FAILED", "evaluation dataset must be valid JSONL", err.Error())
 		return
 	}
+	retriever, err := s.evaluationRetriever(c.Request.Context())
+	if err != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not load active evaluation scope", nil)
+		return
+	}
 	cases, err = evaluation.ResolveCitationText(c.Request.Context(), cases, s.resolveReadyChunkIDs)
 	if err != nil {
 		fail(c, 422, "VALIDATION_FAILED", "evaluation citation_text must identify exactly one ready chunk", err.Error())
@@ -733,6 +757,15 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 	cases, err = evaluation.ResolveEvidencePoints(c.Request.Context(), cases, s.loadEvidenceChunks)
 	if err != nil {
 		fail(c, 422, "VALIDATION_FAILED", "evidence spans must resolve against ready document chunks", err.Error())
+		return
+	}
+	unchanged, scopeErr := s.evaluationScopeUnchanged(c.Request.Context(), retriever)
+	if scopeErr != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not verify active evaluation scope", nil)
+		return
+	}
+	if !unchanged {
+		fail(c, 409, "INDEX_CHANGED", "active index changed during evaluation; retry with current evidence", nil)
 		return
 	}
 	if c.Query("resolve_only") == "true" {
@@ -745,15 +778,25 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 	}
 	// 评估模式来自运行配置，而不是具体 Go 实现类型，避免替换真实 Provider 后被误标为 fake。
 	real := s.aiMode == "real"
-	result, err := evaluation.Run(c.Request.Context(), cases, s.embedding, s.vectors, 5, real)
+	result, err := evaluation.Run(c.Request.Context(), cases, s.embedding, retriever, 5, real)
 	if err != nil {
 		fail(c, 503, "DEPENDENCY_UNAVAILABLE", "evaluation retrieval failed", err.Error())
+		return
+	}
+	unchanged, scopeErr = s.evaluationScopeUnchanged(c.Request.Context(), retriever)
+	if scopeErr != nil {
+		fail(c, 500, "INTERNAL_ERROR", "could not verify active evaluation scope", nil)
+		return
+	}
+	if !unchanged {
+		fail(c, 409, "INDEX_CHANGED", "active index changed during evaluation; retry with current evidence", nil)
 		return
 	}
 	resolvedBody, _ := json.Marshal(cases)
 	datasetSum := sha256.Sum256(resolvedBody)
 	// 报告要能独立说明自己出自哪份数据集、哪个模型和哪个集合；这些运行元数据只有 handler 知道，
 	// 所以在渲染前补进 Report，让落库的报告与 rag_evaluations 行保持同一套事实。
+	result.Indexes = retriever.(activeEvaluationRetriever).indexes
 	result.EmbeddingModel = s.embeddingModel
 	result.Collection = s.ragCollection
 	result.ResolvedHash = hex.EncodeToString(datasetSum[:])
@@ -761,7 +804,7 @@ func (s *Server) evaluateRAG(c *gin.Context) {
 	result.DatasetHash = hex.EncodeToString(inputSum[:])
 	metrics, _ := json.Marshal(result.Retrievers)
 	report := evaluation.Markdown(result)
-	configJSON, _ := json.Marshal(map[string]any{"dense_limit": 20, "sparse_limit": 20, "fusion": "rrf", "evaluation": "retrieval_only"})
+	configJSON, _ := json.Marshal(map[string]any{"dense_limit": 20, "sparse_limit": 20, "fusion": "rrf", "evaluation": "retrieval_only", "active_chunk_ids": retriever.(activeEvaluationRetriever).ids, "indexes": result.Indexes})
 	row := ragEvaluationRow{
 		Mode: result.Mode, DatasetVersion: result.DatasetHash,
 		EmbeddingModel: s.embeddingModel, CollectionName: s.ragCollection,
@@ -789,7 +832,7 @@ func (s *Server) resolveReadyChunkIDs(ctx context.Context, citationText string) 
 	if err := s.store.DB.WithContext(ctx).Table("document_chunks dc").
 		Select("dc.id").
 		Joins("JOIN documents d ON d.id=dc.document_id").
-		Where("d.status='ready' AND LOCATE(?, dc.content)>0", citationText).
+		Where("d.status<>'deleting' AND (d.active_index_id>0 OR d.index_version<>'' OR d.status='ready') AND dc.index_id=d.active_index_id AND LOCATE(?, dc.content)>0", citationText).
 		Order("dc.document_id,dc.chunk_index,dc.id").
 		Limit(2).
 		Find(&rows).Error; err != nil {
@@ -890,34 +933,41 @@ func (s *Server) weekly(c *gin.Context) {
 	})
 }
 
-// loadEvidenceChunks reads the authoritative ready document and persisted chunk text.
+// loadEvidenceChunks loads only the active index and verifies persisted positions.
+// Legacy index 0 is explicitly checked with the historical chunk-v1 contract.
 func (s *Server) loadEvidenceChunks(ctx context.Context, id uint64) (string, []evaluation.EvidenceChunk, error) {
 	if s == nil || s.store == nil || s.store.DB == nil {
 		return "", nil, errors.New("document chunk store is not configured")
 	}
 	var doc domain.Document
-	if err := s.store.DB.WithContext(ctx).Where("id=? AND status='ready'", id).First(&doc).Error; err != nil {
+	if err := s.store.DB.WithContext(ctx).Where("id=? AND status<>'deleting' AND (active_index_id>0 OR index_version<>'' OR status='ready')", id).First(&doc).Error; err != nil {
 		return "", nil, err
+	}
+	source := doc.Content
+	if doc.ActiveIndexID != 0 {
+		var version domain.DocumentIndex
+		if err := s.store.DB.WithContext(ctx).Where("id=? AND document_id=? AND status IN ('active','retired')", doc.ActiveIndexID, id).First(&version).Error; err != nil {
+			return "", nil, err
+		}
+		source = version.Content
+		if err := validateSourceHash(source, version.ContentHash); err != nil {
+			return "", nil, err
+		}
 	}
 	var rows []domain.DocumentChunk
-	if err := s.store.DB.WithContext(ctx).Where("document_id=?", id).Order("chunk_index,id").Find(&rows).Error; err != nil {
+	if err := s.store.DB.WithContext(ctx).Where("document_id=? AND index_id=?", id, doc.ActiveIndexID).Order("chunk_index,id").Find(&rows).Error; err != nil {
 		return "", nil, err
 	}
-	expected := rag.ChunkText(doc.Content, rag.DefaultChunkSize, rag.DefaultChunkOverlap)
-	runes := []rune(doc.Content)
-	byteOffsets := make([]int, len(runes)+1)
-	for j, r := range runes {
-		byteOffsets[j+1] = byteOffsets[j] + utf8.RuneLen(r)
+	if len(rows) == 0 {
+		return "", nil, errors.New("active index has no persisted chunks")
 	}
 	chunks := make([]evaluation.EvidenceChunk, len(rows))
 	for i, row := range rows {
-		chunks[i] = evaluation.EvidenceChunk{ID: row.ID, Content: row.Content, StartLine: row.StartLine, EndLine: row.EndLine}
-		if row.ChunkIndex < 0 || row.ChunkIndex >= len(expected) || expected[row.ChunkIndex].Content != row.Content || expected[row.ChunkIndex].StartLine != row.StartLine || expected[row.ChunkIndex].EndLine != row.EndLine {
-			return "", nil, errors.New("persisted chunks differ from current chunker; rebuild before evaluation")
+		start, _, err := evidenceChunkPosition(source, row)
+		if err != nil {
+			return "", nil, err
 		}
-		start := row.ChunkIndex * (rag.DefaultChunkSize - rag.DefaultChunkOverlap)
-		offset := byteOffsets[start]
-		chunks[i].StartByte = &offset
+		chunks[i] = evaluation.EvidenceChunk{ID: row.ID, Content: row.Content, StartLine: row.StartLine, EndLine: row.EndLine, StartByte: &start}
 	}
-	return doc.Content, chunks, nil
+	return source, chunks, nil
 }

@@ -1,4 +1,12 @@
-.git
-data
-docs
+# Send only build inputs; never send private configuration, articles or reports.
+**
+!Dockerfile
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
 **/*_test.go
+**/.env
+**/.env.*

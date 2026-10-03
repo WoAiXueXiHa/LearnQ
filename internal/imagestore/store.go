@@ -30,7 +30,7 @@ func (s *Store) Save(body []byte, extension string) (string, error) {
 	if len(body) == 0 || len(body) > MaxBytes {
 		return "", fmt.Errorf("image size must be between 1 byte and %d bytes", MaxBytes)
 	}
-	if extension != ".jpg" && extension != ".png" {
+	if extension != ".jpg" && extension != ".png" && extension != ".gif" && extension != ".webp" {
 		return "", errors.New("unsupported image extension")
 	}
 	// 目录按需创建；0o700 使图片目录仅属主可读写，避免同机其他用户窥探图片。

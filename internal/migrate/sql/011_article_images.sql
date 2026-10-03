@@ -1,0 +1,21 @@
+CREATE TABLE article_images (
+ id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+ document_id BIGINT UNSIGNED NOT NULL,
+ index_id BIGINT UNSIGNED NOT NULL,
+ start_byte INT NOT NULL,
+ end_byte INT NOT NULL,
+ start_line INT NOT NULL,
+ end_line INT NOT NULL,
+ original_url TEXT NOT NULL,
+ alt_text TEXT NOT NULL,
+ syntax_kind VARCHAR(32) NOT NULL,
+ status VARCHAR(32) NOT NULL,
+ image_id BIGINT UNSIGNED NULL,
+ last_error TEXT NOT NULL,
+ created_at DATETIME(6) NOT NULL,
+ updated_at DATETIME(6) NOT NULL,
+ UNIQUE KEY uq_article_image_position(index_id,start_byte,end_byte),
+ INDEX idx_article_image_document(document_id),
+ INDEX idx_article_image_snapshot(image_id),
+ CONSTRAINT fk_article_image_index FOREIGN KEY(index_id) REFERENCES document_indexes(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

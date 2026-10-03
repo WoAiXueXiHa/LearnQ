@@ -301,7 +301,7 @@ func TestReindexDocumentCreatesNewAuditableTask(t *testing.T) {
 	if nextTask.ID == firstTask.ID || nextTask.Status != domain.TaskPending {
 		t.Fatalf("next task=%#v first=%d", nextTask, firstTask.ID)
 	}
-	if updated.Status != "uploaded" || updated.IndexVersion != "" || updated.IndexingTaskID != nextTask.ID {
+	if updated.Status != "uploaded" || updated.IndexVersion != "old-version" || updated.IndexingTaskID != nextTask.ID {
 		t.Fatalf("updated document=%#v", updated)
 	}
 	var count int64

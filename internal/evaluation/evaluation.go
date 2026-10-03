@@ -83,6 +83,18 @@ type Report struct {
 	Collection     string            `json:"collection"`
 	DatasetHash    string            `json:"dataset_hash"`
 	ResolvedHash   string            `json:"resolved_hash"`
+	Indexes        []IndexMetadata   `json:"indexes,omitempty"`
+}
+
+// IndexMetadata records the actual immutable candidate scope, rather than
+// guessing the chunking strategy from the current process configuration.
+type IndexMetadata struct {
+	DocumentID    uint64 `json:"document_id"`
+	IndexID       uint64 `json:"index_id"`
+	ArticleSHA256 string `json:"article_sha256"`
+	IndexVersion  string `json:"index_version"`
+	ChunkVersion  string `json:"chunk_version"`
+	Dimension     int    `json:"dimension"`
 }
 
 // Retriever 抽象出三种检索路径，让同一数据集能对 dense / sparse / hybrid 横向对比。
@@ -379,7 +391,15 @@ func Markdown(report Report) string {
 	if report.ResolvedHash != "" {
 		fmt.Fprintf(&b, "解析后标注哈希：%s\n\n", report.ResolvedHash)
 	}
-	fmt.Fprintf(&b, "切块规则：fixed-rune，size=%d，overlap=%d；跨度覆盖按原文 UTF-8 字节区间校验。\n\n", rag.DefaultChunkSize, rag.DefaultChunkOverlap)
+	b.WriteString("跨度覆盖按持久化原文 UTF-8 字节区间校验，清洗后的检索文本不参与原文定位。\n\n")
+	if len(report.Indexes) == 0 {
+		b.WriteString("索引版本：未提供；不能由当前配置推断历史切块规则。\n\n")
+	} else {
+		b.WriteString("候选范围的文章与索引版本（包含本次检索可见的全部文档）：\n\n```json\n")
+		metadata, _ := json.MarshalIndent(report.Indexes, "", "  ")
+		b.Write(metadata)
+		b.WriteString("\n```\n\n")
+	}
 	b.WriteString("## 汇总（全部用例平均）\n\n")
 	b.WriteString("| retriever | Recall@K | NDCG | 检索覆盖率 | 无关候选 |\n|---|---:|---:|---:|---:|\n")
 	for _, name := range RetrieverNames {

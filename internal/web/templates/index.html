@@ -6,26 +6,62 @@
   <title>{{.Title}}</title>
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/material.css">
+  <link rel="stylesheet" href="/static/practice.css">
 </head>
 <body>
 <header class="topbar">
-  <div><h1>LearnQ</h1><p>把学习记录变成报告、复习与可检索知识</p></div>
+  <div><h1>LearnQ</h1><p>用五道题检验文章理解，回看证据并重练</p></div>
   <div class="runtime-status">
     <span id="modelMode" class="badge" title="模型模式会在健康检查或首次 AI 任务后确认">模型模式：检测中</span>
     <span id="health" class="badge">正在连接…</span>
   </div>
 </header>
-<nav class="tabs" role="tablist" aria-label="功能模块">
-  <button id="tab-records" class="active" role="tab" aria-selected="true" aria-controls="records" data-view="records">学习记录</button>
+<nav class="tabs" role="tablist" aria-label="主要入口">
+<button id="tab-practice" class="active" role="tab" aria-selected="true" aria-controls="practice" data-view="practice">文章练习</button>
+<button id="tab-diagnostics" role="tab" aria-selected="false" aria-controls="diagnostics" data-view="diagnostics">诊断与配置</button>
+</nav>
+
+<main>
+  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+	<section id="practice" role="tabpanel" aria-labelledby="tab-practice">
+		<div class="section-head"><div><h2>用五道题检验理解</h2><p>上传一篇 Markdown，确认题目，全部作答后查看有依据的反馈。</p></div><button type="button" id="practiceRefresh" class="secondary">刷新</button></div>
+		<form id="practiceUpload" class="card"><label>选择 Markdown 文章<input id="practiceFile" type="file" accept=".md,text/markdown" required></label><p>真实模式下，文章片段用于外部向量化，题目与反馈依据发送给文本模型，外链图片快照发送给视觉模型。请确认你有权使用这些资料。</p><button type="submit">上传文章</button></form>
+		<div id="practiceArticles" class="cards"></div>
+		<div id="practiceDeletion" class="stack"></div>
+		<p id="practiceMode" class="muted"></p><ol id="practiceSteps" class="practice-steps" aria-label="练习步骤"></ol>
+		<div id="practiceImages" class="stack"></div>
+		<div id="practiceSet" class="stack"></div>
+		<div id="practiceAttempt" class="stack"></div>
+		<details class="card"><summary>登记官方核查来源</summary><p>登记你确认的官方文档；版本与条件不明时，疑点保持待核查。</p><form id="authorityRegister"><label>技术主题<input name="topic" required maxlength="255"></label><label>官方文档地址<input name="url" type="url" required placeholder="https://..."></label><button type="submit">登记来源</button></form><div id="authoritySources" class="cards"></div></details>
+		<div id="authorityPanel" class="stack"></div>
+		<div class="section-head"><h3>题组与作答历史</h3></div><div id="practiceHistory" class="cards"></div>
+		<div class="section-head"><h3>复习与重练</h3></div><div id="practiceReviews" class="cards"></div>
+	</section>
+
+  <section id="diagnostics" role="tabpanel" aria-labelledby="tab-diagnostics" hidden>
+    <div class="section-head"><h2>模型调用与费用</h2><button type="button" id="diagnosticsRefresh">刷新</button></div>
+    <div id="modelBudget" class="card"></div>
+    <details class="card"><summary>登记模型价格与 token 限制</summary><p>根据供应商价格或账单填写，登记为新版本。这里不会修改密钥或开启真实模式。</p>
+    <form id="modelPriceForm" class="form-grid">
+      <label>模型名称<input name="model" required maxlength="128"></label>
+      <label>价格依据 / 版本<input name="version_label" required maxlength="255"></label>
+      <label>每百万输入 token（元）<input name="input_price" type="number" min="0" max="1000" step="0.000001" required></label>
+      <label>每百万输出 token（元）<input name="output_price" type="number" min="0" max="1000" step="0.000001" required></label>
+      <label>输入 token 上限<input name="max_input_tokens" type="number" min="1" max="2000000" step="1" required></label>
+      <label>输出 token 上限<input name="max_output_tokens" type="number" min="1" max="32768" step="1" required></label>
+      <button type="submit">保存价格版本</button>
+    </form></details>
+    <div id="modelPrices" class="cards"></div>
+    <h3>最近调用</h3><div id="modelCalls" class="stack"></div>
+<details class="card"><summary>更多诊断与兼容工具</summary><nav class="tabs" role="tablist" aria-label="诊断与兼容工具">
+  <button id="tab-records"  role="tab" aria-selected="false" aria-controls="records" data-view="records">学习记录</button>
   <button id="tab-task" role="tab" aria-selected="false" aria-controls="task" data-view="task">任务与报告</button>
   <button id="tab-reviews" role="tab" aria-selected="false" aria-controls="reviews" data-view="reviews">复习计划</button>
   <button id="tab-skills" role="tab" aria-selected="false" aria-controls="skills" data-view="skills">Agent 工作台</button>
   <button id="tab-knowledge" role="tab" aria-selected="false" aria-controls="knowledge" data-view="knowledge">学习素材与 RAG</button>
-</nav>
-<main>
-  <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
-
-  <section id="records" role="tabpanel" aria-labelledby="tab-records">
+</nav></details>
+  </section>
+  <section id="records" role="tabpanel" aria-labelledby="tab-records" hidden>
     <div class="section-head"><div><h2>记录今天学了什么</h2><p>提交后会自动生成报告和复习计划。</p></div></div>
     <form id="recordForm" class="card form-grid">
       <label>标题<input name="title" placeholder="例如：Go 并发学习" required></label>
@@ -111,5 +147,11 @@
   </section>
 </main>
 <script src="/static/app.js"></script>
+<script src="/static/evidence.js"></script>
+<script src="/static/practice.js"></script>
+<script src="/static/authority.js"></script>
+<script src="/static/deletion.js"></script>
+<script src="/static/diagnostics.js"></script>
+<script src="/static/image-correction.js"></script>
 </body>
 </html>

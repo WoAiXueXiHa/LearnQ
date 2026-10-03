@@ -11,9 +11,12 @@ import (
 	"time"
 
 	"github.com/WoAiXueXiHa/LearnQ/internal/agenttool"
+	"github.com/WoAiXueXiHa/LearnQ/internal/articleimage"
 	"github.com/WoAiXueXiHa/LearnQ/internal/bootstrap"
 	"github.com/WoAiXueXiHa/LearnQ/internal/config"
 	"github.com/WoAiXueXiHa/LearnQ/internal/dispatcher"
+	"github.com/WoAiXueXiHa/LearnQ/internal/documentcleanup"
+	"github.com/WoAiXueXiHa/LearnQ/internal/imageindex"
 	"github.com/WoAiXueXiHa/LearnQ/internal/imagestore"
 	"github.com/WoAiXueXiHa/LearnQ/internal/indexer"
 	appmetrics "github.com/WoAiXueXiHa/LearnQ/internal/metrics"
@@ -59,6 +62,15 @@ func main() {
 	// SIGINT/SIGTERM 经 NotifyContext 统一转为 ctx 取消，下方所有后台循环共用这一个信号源。
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	articleImagesDone := make(chan struct{})
+	go func() {
+		defer close(articleImagesDone)
+		visionName := cfg.AIVisionModel
+		if cfg.AIMode != "real" {
+			visionName = "learnq-fake-vision-v1"
+		}
+		(&articleimage.Processor{Store: s, Images: imagestore.New(cfg.ImageDir), MaxImages: cfg.ArticleMaxImages, DescriptionModel: visionName}).Run(ctx, logger)
+	}()
 	go func() {
 		// 心跳只表示“至少有一个 Worker 正常轮询”，供 API readiness 使用，
 		// TTL 大于刷新周期，短暂调度抖动不会立即把服务判为不可用。
@@ -110,9 +122,19 @@ func main() {
 			}
 		}
 	}()
-	chat, embedding := bootstrap.Models(cfg)
+	chat, embedding := bootstrap.MeteredModels(cfg, db)
 	// 该客户端同时用于集合校验与文档索引写入，超时固定 10 秒，与任务执行超时相互独立。
 	vectors := rag.Qdrant{BaseURL: cfg.QdrantURL, Collection: cfg.RAGCollection, Client: &http.Client{Timeout: 10 * time.Second}}
+	deletionsDone := make(chan struct{})
+	go func() {
+		defer close(deletionsDone)
+		(&documentcleanup.Processor{Store: s, Images: imagestore.New(cfg.ImageDir), Vectors: vectors}).Run(ctx, logger)
+	}()
+	imageIndexesDone := make(chan struct{})
+	go func() {
+		defer close(imageIndexesDone)
+		(&imageindex.Indexer{DB: db, Embedding: embedding, Vectors: vectors, Model: bootstrap.EmbeddingModelName(cfg), Dimension: cfg.EmbeddingDim}).Run(ctx, logger)
+	}()
 	registry := skill.New(chat)
 	evidence := &rag.EvidenceService{DB: db, Embedding: embedding, Vectors: vectors}
 	tools := agenttool.Service{DB: db, Evidence: evidence}
@@ -122,21 +144,23 @@ func main() {
 	// 分别支撑 image_describe、study_report、document_index 三类任务的执行。
 	pool := worker.New(s, q, chat, cfg.ReportDir, logger)
 	pool.WithTiming(cfg.TaskTimeout, cfg.LeaseDuration)
+	pool.WithModelCacheIdentity(cfg.AIMode + ":" + cfg.AIChatModel)
 	pool.WithMetrics(metricRecorder)
-	pool.WithVision(bootstrap.Vision(cfg), imagestore.New(cfg.ImageDir))
+	pool.WithVision(bootstrap.MeteredVision(cfg, db), imagestore.New(cfg.ImageDir))
 	pool.WithSkills(registry)
 	pool.WithIndexer(&indexer.Indexer{
 		Store: s, Embedding: embedding, Dimension: cfg.EmbeddingDim,
-		Vectors: vectors,
-		Version: fmt.Sprintf("collection=%s;embedding=%s;dim=%d;chunk=800;overlap=120",
-			cfg.RAGCollection, cfg.AIEmbeddingModel, cfg.EmbeddingDim),
+		Vectors:      vectors,
+		ChunkVersion: cfg.DocumentChunkVersion,
+		Version: fmt.Sprintf("collection=%s;embedding=%s;dim=%d;configured_chunk=%s",
+			cfg.RAGCollection, bootstrap.EmbeddingModelName(cfg), cfg.EmbeddingDim, cfg.DocumentChunkVersion),
 	})
 	pool.Run(ctx)
 	// Run 启动固定数量 goroutine 的领取循环后返回，主 goroutine 在此等待取消信号。
 	<-ctx.Done()
 	// 取消信号先阻止领取新任务；已领取任务在宽限期内完成持久化，超时任务之后由 Reaper 接管。
 	wait := make(chan struct{})
-	go func() { pool.Wait(); close(wait) }()
+	go func() { pool.Wait(); <-articleImagesDone; <-imageIndexesDone; <-deletionsDone; close(wait) }()
 	// 宽限期到点仍有人未完成则直接退出：遗留任务的租约会过期，下次启动的 Reaper 会回收重试，
 	// MySQL 保存全部状态，强杀进程不会丢失任务。
 	select {

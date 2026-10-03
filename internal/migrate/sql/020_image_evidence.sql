@@ -1,0 +1,20 @@
+CREATE TABLE image_evidence (
+ id CHAR(64) PRIMARY KEY,
+ article_image_id BIGINT UNSIGNED NOT NULL,
+ document_id BIGINT UNSIGNED NOT NULL,
+ index_id BIGINT UNSIGNED NOT NULL,
+ image_id BIGINT UNSIGNED NOT NULL,
+ content LONGTEXT NOT NULL,
+ content_hash CHAR(64) NOT NULL,
+ image_hash CHAR(64) NOT NULL,
+ description_model VARCHAR(128) NOT NULL,
+ embedding_model VARCHAR(128) NOT NULL,
+ dimension INT NOT NULL,
+ status VARCHAR(24) NOT NULL,
+ last_error TEXT NOT NULL,
+ created_at DATETIME(6) NOT NULL,
+ updated_at DATETIME(6) NOT NULL,
+ UNIQUE KEY uq_image_evidence_occurrence(article_image_id),
+ CONSTRAINT fk_image_evidence_ref FOREIGN KEY(article_image_id) REFERENCES article_images(id) ON DELETE CASCADE,
+ INDEX(document_id,index_id,status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

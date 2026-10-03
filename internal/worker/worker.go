@@ -25,6 +25,7 @@ import (
 )
 
 type Pool struct {
+	modelCacheIdentity string
 	// concurrency 控制本进程并行度；timeout 限制业务执行，lease 略长于 timeout，
 	// 给成功/失败结果留出持久化窗口。
 	store       *store.Store
@@ -156,6 +157,15 @@ func (p *Pool) claimAndRun(parent context.Context) {
 	ctx, cancel := context.WithTimeout(parent, p.timeout)
 	defer cancel()
 	switch task.Kind {
+	case "question_generate":
+		p.processQuestions(ctx, task, token, started)
+		return
+	case "practice_feedback":
+		p.processFeedback(ctx, task, token, started)
+		return
+	case "authority_check":
+		p.processAuthority(ctx, task, token, started)
+		return
 	case "document_index":
 		// 索引任务与报告任务共用可靠性外壳，但业务完成动作不同：
 		// 索引成功必须同时把 Document 推进到 ready。
@@ -255,9 +265,14 @@ func (p *Pool) processImage(ctx context.Context, task domain.AITask, token strin
 		p.failAndAck(task, token, model.Permanent(fmt.Errorf("read image: %w", err)))
 		return
 	}
+	body, mediaType, err := imagestore.VisionInput(body, imageRow.MediaType)
+	if err != nil {
+		p.failAndAck(task, token, model.Permanent(err))
+		return
+	}
 	modelStarted := time.Now()
 	response, err := p.vision.Describe(ctx, model.VisionRequest{
-		Image: body, MediaType: imageRow.MediaType, Prompt: imageRow.Prompt,
+		Image: body, MediaType: mediaType, Prompt: imageRow.Prompt,
 	})
 	p.recordModel("vision", response.InputTokens, response.OutputTokens, time.Since(modelStarted), err)
 	if err != nil {
@@ -290,6 +305,8 @@ func (p *Pool) failAndAck(task domain.AITask, token string, cause error) {
 	terminal := !retryable(cause)
 	var failErr error
 	switch task.Kind {
+	case "question_generate":
+		failErr = p.store.FailQuestionGeneration(ctx, task, token, cause, terminal)
 	case "document_index":
 		_, _, failErr = p.store.FailDocument(ctx, task, token, cause, terminal)
 	case "image_describe":

@@ -185,7 +185,7 @@ func (s *Server) getImage(c *gin.Context) {
 		return
 	}
 	var imageRow domain.Image
-	if lookupFailed(c, s.store.DB.First(&imageRow, id).Error, "could not load image") {
+	if lookupFailed(c, s.store.DB.WithContext(c.Request.Context()).First(&imageRow, id).Error, "could not load image") {
 		return
 	}
 	ok(c, 200, imageView(imageRow))
@@ -203,7 +203,7 @@ func (s *Server) imageContent(c *gin.Context) {
 		return
 	}
 	var imageRow domain.Image
-	if lookupFailed(c, s.store.DB.First(&imageRow, id).Error, "could not load image") {
+	if lookupFailed(c, s.store.DB.WithContext(c.Request.Context()).First(&imageRow, id).Error, "could not load image") {
 		return
 	}
 	// deleting 是删除流程的中间态：文件可能已删或未删，此时对外一律视为不存在。
@@ -211,27 +211,25 @@ func (s *Server) imageContent(c *gin.Context) {
 		notFound(c)
 		return
 	}
-	file, err := s.imageStore.Open(imageRow.StoragePath)
+	body, err := s.imageStore.Read(imageRow.StoragePath)
 	if err != nil {
-		// 磁盘文件丢失按 404 处理：元数据仍在但内容已不可得，对外语义与不存在一致。
 		if errors.Is(err, os.ErrNotExist) {
 			notFound(c)
 			return
 		}
-		fail(c, 500, "INTERNAL_ERROR", "stored image could not be opened", nil)
+		fail(c, 410, "EVIDENCE_INVALID", "stored image could not be read within snapshot limits", nil)
 		return
 	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		fail(c, 500, "INTERNAL_ERROR", "stored image could not be inspected", nil)
+	hash := sha256.Sum256(body)
+	if hex.EncodeToString(hash[:]) != imageRow.ContentHash {
+		fail(c, 410, "EVIDENCE_INVALID", "stored image snapshot hash mismatch", nil)
 		return
 	}
 	// nosniff 禁止浏览器对响应做 MIME 嗅探：即使文件内容被改写成 HTML，也不会被当页面执行（防 XSS）。
 	c.Header("X-Content-Type-Options", "nosniff")
 	// inline 让浏览器直接展示图片而非强制下载。
 	c.Header("Content-Disposition", "inline")
-	c.DataFromReader(200, info.Size(), imageRow.MediaType, file, nil)
+	c.Data(200, imageRow.MediaType, body)
 }
 
 // deleteImage 执行两阶段删除：先经 PrepareImageDelete 把图片置为 deleting（同时终止关联任务、
@@ -263,7 +261,7 @@ func (s *Server) deleteImage(c *gin.Context) {
 			return
 		}
 		// 向量删除失败不回滚 deleting 状态：图片保持"删除中"，重试时向量删除幂等。
-		if err := s.vectors.DeleteDocument(c, *imageRow.DerivedDocumentID); err != nil {
+		if err := s.vectors.DeleteDocument(c.Request.Context(), *imageRow.DerivedDocumentID); err != nil {
 			fail(c, 503, "DEPENDENCY_UNAVAILABLE",
 				"could not remove derived Qdrant points; image remains deleting and may be retried", nil)
 			return
@@ -311,7 +309,7 @@ func (s *Server) addImageToKnowledgeBase(c *gin.Context) {
 		return
 	}
 	var imageRow domain.Image
-	if lookupFailed(c, s.store.DB.First(&imageRow, id).Error, "could not load image") {
+	if lookupFailed(c, s.store.DB.WithContext(c.Request.Context()).First(&imageRow, id).Error, "could not load image") {
 		return
 	}
 	// 双重前置条件：图片必须已完成描述（ready），且 description_json 能成功解析——

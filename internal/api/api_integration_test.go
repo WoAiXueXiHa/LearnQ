@@ -173,6 +173,21 @@ func TestImageUploadListContentAndDelete(t *testing.T) {
 	if content.Code != http.StatusOK || content.Header().Get("Content-Type") != "image/png" {
 		t.Fatalf("content=%d type=%s", content.Code, content.Header().Get("Content-Type"))
 	}
+	var stored domain.Image
+	if err := f.store.DB.First(&stored, envelope.Data.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	originalHash := stored.ContentHash
+	if err := f.store.DB.Model(&stored).Update("content_hash", strings.Repeat("0", 64)).Error; err != nil {
+		t.Fatal(err)
+	}
+	invalid := request(t, f, http.MethodGet, "/api/v1/images/"+id+"/content", "", nil)
+	if invalid.Code != http.StatusGone {
+		t.Fatalf("tampered image returned %d", invalid.Code)
+	}
+	if err := f.store.DB.Model(&stored).Update("content_hash", originalHash).Error; err != nil {
+		t.Fatal(err)
+	}
 	deleted := request(t, f, http.MethodDelete, "/api/v1/images/"+id, "", nil)
 	if deleted.Code != http.StatusOK {
 		t.Fatalf("delete=%d %s", deleted.Code, deleted.Body)

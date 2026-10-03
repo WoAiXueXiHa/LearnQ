@@ -3,6 +3,8 @@ x-app-environment: &app-environment
   REDIS_ADDR: redis:6379
   QDRANT_URL: http://qdrant:6333
   AI_MODE: ${AI_MODE:-fake}
+  AI_DAILY_BUDGET_MICROCNY: ${AI_DAILY_BUDGET_MICROCNY:-0}
+  AI_CALL_RESERVE_MICROCNY: ${AI_CALL_RESERVE_MICROCNY:-0}
   AI_CHAT_BASE_URL: ${AI_CHAT_BASE_URL:-https://api.deepseek.com}
   AI_CHAT_API_KEY: ${AI_CHAT_API_KEY:-}
   AI_CHAT_MODEL: ${AI_CHAT_MODEL:-deepseek-flash}
@@ -12,6 +14,7 @@ x-app-environment: &app-environment
   AI_EMBEDDING_API_KEY: ${AI_EMBEDDING_API_KEY:-}
   AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-@cf/qwen/qwen3-embedding-0.6b}
   EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+  DOCUMENT_CHUNK_VERSION: ${DOCUMENT_CHUNK_VERSION:-markdown-block-800-v1}
   AI_VISION_PROVIDER: ${AI_VISION_PROVIDER:-openai}
   AI_VISION_BASE_URL: ${AI_VISION_BASE_URL:-https://api.deepseek.com}
   AI_VISION_API_KEY: ${AI_VISION_API_KEY:-}
@@ -22,9 +25,12 @@ x-app-environment: &app-environment
   HTTP_ADDR: 0.0.0.0:8080
   REPORT_DIR: /app/data/reports
   IMAGE_DIR: /app/data/images
+  ARTICLE_MAX_IMAGES: ${ARTICLE_MAX_IMAGES:-32}
+  AUTHORITY_SNAPSHOT_TTL: ${AUTHORITY_SNAPSHOT_TTL:-720h}
 
 services:
   mysql:
+    restart: unless-stopped
     image: mysql:8.4.10
     environment:
       MYSQL_DATABASE: learnq
@@ -40,6 +46,7 @@ services:
       retries: 30
     volumes: [mysql-data:/var/lib/mysql]
   redis:
+    restart: unless-stopped
     image: redis:7.2.14-alpine
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -47,6 +54,7 @@ services:
       timeout: 3s
       retries: 30
   qdrant:
+    restart: unless-stopped
     image: qdrant/qdrant:v1.18.2
     healthcheck:
       # The official image has bash but intentionally ships without wget/curl.
@@ -62,6 +70,7 @@ services:
     depends_on:
       mysql: {condition: service_healthy}
   api:
+    restart: unless-stopped
     build: {context: ., args: {TARGET: api}}
     environment: *app-environment
     extra_hosts: ["host.docker.internal:host-gateway"]
@@ -72,6 +81,7 @@ services:
       redis: {condition: service_healthy}
       qdrant: {condition: service_healthy}
   worker:
+    restart: unless-stopped
     build: {context: ., args: {TARGET: worker}}
     environment: *app-environment
     extra_hosts: ["host.docker.internal:host-gateway"]

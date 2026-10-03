@@ -9,7 +9,7 @@ curl() {
     --max-time "${CURL_MAX_TIME:-20}" "$@"
 }
 
-COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-learnq_acceptance_$$}"
+COMPOSE_PROJECT_NAME="learnq_acceptance_$(date +%s)_$$"
 LEARNQ_HTTP_PORT="${LEARNQ_HTTP_PORT:-18080}"
 AI_MODE=fake
 BASE_URL="http://127.0.0.1:${LEARNQ_HTTP_PORT}"
@@ -153,6 +153,29 @@ done
 rag=$(curl -fsS -X POST "$BASE_URL/api/v1/rag/query" \
   -H 'Content-Type: application/json' -d '{"question":"LearnQ 如何启动 Compose？","top_k":5}')
 printf '%s' "$rag" | jq -e '.data.answer | contains("[S1]")' >/dev/null
+printf '%s' "$rag" | jq -e '.data.citations[0] | (.index_id > 0) and (.block_type | length > 0) and (.block_spans | length > 0) and (.heading_path | type == "array") and ((.image_refs // []) | type == "array")' >/dev/null
+evidence_url=$(printf '%s' "$rag" | jq -r '.data.citations[0].evidence_url')
+old_evidence=$(curl -fsS "$BASE_URL$evidence_url")
+printf '%s' "$old_evidence" | jq -e '.data.active == true and (.data.chunk.block_spans_json | fromjson | length > 0)' >/dev/null
+citation_document=$(printf '%s' "$rag" | jq -r '.data.citations[0].document_id')
+history_rebuild=$(curl -fsS -X POST "$BASE_URL/api/v1/documents/$citation_document/reindex")
+history_task=$(printf '%s' "$history_rebuild" | jq -r '.data.indexing_task_id')
+attempt=0
+while :; do
+  history_status=$(curl -fsS "$BASE_URL/api/v1/tasks/$history_task" | jq -r '.data.status')
+  [ "$history_status" = succeeded ] && break
+  [ "$history_status" != dead ] || exit 1
+  attempt=$((attempt+1))
+  [ "$attempt" -lt 60 ] || exit 1
+  sleep 1
+done
+saved_evidence=$(curl -fsS "$BASE_URL$evidence_url")
+printf '%s' "$saved_evidence" | jq -e '.data.active == false' >/dev/null
+test "$(printf '%s' "$old_evidence" | jq -r '.data.article_sha256')" = "$(printf '%s' "$saved_evidence" | jq -r '.data.article_sha256')"
+test "$(printf '%s' "$old_evidence" | jq -r '.data.chunk.content_hash')" = "$(printf '%s' "$saved_evidence" | jq -r '.data.chunk.content_hash')"
+# Refresh candidate identities after the rebuild; the saved historical URL remains valid.
+rag=$(curl -fsS -X POST "$BASE_URL/api/v1/rag/query" \
+  -H 'Content-Type: application/json' -d '{"question":"LearnQ 如何启动 Compose？","top_k":5}')
 metrics=$(curl -fsS "$BASE_URL/metrics")
 printf '%s' "$metrics" | grep -q '^learnq_outbox_unpublished '
 printf '%s' "$metrics" | grep -q '^learnq_queue_ready '
@@ -163,7 +186,7 @@ chunk_id=$(printf '%s' "$rag" | jq -r '.data.citations[0].chunk_id')
 printf '{"id":"acceptance-rag","question":"LearnQ 如何启动 Compose？","relevant_chunks":[{"chunk_id":"%s","relevance":3}],"correct_answer":"使用 docker compose 启动","tags":["compose"],"difficulty":"easy"}\n' "$chunk_id" |
   curl -fsS -X POST "$BASE_URL/api/v1/evaluations/rag" \
     -H 'Content-Type: application/jsonl' --data-binary @- |
-  jq -e '.data.status == "succeeded"' >/dev/null
+  jq -e '.data.status == "succeeded" and (.data.config_json | fromjson | .indexes | length > 0) and (.data.config_json | fromjson | .indexes | all(.[]; .document_id > 0 and .index_id > 0 and .dimension == 1024 and .chunk_version == "markdown-block-800-v1" and (.article_sha256 | length == 64)))' >/dev/null
 
 curl -fsS -X DELETE "$BASE_URL/api/v1/images/$image_id" |
   jq -e --argjson image "$image_id" '.data.deleted == $image' >/dev/null

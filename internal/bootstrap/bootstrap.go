@@ -5,6 +5,7 @@ import (
 
 	"github.com/WoAiXueXiHa/LearnQ/internal/config"
 	"github.com/WoAiXueXiHa/LearnQ/internal/model"
+	"github.com/WoAiXueXiHa/LearnQ/internal/modelcall"
 	"github.com/go-redis/redis/v8"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -45,6 +46,15 @@ func Models(cfg config.Config) (model.ChatModel, model.EmbeddingModel) {
 	return fake, fake
 }
 
+// EmbeddingModelName matches the provider selected by Models, rather than the
+// real-provider configuration that can remain set while running in fake mode.
+func EmbeddingModelName(cfg config.Config) string {
+	if cfg.AIMode == "real" {
+		return cfg.AIEmbeddingModel
+	}
+	return "learnq-fake-embedding-v1"
+}
+
 // Vision 按 provider 返回视觉模型实现：ollama 走原生 /api/chat 接口并携带上下文长度，
 // openai 走 OpenAI 兼容接口。fake 模式返回 Fake 占位实现：不做真实识别，但保留相同的
 // 格式校验与描述契约，使上传→任务→Fencing 持久化链路无模型也能跑通。
@@ -66,4 +76,22 @@ func Vision(cfg config.Config) model.VisionModel {
 		}
 	}
 	return &model.Fake{Dimension: cfg.EmbeddingDim}
+}
+
+func MeteredModels(cfg config.Config, db *gorm.DB) (model.ChatModel, model.EmbeddingModel) {
+	chat, embedding := Models(cfg)
+	meter := &modelcall.Meter{DB: db, Mode: cfg.AIMode, DailyMicroCNY: int64(cfg.AIDailyBudgetMicroCNY), CallMicroCNY: int64(cfg.AICallReserveMicroCNY)}
+	chatName := cfg.AIChatModel
+	if cfg.AIMode != "real" {
+		chatName = "learnq-fake-text"
+	}
+	return modelcall.Chat{Meter: meter, Inner: chat, Name: chatName}, modelcall.Embedding{Meter: meter, Inner: embedding, Name: EmbeddingModelName(cfg)}
+}
+
+func MeteredVision(cfg config.Config, db *gorm.DB) model.VisionModel {
+	name := cfg.AIVisionModel
+	if cfg.AIMode != "real" {
+		name = "learnq-fake-vision-v1"
+	}
+	return modelcall.Vision{Meter: &modelcall.Meter{DB: db, Mode: cfg.AIMode, DailyMicroCNY: int64(cfg.AIDailyBudgetMicroCNY), CallMicroCNY: int64(cfg.AICallReserveMicroCNY)}, Inner: Vision(cfg), Name: name}
 }

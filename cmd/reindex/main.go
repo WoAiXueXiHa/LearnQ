@@ -20,7 +20,7 @@ func main() {
 	documentID := flag.Uint64("document-id", 0, "enqueue one document for reindex")
 	all := flag.Bool("all", false, "process all eligible documents")
 	limit := flag.Int("limit", 1000, "maximum documents selected by --all")
-	shadowCollection := flag.String("shadow-collection", "", "rebuild ready documents into this new collection")
+	shadowCollection := flag.String("shadow-collection", "", "legacy embedding-only shadow build; requires maintenance window with API/worker writes stopped")
 	alias := flag.String("alias", "", "atomically switch this alias after a successful shadow rebuild")
 	flag.Parse()
 	if (*documentID == 0) == !*all || *limit <= 0 {
@@ -80,6 +80,13 @@ func shadowRebuild(ctx context.Context, cfg config.Config, s *store.Store, colle
 	if collection == alias {
 		log.Fatal("shadow collection must differ from alias")
 	}
+	var readyCount int64
+	if err := s.DB.WithContext(ctx).Model(&domain.Document{}).Where("status='ready'").Count(&readyCount).Error; err != nil {
+		log.Fatal(err)
+	}
+	if readyCount > int64(limit) {
+		log.Fatal("shadow rebuild limit excludes ready documents; alias was not changed")
+	}
 	var documents []domain.Document
 	if err := s.DB.WithContext(ctx).Where("status='ready'").Order("id").Limit(limit).Find(&documents).Error; err != nil {
 		log.Fatal(err)
@@ -87,15 +94,20 @@ func shadowRebuild(ctx context.Context, cfg config.Config, s *store.Store, colle
 	if len(documents) == 0 {
 		log.Fatal("no ready documents selected; alias was not changed")
 	}
-	_, embedding := bootstrap.Models(cfg)
+	_, embedding := bootstrap.MeteredModels(cfg, s.DB)
 	vectors := rag.Qdrant{
 		BaseURL: cfg.QdrantURL, Collection: collection,
 		Client: &http.Client{Timeout: 30 * time.Second},
 	}
-	version := fmt.Sprintf("collection=%s;embedding=%s;dim=%d;chunk=persisted", collection, cfg.AIEmbeddingModel, cfg.EmbeddingDim)
+	version := fmt.Sprintf("collection=%s;embedding=%s;dim=%d;chunk=persisted", collection, bootstrap.EmbeddingModelName(cfg), cfg.EmbeddingDim)
 	builder := &indexer.Indexer{
 		Store: s, Embedding: embedding, Vectors: vectors,
 		Dimension: cfg.EmbeddingDim, Version: version,
+	}
+	for _, document := range documents {
+		if document.ActiveIndexID > 0 {
+			log.Fatal("shadow alias migration of versioned documents requires a separate embedding-version contract; use ordinary --document-id/--all reindex")
+		}
 	}
 	for index, document := range documents {
 		if err := builder.ShadowDocument(ctx, document.ID); err != nil {
@@ -103,17 +115,22 @@ func shadowRebuild(ctx context.Context, cfg config.Config, s *store.Store, colle
 		}
 		fmt.Printf("rebuilt document=%d target=%s\n", document.ID, collection)
 	}
+	var current []domain.Document
+	if err := s.DB.WithContext(ctx).Where("status='ready'").Order("id").Find(&current).Error; err != nil {
+		log.Fatal(err)
+	}
+	if len(current) != len(documents) {
+		log.Fatal("ready document set changed during shadow build; alias was not changed")
+	}
+	for index, document := range documents {
+		if current[index].ID != document.ID || current[index].IndexingTaskID != document.IndexingTaskID || current[index].ActiveIndexID != document.ActiveIndexID {
+			log.Fatal("document index changed during shadow build; alias was not changed")
+		}
+	}
 	if err := vectors.SwitchAlias(ctx, alias); err != nil {
 		log.Fatalf("shadow collection is complete but alias switch failed: %v", err)
 	}
-	ids := make([]uint64, len(documents))
-	for index := range documents {
-		ids[index] = documents[index].ID
-	}
-	if err := s.DB.WithContext(ctx).Model(&domain.Document{}).
-		Where("id IN ? AND status='ready'", ids).
-		Updates(map[string]any{"index_version": version, "updated_at": time.Now().UTC()}).Error; err != nil {
-		log.Fatalf("alias switched but index version metadata update failed: %v", err)
-	}
+	// Shadow re-embedding does not change the source/chunker version contract.
+	// The active MySQL version remains immutable; collection provenance is reported here.
 	fmt.Printf("summary rebuilt=%d alias=%s target=%s\n", len(documents), alias, collection)
 }

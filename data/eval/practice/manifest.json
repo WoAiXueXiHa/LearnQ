@@ -1,0 +1,24 @@
+{
+  "dataset_id": "practice-synthetic-v1",
+  "status": "inputs_frozen_not_executed",
+  "files": [
+    {
+      "path": "articles/receipt.md",
+      "sha256": "cb4784e200bb559dc1e400c027be97a9dd5a9c94057e7eb72400cb8d78d69e3a"
+    },
+    {
+      "path": "articles/cache.md",
+      "sha256": "31d8d2e733ea397d3da5bb04ccb34f7c365ff01834476593825b38951ef16cae"
+    },
+    {
+      "path": "cases.jsonl",
+      "sha256": "7e625393b1bd473e7b782796c785d5d7aa2a2f49923943966e834852ed324af7"
+    }
+  ],
+  "remaining_fixtures": [
+    "article_with_image_only_knowledge_and_owned_diagram",
+    "manual_image_nodes_arrows_labels",
+    "registered_official_snapshot_with_version",
+    "private_redis_article_existing_frozen_manifest"
+  ]
+}

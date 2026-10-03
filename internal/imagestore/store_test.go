@@ -29,8 +29,8 @@ func TestSaveReadDeleteAndRejectTraversal(t *testing.T) {
 
 func TestSaveRejectsUnsupportedOrOversizedImage(t *testing.T) {
 	store := New(t.TempDir())
-	if _, err := store.Save([]byte("x"), ".gif"); err == nil {
-		t.Fatal("gif was accepted")
+	if _, err := store.Save([]byte("x"), ".svg"); err == nil {
+		t.Fatal("unsupported svg was accepted")
 	}
 	if _, err := store.Save(make([]byte, MaxBytes+1), ".png"); err == nil {
 		t.Fatal("oversized image was accepted")

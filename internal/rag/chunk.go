@@ -12,19 +12,27 @@ import (
 // 哈希上叠加文档 ID 与块序号派生（见 internal/indexer），并非直接用此哈希。
 // Index 是块在文档内的序号，StartLine/EndLine 指向原文行号，供引用定位。
 type Chunk struct {
-	ID        string `json:"id"`
-	Index     int    `json:"index"`
-	Title     string `json:"title"`
-	StartLine int    `json:"start_line"`
-	EndLine   int    `json:"end_line"`
-	Content   string `json:"content"`
-	Hash      string `json:"hash"`
+	BlockSpans       []BlockSpan      `json:"block_spans"`
+	HeadingPath      []string         `json:"heading_path"`
+	BlockType        string           `json:"block_type"`
+	EmbeddingContent string           `json:"embedding_content"`
+	ImageRefs        []ImageReference `json:"image_refs"`
+	ID               string           `json:"id"`
+	Index            int              `json:"index"`
+	Title            string           `json:"title"`
+	StartLine        int              `json:"start_line"`
+	EndLine          int              `json:"end_line"`
+	StartByte        int              `json:"start_byte"`
+	EndByte          int              `json:"end_byte"`
+	Content          string           `json:"content"`
+	Hash             string           `json:"hash"`
 }
 
 // runeAt 记录单个 rune 及其所在行号，切块时随文本一起搬运，用于计算块的行区间。
 type runeAt struct {
-	value rune
-	line  int
+	value      rune
+	line       int
+	byteOffset int
 }
 
 // 默认切块参数。索引与离线校验必须用同一组值，否则报告里的行区间对不上线上索引，
@@ -52,8 +60,8 @@ func ChunkText(text string, size, overlap int) []Chunk {
 	var runes []runeAt
 	line := 1
 	title := ""
-	for _, r := range text {
-		runes = append(runes, runeAt{r, line})
+	for offset, r := range text {
+		runes = append(runes, runeAt{r, line, offset})
 		if r == '\n' {
 			line++
 		}
@@ -77,7 +85,7 @@ func ChunkText(text string, size, overlap int) []Chunk {
 		// Qdrant 去重依靠索引层叠加文档 ID 与块序号派生的稳定 ID，而非此哈希本身。
 		sum := sha256.Sum256([]byte(content))
 		hash := hex.EncodeToString(sum[:])
-		out = append(out, Chunk{ID: hash, Index: len(out), Title: title, StartLine: runes[start].line, EndLine: runes[end-1].line, Content: content, Hash: hash})
+		out = append(out, Chunk{ID: hash, Index: len(out), Title: title, StartLine: runes[start].line, EndLine: runes[end-1].line, Content: content, Hash: hash, StartByte: runes[start].byteOffset, EndByte: runes[start].byteOffset + len(content)})
 		// 块已覆盖到文末时收尾：后面不再有未切文本，直接结束循环。
 		if end == len(runes) {
 			break

@@ -16,10 +16,11 @@ import (
 // ChatRequest 是供应商无关的生成请求：Prompt 为系统提示词，Input 为用户输入，
 // ResponseSchema 约束输出 JSON 结构。
 type ChatRequest struct {
-	Prompt         string
-	Skill          string
-	Input          json.RawMessage
-	ResponseSchema json.RawMessage
+	MaxOutputTokens int
+	Prompt          string
+	Skill           string
+	Input           json.RawMessage
+	ResponseSchema  json.RawMessage
 }
 type ChatResponse struct {
 	Content      string
@@ -60,6 +61,54 @@ func (f Fake) Generate(ctx context.Context, req ChatRequest) (ChatResponse, erro
 		return ChatResponse{}, errors.New("temporary model error")
 	case "invalid_json":
 		return ChatResponse{Content: "{"}, nil
+	}
+	if req.Skill == "authority-check" {
+		return ChatResponse{Content: `{"judgment":"uncertain","explanation":"Fake 模式不核查事实，仅验证双来源管线。"}`, Model: "learnq-fake-authority-v1"}, nil
+	}
+	if req.Skill == "practice-feedback" {
+		body, _ := json.Marshal(map[string]any{"items": []map[string]any{{"type": "expression", "judgment_status": "unable_to_judge", "explanation": "Fake 模式只验证反馈流程，不判断作答正确性。", "chunk_ids": []string{}, "image_ref_ids": []uint64{}}}})
+		return ChatResponse{Content: string(body), Model: "learnq-fake-feedback-v1", InputTokens: len(req.Input) / 4, OutputTokens: len(body) / 4}, nil
+	}
+	if req.Skill == "practice-questions" {
+		var input struct {
+			Chunks []struct {
+				ID      string `json:"id"`
+				Content string `json:"content"`
+			} `json:"chunks"`
+			Images []struct {
+				ID uint64 `json:"image_ref_id"`
+			} `json:"images"`
+		}
+		if err := json.Unmarshal(req.Input, &input); err != nil {
+			return ChatResponse{}, err
+		}
+		if len(input.Chunks) == 0 {
+			return ChatResponse{}, errors.New("no article evidence")
+		}
+		questions := []map[string]any{}
+		for j, prompt := range []string{"文章的核心问题是什么？", "核心机制如何按步骤运行？", "关键方案有哪些取舍？", "失败情形和边界如何处理？", "如何串联全文解释这个知识点？"} {
+			chunk := input.Chunks[j%len(input.Chunks)]
+			ids := []string{chunk.ID}
+			for k, c := range input.Chunks {
+				if k%5 == j && c.ID != chunk.ID {
+					ids = append(ids, c.ID)
+				}
+			}
+			imageIDs := []uint64{}
+			for k, image := range input.Images {
+				if k%5 == j {
+					imageIDs = append(imageIDs, image.ID)
+				}
+			}
+			points := []string{"演示要点：说明本题涉及的概念与步骤；请按文章人工核对。", "演示要点：补充适用条件和失败边界；此内容不是文章分析结果。"}
+			items := []map[string]any{}
+			for _, point := range points {
+				items = append(items, map[string]any{"text": point, "chunk_ids": ids, "image_ref_ids": imageIDs})
+			}
+			questions = append(questions, map[string]any{"prompt": prompt, "knowledge_points": []string{"Fake 流程占位，需人工检查"}, "reference_points": points, "reference_items": items, "chunk_ids": ids, "image_ref_ids": imageIDs})
+		}
+		body, _ := json.Marshal(map[string]any{"questions": questions})
+		return ChatResponse{Content: string(body), Model: "learnq-fake-questions-v2", InputTokens: len(req.Input) / 4, OutputTokens: len(body) / 4}, nil
 	}
 	if req.Skill == "agent-planner" {
 		var input struct {

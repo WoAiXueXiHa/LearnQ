@@ -274,6 +274,21 @@ func (s *Store) fail(ctx context.Context, task domain.AITask, token string, caus
 	}
 	err := s.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		now := time.Now().UTC()
+		// Match completion's lock order: attempt, task, feedback. Updating a
+		// failed feedback first would deadlock against a successful sibling
+		// holding the attempt while reading the current five feedback rows.
+		if task.Kind == "practice_feedback" {
+			var rows []domain.AnswerFeedback
+			if err := tx.Select("practice_attempt_id").Where("task_id=?", task.ID).Limit(1).Find(&rows).Error; err != nil {
+				return err
+			}
+			if len(rows) > 0 {
+				var attempt domain.PracticeAttempt
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&attempt, rows[0].PracticeAttemptID).Error; err != nil {
+					return err
+				}
+			}
+		}
 		// 常规失败要求租约仍有效，Reaper 则要求租约已过期；两条路径共用一条 SQL 模板。
 		leasePredicate := "lease_until>?"
 		if requireExpired {
@@ -299,11 +314,43 @@ func (s *Store) fail(ctx context.Context, task domain.AITask, token string, caus
 				documentStatus = "uploaded"
 				errorMessage = ""
 			}
-			// 已 ready 或正在删除的文档不回退，防止把成功状态打成失败。
+			// 重建失败保留活动版本；初次构建失败进入失败态。删除中的文档不回退。
 			if err := tx.Model(&domain.Document{}).
 				Where("id=? AND indexing_task_id=? AND status NOT IN ('ready','deleting')", documentID, task.ID).
-				Updates(map[string]any{"status": documentStatus, "error_message": errorMessage, "updated_at": now}).Error; err != nil {
+				Updates(map[string]any{"status": gorm.Expr("CASE WHEN ? = 'failed' AND (active_index_id > 0 OR index_version <> '') THEN 'ready' ELSE ? END", documentStatus, documentStatus), "error_message": errorMessage, "updated_at": now}).Error; err != nil {
 				return err
+			}
+		}
+		if task.Kind == "question_generate" {
+			updates := map[string]any{"last_error": cause.Error(), "updated_at": now}
+			if !retry {
+				updates["status"] = "failed"
+			}
+			if err := tx.Model(&domain.QuestionSet{}).Where("generation_task_id=? AND status='generating'", task.ID).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		if task.Kind == "authority_check" {
+			updates := map[string]any{"explanation": cause.Error(), "updated_at": now}
+			if !retry {
+				updates["status"] = "failed"
+			}
+			if err := tx.Model(&domain.AuthorityCheck{}).Where("task_id=? AND status='pending'", task.ID).Updates(updates).Error; err != nil {
+				return err
+			}
+		}
+		if task.Kind == "practice_feedback" {
+			feedbackStatus := "pending"
+			if !retry {
+				feedbackStatus = "failed"
+			}
+			if err := tx.Model(&domain.AnswerFeedback{}).Where("task_id=? AND status<>'ready'", task.ID).Updates(map[string]any{"status": feedbackStatus, "last_error": cause.Error(), "updated_at": now}).Error; err != nil {
+				return err
+			}
+			if !retry {
+				if err := tx.Exec("UPDATE practice_attempts SET status='feedback_failed',last_error=?,updated_at=? WHERE id IN (SELECT practice_attempt_id FROM answer_feedback WHERE task_id=?) AND status<>'feedback_ready'", cause.Error(), now, task.ID).Error; err != nil {
+					return err
+				}
 			}
 		}
 		if retry {
@@ -355,7 +402,7 @@ func (s *Store) CreateDocument(ctx context.Context, document domain.Document) (d
 }
 
 // ReindexDocument 为已有文档创建新一代索引任务。旧任务与 Attempt 保留作审计，
-// 文档在重建期间离开 ready 集合，RAG 不会读取到新旧索引混合结果。
+// 构建状态单独推进；活动版本在重建期间仍可检索，完成事务才切换。
 func (s *Store) ReindexDocument(ctx context.Context, documentID uint64) (domain.Document, domain.AITask, error) {
 	var document domain.Document
 	var task domain.AITask
@@ -375,6 +422,11 @@ func (s *Store) ReindexDocument(ctx context.Context, documentID uint64) (domain.
 				return errors.New("document already has an active indexing task")
 			}
 		}
+		// Pre-version migrations can leave a ready legacy index without provenance.
+		// Preserve its availability while explicitly labeling the unknown contract.
+		if document.Status == "ready" && document.ActiveIndexID == 0 && document.IndexVersion == "" {
+			document.IndexVersion = "legacy-unverified"
+		}
 		now := time.Now().UTC()
 		payload, _ := json.Marshal(map[string]any{"document_id": document.ID})
 		task = domain.AITask{
@@ -386,7 +438,7 @@ func (s *Store) ReindexDocument(ctx context.Context, documentID uint64) (domain.
 		}
 		result := tx.Model(&domain.Document{}).Where("id=? AND status<>'deleting'", document.ID).
 			Updates(map[string]any{
-				"status": "uploaded", "index_version": "", "indexing_task_id": task.ID,
+				"status": "uploaded", "index_version": document.IndexVersion, "indexing_task_id": task.ID,
 				"error_message": "", "updated_at": now,
 			})
 		if result.Error != nil {
@@ -396,7 +448,6 @@ func (s *Store) ReindexDocument(ctx context.Context, documentID uint64) (domain.
 			return errors.New("document state changed before reindex")
 		}
 		document.Status = "uploaded"
-		document.IndexVersion = ""
 		document.IndexingTaskID = task.ID
 		document.ErrorMessage = ""
 		document.UpdatedAt = now
@@ -422,14 +473,27 @@ func (s *Store) CompleteDocumentIndex(ctx context.Context, task domain.AITask, t
 		if result.RowsAffected != 1 {
 			return errors.New("task lease lost")
 		}
+		var version domain.DocumentIndex
+		if err := tx.Where("document_id=? AND task_id=? AND execution_generation=? AND attempt_no=? AND status='built'", documentID, task.ID, task.ExecutionGeneration, task.AttemptNo).First(&version).Error; err != nil {
+			return err
+		}
+		if version.IndexVersion != indexVersion {
+			return errors.New("index configuration changed before completion")
+		}
 		// 文档必须处于 indexing 才能置 ready；删除等并发操作会改变状态使本更新落空并回滚。
-		documentResult := tx.Exec(`UPDATE documents SET status='ready',index_version=?,error_message='',updated_at=?
-			WHERE id=? AND indexing_task_id=? AND status='indexing'`, indexVersion, now, documentID, task.ID)
+		documentResult := tx.Exec(`UPDATE documents SET status='ready',index_version=?,active_index_id=?,error_message='',updated_at=?
+			WHERE id=? AND indexing_task_id=? AND status='indexing'`, indexVersion, version.ID, now, documentID, task.ID)
 		if documentResult.Error != nil {
 			return documentResult.Error
 		}
 		if documentResult.RowsAffected != 1 {
 			return errors.New("document state changed before index completion")
+		}
+		if err := tx.Model(&domain.DocumentIndex{}).Where("document_id=? AND id<>? AND status='active'", documentID, version.ID).Update("status", "retired").Error; err != nil {
+			return err
+		}
+		if err := tx.Model(&version).Update("status", "active").Error; err != nil {
+			return err
 		}
 		return tx.Exec(`UPDATE task_attempts SET status='succeeded',finished_at=?
 			WHERE task_id=? AND execution_generation=? AND lease_token=?`, now, task.ID, task.ExecutionGeneration, token).Error

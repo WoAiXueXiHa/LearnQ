@@ -1,6 +1,6 @@
 # LearnQ
 
-[![CI](https://github.com/WoAiXueXiHa/LeranQ/actions/workflows/ci.yml/badge.svg)](https://github.com/WoAiXueXiHa/LeranQ/actions/workflows/ci.yml)
+[![CI](https://github.com/WoAiXueXiHa/LearnQ/actions/workflows/ci.yml/badge.svg)](https://github.com/WoAiXueXiHa/LearnQ/actions/workflows/ci.yml)
 
 LearnQ 是一个面向个人学习复盘的本地 AI 应用。用户提交一次学习记录后，系统会异步生成结构化报告和复习任务；也可以上传个人文档，通过混合检索获得带来源引用的回答。
 

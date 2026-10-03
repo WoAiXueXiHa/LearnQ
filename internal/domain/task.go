@@ -120,6 +120,7 @@ type Document struct {
 	ContentHash    string    `json:"content_hash"`
 	Content        string    `json:"-" gorm:"type:longtext"`
 	Status         string    `json:"status"`
+	ActiveIndexID  uint64    `json:"active_index_id"`
 	IndexVersion   string    `json:"index_version"`
 	IndexingTaskID uint64    `json:"indexing_task_id"`
 	ErrorMessage   string    `json:"error_message,omitempty"`
@@ -128,9 +129,17 @@ type Document struct {
 }
 
 type DocumentChunk struct {
-	// ID 由文档、块序号和内容哈希稳定生成，重复索引会覆盖同一点而不是制造副本。
+	BlockSpansJSON   string `json:"block_spans_json" gorm:"type:longtext"`
+	EmbeddingContent string `json:"-" gorm:"type:text"`
+	HeadingPathJSON  string `json:"heading_path_json" gorm:"type:text"`
+	BlockType        string `json:"block_type"`
+	ImageRefsJSON    string `json:"image_refs_json" gorm:"type:longtext"`
+	// ID 包含文档、不可变索引构建、块序号和内容哈希。
 	ID          string    `json:"id" gorm:"primaryKey;size:64"`
 	DocumentID  uint64    `json:"document_id"`
+	IndexID     uint64    `json:"index_id"`
+	StartByte   int       `json:"start_byte"`
+	EndByte     int       `json:"end_byte"`
 	ChunkIndex  int       `json:"chunk_index"`
 	Title       string    `json:"title"`
 	StartLine   int       `json:"start_line"`
@@ -160,3 +169,22 @@ type Image struct {
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
 }
+
+// DocumentIndex preserves source bytes and configuration for an immutable index build.
+// Only Status changes; source, chunks and their positions are never overwritten.
+type DocumentIndex struct {
+	ID                  uint64    `json:"id" gorm:"primaryKey"`
+	DocumentID          uint64    `json:"document_id"`
+	TaskID              uint64    `json:"task_id"`
+	ExecutionGeneration int       `json:"execution_generation"`
+	AttemptNo           int       `json:"attempt_no"`
+	Content             string    `json:"-" gorm:"type:longtext"`
+	ContentHash         string    `json:"content_hash"`
+	IndexVersion        string    `json:"index_version"`
+	ChunkVersion        string    `json:"chunk_version"`
+	Dimension           int       `json:"dimension"`
+	Status              string    `json:"status"`
+	CreatedAt           time.Time `json:"created_at"`
+}
+
+func (DocumentIndex) TableName() string { return "document_indexes" }

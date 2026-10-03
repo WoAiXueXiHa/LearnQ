@@ -74,6 +74,8 @@ def main():
     parser.add_argument("--project", required=True, help="explicit isolated Compose project")
     parser.add_argument("--samples", type=int, default=60)
     parser.add_argument("--interval", type=float, default=5)
+    parser.add_argument("--max-consecutive-errors", type=int, default=3,
+                        help="bounded retries for Docker errors during container recreation")
     parser.add_argument("--disk-path", type=Path, default=Path("."),
                         help="path on the filesystem holding Docker data/volumes")
     args = parser.parse_args()
@@ -81,15 +83,34 @@ def main():
         parser.error("invalid Compose project name")
     if args.samples < 1 or not 0 < args.interval <= 60:
         parser.error("samples must be positive; interval must be in (0, 60]")
+    if args.max_consecutive_errors < 1:
+        parser.error("max-consecutive-errors must be positive")
+    consecutive_errors = 0
     for index in range(args.samples):
         try:
             print(json.dumps(sample(args.project, args.disk_path)), flush=True)
-        except (ValueError, OSError, subprocess.SubprocessError, KeyError) as error:
+            consecutive_errors = 0
+        except subprocess.SubprocessError as error:
+            # A recreate can invalidate IDs between ps and stats. Keep the gap
+            # visible in JSONL and retry, but never hide a persistent failure.
+            consecutive_errors += 1
+            print(json.dumps({
+                "time_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "project": args.project, "sample_error": type(error).__name__,
+                "consecutive_errors": consecutive_errors,
+            }), flush=True)
+            if consecutive_errors >= args.max_consecutive_errors:
+                print("capacity sampling stopped after repeated Docker errors", file=sys.stderr)
+                return 1
+        except (ValueError, OSError, KeyError) as error:
             # Docker error stderr can contain server details; keep output bounded.
             print(f"capacity sample failed: {type(error).__name__}: {error}", file=sys.stderr)
             return 1
         if index + 1 < args.samples:
             time.sleep(args.interval)
+    if consecutive_errors:
+        print("capacity sampling ended before recovery from Docker errors", file=sys.stderr)
+        return 1
     return 0
 
 

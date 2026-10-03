@@ -41,7 +41,7 @@ func main() {
 		os.Exit(1)
 	}
 	// 连接 Chat、Embedding模型
-	chat, embedding := bootstrap.Models(cfg)
+	chat, embedding := bootstrap.MeteredModels(cfg, db)
 	// Chat、Embedding 和向量库都通过窄接口注入，fake/real 模式共用同一条业务链路。
 	// 连接向量数据库
 	// Qdrant 客户端超时固定 10 秒，与任务执行超时相互独立：向量查询是请求同步链路的一部分，需要各自明确的上限。
@@ -62,17 +62,19 @@ func main() {
 	agentRuntime.RegisterTool("review_task_create", tools.ReviewTaskCreate)
 	registry.RegisterTool("rag_query", tools.RAGQuery)
 	runtimeChatModel, runtimeVisionModel, runtimeEmbeddingModel :=
-		cfg.AIChatModel, cfg.AIVisionModel, cfg.AIEmbeddingModel
+		cfg.AIChatModel, cfg.AIVisionModel, bootstrap.EmbeddingModelName(cfg)
 	// 选择模型
 	// fake 模式下替换为占位模型名：这些名字与 Fake 实现响应中报告的 Model 字段一致，保证就绪探针展示的运行时信息与实际执行路径相符。
 	if cfg.AIMode == "fake" {
 		runtimeChatModel = "learnq-fake-chat-v1"
 		runtimeVisionModel = "learnq-fake-vision-v1"
-		runtimeEmbeddingModel = "learnq-fake-embedding-v1"
 	}
 	// 组装 API Handler，注入数据库、模型、向量库、队列和工具函数
 	handler := api.New(store.New(db), registry, api.WithRAG(chat, embedding, vectors), api.WithEvidence(evidence), api.WithAgentRuntime(agentRuntime),
 		api.WithImageStore(imagestore.New(cfg.ImageDir)),
+		api.WithArticleImageLimit(cfg.ArticleMaxImages),
+		api.WithAuthoritySnapshotTTL(cfg.AuthoritySnapshotTTL),
+		api.WithModelBudget(int64(cfg.AIDailyBudgetMicroCNY), int64(cfg.AICallReserveMicroCNY)),
 		api.WithRuntimeInfo(cfg.AIMode, runtimeChatModel, runtimeVisionModel, runtimeEmbeddingModel),
 		api.WithRAGMetadata(cfg.RAGCollection),
 		api.WithOperationalMetrics(metricRecorder, func(ctx context.Context) (int64, int64, error) {
